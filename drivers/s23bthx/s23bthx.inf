@@ -1,0 +1,60 @@
+[Version]
+Signature="$WINDOWS NT$"
+Class=Bluetooth
+ClassGuid={e0cbf06c-cd8b-4647-bb8a-263b43f0f974}
+Provider=%ProviderName%
+DriverVer=04/01/2024,1.0.0.0
+CatalogFile=s23bthx.cat
+PnpLockdown=1
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+s23bthx.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName%=Standard,NT$ARCH$
+
+[Standard.NT$ARCH$]
+%DeviceName%=s23bthx_Device, ACPI\QCOM0831
+
+[s23bthx_Device.NT]
+CopyFiles=Drivers_Dir
+Include=Bth.inf
+Needs=BthUsb.NT
+
+[Drivers_Dir]
+s23bthx.sys
+
+[s23bthx_Device.NT.Services]
+AddService = s23bthx, 0x00000002, s23bthx_Service_Inst
+Include=Bth.inf
+Needs=BthUsb.NT.Services
+
+[s23bthx_Service_Inst]
+DisplayName    = %ServiceDesc%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\s23bthx.sys
+
+[s23bthx_Device.NT.HW]
+AddReg = s23bthx_Device.NT.HW.AddReg
+Include=Bth.inf
+Needs=BthUsb.NT.HW
+
+[s23bthx_Device.NT.HW.AddReg]
+HKR,,DeviceCharacteristics,0x10001,0x0100         ; Use same security checks on relative opens
+HKR,,Security,,"D:P(A;;GA;;;BA)(A;;GA;;;SY)"      ; Allow generic-all access to Built-in administrators and Local system
+HKR,,LowerFilters,0x00010000,"s23bthx"
+
+[Strings]
+ProviderName="MahanYTT"
+ManufacturerName="MahanYTT"
+DiskName="S23 Bluetooth Extension Installation Disk"
+DeviceName="S23 QCA6490 Bluetooth UART Transport"
+ServiceDesc="S23 QCA6490 Bluetooth UART Transport Driver"
