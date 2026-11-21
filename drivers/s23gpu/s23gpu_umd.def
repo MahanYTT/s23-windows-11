@@ -1,0 +1,4 @@
+LIBRARY s23gpu_umd
+EXPORTS
+    OpenAdapter10
+    OpenAdapter10_2

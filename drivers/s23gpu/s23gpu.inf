@@ -1,0 +1,58 @@
+[Version]
+Signature="$WINDOWS NT$"
+Class=Display
+ClassGuid={4D36E968-E325-11CE-BFC1-08002BE10318}
+Provider=%Provider%
+DriverVer=04/01/2024,1.0.0.2
+CatalogFile=s23gpu.cat
+PnpLockdown=1
+
+[DestinationDirs]
+S23Gpu_Files=12
+S23Gpu_Umd=11
+
+[SourceDisksNames]
+1=%Disk%,,,
+
+[SourceDisksFiles]
+s23gpu.sys=1
+s23gpu_umd.dll=1
+
+[Manufacturer]
+%Mfg%=S23Gpu,NTarm64.10.0
+
+[S23Gpu.NTarm64.10.0]
+%Desc%=S23Gpu_Inst,ROOT\S23GPU
+
+[S23Gpu_Inst]
+FeatureScore=F8
+CopyFiles=S23Gpu_Files,S23Gpu_Umd
+AddReg=S23Gpu_AddReg
+
+[S23Gpu_Files]
+s23gpu.sys
+
+[S23Gpu_Umd]
+s23gpu_umd.dll
+
+[S23Gpu_AddReg]
+HKR,,InstalledDisplayDrivers,0x00010000,"s23gpu_umd"
+HKR,,UserModeDriverName,0x00010000,"s23gpu_umd.dll","s23gpu_umd.dll","s23gpu_umd.dll","s23gpu_umd.dll"
+HKR,,UserModeDriverGUID,0x00000000,"{7B3E2F10-5230-4740-A740-000000000001}"
+
+[S23Gpu_Inst.Services]
+AddService=s23gpu,0x00000002,S23Gpu_Svc
+
+[S23Gpu_Svc]
+DisplayName=%Desc%
+ServiceType=1
+StartType=3
+ErrorControl=1
+LoadOrderGroup=Video
+ServiceBinary=%12%\s23gpu.sys
+
+[Strings]
+Provider="S23 Windows on ARM"
+Mfg="Qualcomm / S23 Bring-Up"
+Desc="Qualcomm Adreno 740 Render-Only GPU (S23)"
+Disk="S23 Adreno 740 Driver Disk"

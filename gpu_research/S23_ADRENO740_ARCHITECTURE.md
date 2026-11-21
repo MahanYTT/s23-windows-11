@@ -323,8 +323,8 @@ Tested live on the Galaxy S23 (`StageMask = 0x3B` -> restored to `0x01`, capture
      - `KGSL_CP_SQE_CNTL(5B) (0x03D02020) = 0x00000000`
    - Clean teardown verified: released `OOB_ACK` (`BIT 31` on `GMU_H2G_SET`), asserted `GMU_CM3_SYSRESET(stopped) = 1`, fault-pinned and disabled `KGSL-SMMU` CB2 (`tlb_done=1 CM3_RST=1 CB2_SCTLR=00000000 TLBSTATUS=00000000`), and freed the 89-page pool.
 
-5. **Next On-Device Step — Persistent WDDM Render-Only KMD + ARM64 Mesa (`Turnip` / `Freedreno`)**:
-   - Stage 6A/6B/6C are now verified live (see Section 5.5 below). Integrate `s23_gpu_acpi.asl` (`MMU1` `OPEN0D01` + `GPU0` `OPEN0515`) into a UEFI test build, build a persistent ARM64 WDDM Render-Only KMD (preserving UEFI SimpleFB display scanout while offloading 3D/compute to Adreno 740), and connect ARM64 Mesa (`Turnip` Vulkan + `Freedreno`/`Zink` OpenGL).
+5. **Persistent WDDM 1.3 Render-Only KMD (`drivers/s23gpu/` — Done) & Next Step — ARM64 Mesa (`Turnip` / `Freedreno`)**:
+   - Stage 6A/6B/6C and the persistent ARM64 WDDM 1.3 Render-Only KMD (`drivers/s23gpu/s23gpu.sys`, `s23gpu_umd.dll`, `s23gpu.inf`) are now verified live (see Sections 5.5 and 5.6 below). Next step is building and deploying ARM64 Mesa (`Turnip` Vulkan + `Freedreno` / `d3d10umd` / `Zink`) against the `topazgpu_escape.h` / Linux `msm` DRM ABI exposed by `s23gpu.sys`.
 
 ### 5.5 Live Stage 6A/6B/6C Full Adreno 740 Execution: `KGSL-SMMU` CB0 + `QTB` ECATS + `a740_sqe.fw` + PM4 Fences + TZ `a740_zap.mbn` (`s23gpuprobe.sys v1.0.0.7`)
 
@@ -359,5 +359,23 @@ Tested incrementally live on the Galaxy S23 (`RFCW90N0N7X`, `StageMask = 0x7B` -
      - **`Fence3(non-sec): val=3 polls=3`**
      - **`SECVID_TRUST_CNTL(6C) (0x03D3D000) = 0x00000000`** (switched from `1` -> `0`: full non-secure GPU execution active!), `RBBM_STATUS(6C) = 0x1`, `CB0_FSR = 0x400`.
    - Clean teardown verified (`CP_SQE_CNTL=3` -> `GBIF_HALT` drain -> `RBBM_SW_RESET_CMD` -> `CP_SQE_CNTL=0` -> `CB0` & `CB2` SMMU teardown `tlb_done=1` -> `GMU_CM3_SYSRESET=1`).
+
+### 5.6 Persistent WDDM 1.3 Render-Only KMD (`drivers/s23gpu/s23gpu.sys` — Verified Live)
+
+- **Driver Package (`drivers/s23gpu/`)**:
+  - Built natively on host PC with MSVC `14.44.35207` (`Hostx64\arm64`, `/W3 /WX`) + WDK `10.0.26100.6584`, verified against phone `ntoskrnl.exe` (`45/45`) & `hal.dll` (`3/3`) via `verify_pe.py`, cataloged (`inf2cat`), and Authenticode-signed with `CN=S23TouchTest2020`.
+  - Contains `s23gpu.sys` (WDDM 1.3 Render-Only KMD, `NumSources=0, NumChildren=0, SupportNonVGA=TRUE`), `s23gpu_umd.dll` (minimal ARM64 UMD stub exporting `OpenAdapter10` / `OpenAdapter10_2`), `s23gpu.inf` (`ROOT\S23GPU`, `FeatureScore=F8`, `InstalledDisplayDrivers` + `UserModeDriverName` `REG_MULTI_SZ`), `s23gpu_install.exe`, and `s23gpu_test.exe`.
+  - **24H2 WDDM Bring-Up Finding**: `dxgkrnl.sys` rejects a Display-class adapter post-start (`Event ID 549 StartAdapter_AddAdapterFailed`, `STATUS_OBJECT_NAME_NOT_FOUND 0xC0000034`) unless `HKR,,UserModeDriverName` (`REG_MULTI_SZ`) + `HKR,,InstalledDisplayDrivers` point to a valid ARM64 UMD DLL. Adding `s23gpu_umd.dll` resolved the start failure immediately while keeping `ROOT\BasicDisplay\0000` UEFI SimpleFB scanout active (`Started`).
+- **Escape ABI & MMU / Ring Bring-Up**:
+  - Exposes `topazgpu_escape.h` / Linux `msm` DRM ABI (`VERSION 1.9.0 "msm"`, `CHIP_ID=0x43050a01`, `GPU_ID=740`, `GMEM=0x01000000+0x00300000`, `HBB=16`, `VA=0x02000000+0xEE000000`, `<64 GB` scatter-gather MDLs, 3-level 4 KiB SMMU CB0 page tables, A7xx Ring0 BR/BV submit with separated `memptrs` slots, `GMU_ALWAYS_ON_CNT` timestamps, and `PAS_SHUTDOWN(13)` teardown).
+- **Live Verification (`drivers/s23gpu/s23gpu_v1_live.log`)**:
+  - Device installed as `ROOT\DISPLAY\0000` (`oem21.inf`, `Status: Started`) alongside `ROOT\BasicDisplay\0000` (`Status: Started`); kernel log confirmed `QTB ECATS MATCH`, `CP_SMMU_APERTURE(CB0) r0=0 r1=0`, and `Adreno 740 READY (CHIP_ID=43050a01 CB0+CB2+GMU+SQE+ZAP non-sec live)`.
+  - `s23gpu_test.exe` Run 1 (`LUID 0:014e7796`, `TS=154466028704->154466389966`, `d=361262`):
+    - **Test 1** (GEM alloc + CPU write + GPU `CP_MEM_WRITE`): `PASS` (`p0=cafebabe,5230a740 p1=11223344,55667788`).
+    - **Test 2** (100 sequential `GEM_SUBMIT` + `WAIT_FENCE` loop): `PASS` (`last val=0xa7400064 fence=103`).
+    - **Test 3** (`SET_IOVA=0x10000000` softpin): `PASS` (`ret=0 val=0x50f70001`).
+    - **Test 4** (BO close + re-alloc): `PASS`.
+  - Clean `StopDevice` + cold-restart cycle (`pnputil /disable-device` -> `/enable-device` on `ROOT\DISPLAY\0000`) -> Run 2 (`LUID 0:0151d263`, `TS=154908831397->154909044075`, `d=212678`): all 4 tests passed identically with `s23link.py ping` (`pong 2.0 ms`).
+
 
 

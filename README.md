@@ -25,7 +25,7 @@ Hardware bring-up drivers, UEFI DXE patches, ACPI SSDTs, kernel telemetry probes
 | **USB-C Link Control** | [`s23link.py`](s23link.py) | **Working** | PC-to-phone WinUSB control link (`RM9_WINUSB=1 python s23link.py ping\|exec\|put\|get`). |
 | **Wi-Fi 6E (`QCA6490`)** | [`wifi_research/qca6490_bringup/`](wifi_research/qca6490_bringup/), [`drivers/s23pcieprobe/`](drivers/s23pcieprobe/) | **Bring-Up / Staged** | `PCI\VEN_17CB&DEV_1103` INTx/MSI packaging (`build_s23_qcwlan_pkgs.ps1`), UEFI DXE (`s23_uefi_pcie0_dxe.c`), ACPI SSDT (`s23_pcie0_wlan.asl`), and kernel probe (`s23pcieprobe`). |
 | **Audio & Haptics** | [`drivers/s23sensprobe/`](drivers/s23sensprobe/), [`audio_sensors_research/`](audio_sensors_research/) | **Probed Live** | Dual `CS35L43` speaker amps on `I2C_HUB_SE6` (`0x00998000`, `GPIO8/9`, rst `GPIO42`/`GPIO55`, `@0x40`/`@0x41` `DEVID=0x00035A42 REVID=0xA1`) + `CS40L26A` haptics on `I2C_HUB_SE3` (`0x0098C000`, `@0x40` `DEVID=0x0040A260 REVID=0xA1`). |
-| **Adreno 740 GPU** | [`drivers/s23gpuprobe/`](drivers/s23gpuprobe/), [`gpu_research/`](gpu_research/) | **GMU + CB0 + SQE + PM4 Fences + ZAP Non-Sec Live** | `s23gpuprobe.sys v1.0.0.7` (`StageMask=0x7B`/`0xFB`/`0x1FB`): `KGSL-SMMU` CB2 (`SID=5`, `SMR[2]`) + GMU CM3 (`gmu_gen70200.bin`) + all 5 HFI replies (`err=0`) + `OOB_REQUEST` GX wake (`0xF8222800`); `KGSL-SMMU` CB0 (`SID=0/1`, `ASID=1`, `ACTLR=0x301`, `SCTLR=0x167`) + `gpu_qtb@0x03DE8000` ECATS walk **EXACT MATCH**; full A740 `gpuHwInit()` + `a740_sqe.fw` + `CP_SQE_CNTL=1` -> `CP_ME_INIT` (`Fence1=1`) & `CP_MEM_WRITE` (`Fence2=2`, scratch `0x05E9A740`); TZ `CP_SMMU_APERTURE_ID` + `PAS_ID=13` (`a740_zap.mbn`) + `CP_SET_SECURE_MODE(0)` -> `Fence3=3`, `SECVID_TRUST_CNTL=0`, clean teardown. [`s23_gpu_acpi.asl`](gpu_research/s23_gpu_bringup/s23_gpu_acpi.asl) compiles cleanly (`744 B` AML). |
+| **Adreno 740 GPU** | [`drivers/s23gpu/`](drivers/s23gpu/), [`drivers/s23gpuprobe/`](drivers/s23gpuprobe/), [`gpu_research/`](gpu_research/) | **WDDM 1.3 Render-Only KMD Live (`ROOT\DISPLAY\0000`)** | Persistent ARM64 WDDM 1.3 Render-Only KMD (`s23gpu.sys` + `s23gpu_umd.dll` stub + `s23gpu.inf`) verified live alongside `ROOT\BasicDisplay\0000` SimpleFB scanout: exposes `topazgpu_escape.h` / Linux `msm 1.9.0` DRM ABI (`CHIP_ID=0x43050a01`, `GPU_ID=740`, `GMEM=0x1000000+0x300000`, `HBB=16`, `VA=0x2000000+0xee000000`) with live GMU+CB0/CB2+SQE+ZAP non-secure bring-up, 3-level SMMU CB0 pagetables, `SET_IOVA` softpin, 100-submit PM4 fence loop, and clean disable/enable cold restart (local `s23gpu_v1_live.log`). Research probe [`s23gpuprobe.sys`](drivers/s23gpuprobe/) & [`s23_gpu_acpi.asl`](gpu_research/s23_gpu_bringup/s23_gpu_acpi.asl) (`744 B` AML) remain preserved. |
 | **5G Modem / PIL / Perf** | [`drivers/s23pilprobe/`](drivers/s23pilprobe/), [`drivers/s23perf/`](drivers/s23perf/), [`modem_5g_research/`](modem_5g_research/) | **Probed / ACPI** | XPU-hardened SMEM/IMEM/PIL telemetry (`s23pilprobe`), `s23_subsys_pil.asl` ACPI SSDT, and EPSS CPUfreq / TSENS v2 41-sensor probe (`s23perf`). |
 | **ACL Recovery** | [`drivers/s23aclfix/`](drivers/s23aclfix/), [`drivers/s23aclsvc/`](drivers/s23aclsvc/) | **Utility** | Early-boot WDM & LocalSystem one-shot NTFS ACL repair helpers. |
 
@@ -33,7 +33,7 @@ Hardware bring-up drivers, UEFI DXE patches, ACPI SSDTs, kernel telemetry probes
 
 ## Building ARM64 Kernel Drivers
 
-All `drivers/s23*` kernel drivers are built via standalone WSL `build_wsl.py` scripts using Clang + `lld-link` targeting Windows ARM64, then verified and Authenticode-signed on Windows:
+Kernel drivers under `drivers/s23*` are built either via native Hostx64-to-ARM64 MSVC + WDK `10.0.26100.6584` (e.g. [`drivers/s23gpu/build.ps1`](drivers/s23gpu/build.ps1)) or via standalone WSL `build_wsl.py` scripts using Clang + `lld-link` targeting Windows ARM64, then verified and Authenticode-signed on Windows:
 
 1. **Prerequisites:**
    - **WSL:** `clang-18`, `llvm-dlltool`, `lld-link` (`lld`), `acpica-tools` (`iasl`), Python 3.
@@ -83,7 +83,7 @@ Proprietary Samsung / Qualcomm firmware binaries, partition backups, logs, and c
 
 ## Repository Layout
 
-- `drivers/s23*` — Native ARM64 WDM drivers & diagnostic kernel probes (`s23bthx`, `s23touch`, `s23keys`, `s23batt`, `s23gpuprobe`, `s23btprobe`, `s23sensprobe`, `s23pcieprobe`, `s23pilprobe`, `s23perf`, `s23disp_diag`, `s23aclfix`, `s23aclsvc`).
+- `drivers/s23*` — Native ARM64 WDDM/WDM drivers & diagnostic kernel probes (`s23gpu`, `s23bthx`, `s23touch`, `s23keys`, `s23batt`, `s23gpuprobe`, `s23btprobe`, `s23sensprobe`, `s23pcieprobe`, `s23pilprobe`, `s23perf`, `s23disp_diag`, `s23aclfix`, `s23aclsvc`).
 - `display_research/` — `S23DisplayFixDxe_v2.c` / `v3.c` and MDSS/DSI0 auto-refresh patches.
 - `gpu_research/` — Adreno 740 (`GEN7_2_1`) hardware architecture report, ACPI SSDT (`s23_gpu_acpi.asl`), UEFI DXE, and Lineage Recovery firmware tooling.
 - `bt_research/` — QCA6490 UART14 (`0x00898000`) bring-up documentation and ACPI SSDT (`s23_bt_uart14.asl`).
