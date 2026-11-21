@@ -1,0 +1,35 @@
+[Defines]
+  INF_VERSION                    = 0x00010005
+  BASE_NAME                      = S23Pcie0Dxe
+  FILE_GUID                      = 8B2E41A7-5C93-4D1F-A026-17CB11036490
+  MODULE_TYPE                    = DXE_DRIVER
+  VERSION_STRING                 = 1.0
+  ENTRY_POINT                    = S23Pcie0DxeEntryPoint
+
+[Sources]
+  s23_uefi_pcie0_dxe.c
+  s23_pcie0_wlan.hex
+
+[Packages]
+  ArmPkg/ArmPkg.dec
+  MdePkg/MdePkg.dec
+  MdeModulePkg/MdeModulePkg.dec
+
+[LibraryClasses]
+  ArmLib
+  BaseMemoryLib
+  DebugLib
+  DxeServicesTableLib
+  IoLib
+  UefiBootServicesTableLib
+  UefiDriverEntryPoint
+
+[Protocols]
+  gEfiAcpiTableProtocolGuid
+  gEfiAcpiSdtProtocolGuid
+
+[Guids]
+  gEfiEventReadyToBootGuid
+
+[Depex]
+  TRUE

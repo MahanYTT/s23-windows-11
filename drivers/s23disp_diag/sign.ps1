@@ -1,0 +1,24 @@
+$ErrorActionPreference = 'Stop'
+
+$drvDir = 'C:\Users\Mahan\Documents\windows-on-android\s23_dm1q\drivers\s23disp_diag'
+$pkgDir = Join-Path $drvDir 'pkg'
+$stageDir = Join-Path $drvDir 'cat_stage'
+New-Item -ItemType Directory -Force -Path $pkgDir | Out-Null
+if (Test-Path $stageDir) { Remove-Item -Recurse -Force $stageDir }
+New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+
+$cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -eq 'CN=S23TouchTest2020' -and $_.HasPrivateKey } | Select-Object -First 1
+if (-not $cert) {
+    throw "Certificate CN=S23TouchTest2020 not found!"
+}
+
+$cerPath = Join-Path $pkgDir 's23test.cer'
+Export-Certificate -Cert $cert -FilePath $cerPath -Force | Out-Null
+
+Copy-Item (Join-Path $drvDir 'out\s23disp_diag.sys') (Join-Path $stageDir 's23disp_diag.sys') -Force
+$stageSys = Join-Path $stageDir 's23disp_diag.sys'
+$sigSys = Set-AuthenticodeSignature -FilePath $stageSys -Certificate $cert -HashAlgorithm SHA256
+Write-Output "Signed s23disp_diag.sys: Status=$($sigSys.Status)"
+
+Copy-Item $stageSys (Join-Path $pkgDir 's23disp_diag.sys') -Force
+Get-ChildItem $pkgDir | Select-Object Name, Length

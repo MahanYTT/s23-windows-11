@@ -1,0 +1,47 @@
+; s23touch.inf - Samsung Galaxy S23 (dm1q) Native HID Multitouch Minidriver
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = HIDClass
+ClassGuid   = {745a17a0-74d3-11d0-b6fe-00a0c90f57da}
+Provider    = %ProviderName%
+DriverVer   = 01/13/2024,1.0.0.13
+CatalogFile = s23touch.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+s23touch.sys = 1
+
+[Manufacturer]
+%ManufacturerName% = Models,NTARM64
+
+[Models.NTARM64]
+%DeviceName% = S23Touch_Inst, ROOT\S23TOUCH
+
+[S23Touch_Inst.NT]
+CopyFiles = S23Touch_Copy
+
+[S23Touch_Copy]
+s23touch.sys
+
+[S23Touch_Inst.NT.Services]
+AddService = s23touch, 0x00000002, S23Touch_Service
+
+[S23Touch_Service]
+DisplayName    = %ServiceName%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %13%\s23touch.sys
+
+[Strings]
+ProviderName     = "S23 Windows Bringup"
+ManufacturerName = "Samsung Galaxy S23"
+DiskName         = "S23 Touch Driver Disk"
+DeviceName       = "Samsung Galaxy S23 Native Touch Screen"
+ServiceName      = "S23 Native HID Touch Minidriver"

@@ -1,0 +1,521 @@
+--- a/Platforms/Samsung/dm1qPkg/Drivers/S23DisplayFixDxe/S23DisplayFixDxe.c
++++ b/Platforms/Samsung/dm1qPkg/Drivers/S23DisplayFixDxe/S23DisplayFixDxe.c
+@@ -1,9 +1,21 @@
+ /** @file
+-  S23DisplayFixDxe - Samsung Galaxy S23 (dm1q / SM8550-AC) Command-Mode Display Auto-Refresh Keeper.
++  S23DisplayFixDxe_v2.c - Samsung Galaxy S23 (dm1q / SM8550-AC) Command-Mode Display Auto-Refresh Fix v2
+ 
+-  Ensures the DM1_S6E3FAC_AMB606AW01 DSI command-mode panel stays actively refreshed
+-  across UEFI boot and ExitBootServices handoff into Windows 11 SimpleFB (0xB8000000),
+-  strictly gated by DISP_CC GDSC + AHB/MDP clock checks (G116Gate) to avoid AXI SErrors.
++  Backports verified SM8550 hardware fixes from s23disp_diag.c v1.0.0.2:
++    1. Full 5-register SM8550 G116Gate on DISP_CC (0x0AF00000):
++       - CORE_BCR     (+0x8000): bit 0 == 0
++       - MDP_CLK_CBCR (+0x800C): (val & 0x80000001) == 0x00000001 (CLK_OFF=0, CLK_ENABLE=1)
++       - AHB_CLK_CBCR (+0x80A4): (val & 0x80000001) == 0x00000001 (CLK_OFF=0, CLK_ENABLE=1)
++       - CORE_GDSCR   (+0x9000): (val & 0x80000007) == 0x80000000 (PWR_ON=1, SW/HW collapse=0)
++       - CFG_GDSCR    (+0x9004): (val & 0x00018000) == 0x00010000
++    2. Accurate command-mode stall detection using AR_STATUS (0x0AE362C0), TE_INT_CNT (0x0AE36298),
++       DSI0_CTRL (0x0AE94004), and SYNC_VSYNC (0x0AE36288 bit 19). Does NOT spam MDP_CTL_0_START
++       when FLC_EN (0x0AE360A8) == 0 (where INTF_1_FRAME_COUNT stays frozen even during active refresh).
++    3. Non-colliding ExitBootServices handoff: skips redundant MDP_CTL_0_START if Auto-Refresh is
++       already armed and observed ticking; only re-arms/kicks when unarmed or stalled.
++    4. Optional QCOM DSI v2.7 TPG-FIFO S6E3FAC wake fallback (zero DDR DMA, bypasses apps-smmu
++       SID 0x1c00): automatically available via -DS23_ENABLE_DSI_TPG_WAKE (default enabled when
++       TE_INT_CNT is frozen at DXE entry after warm reboot from Lineage Recovery).
+ **/
+ 
+ #include <Uefi.h>
+@@ -13,94 +25,358 @@
+ #include <Library/IoLib.h>
+ #include <Library/UefiBootServicesTableLib.h>
+ 
++/* ============================================================================
++ * SM8550 / S23 (dm1q) DISP_CC, MDSS_MDP & DSI0 Register Map
++ * ============================================================================ */
+ #define DISP_CC_BASE                      0x0AF00000ULL
+-#define DISP_CC_MDSS_CORE_GDSCR           (DISP_CC_BASE + 0x9000ULL)
++#define DISP_CC_MDSS_CORE_BCR             (DISP_CC_BASE + 0x8000ULL)
+ #define DISP_CC_MDSS_MDP_CLK_CBCR         (DISP_CC_BASE + 0x800CULL)
++#define DISP_CC_MDSS_ESC0_CLK_CBCR        (DISP_CC_BASE + 0x8038ULL)
+ #define DISP_CC_MDSS_AHB_CLK_CBCR         (DISP_CC_BASE + 0x80A4ULL)
++#define DISP_CC_MDSS_CORE_GDSCR           (DISP_CC_BASE + 0x9000ULL)
++#define DISP_CC_MDSS_CORE_CFG_GDSCR       (DISP_CC_BASE + 0x9004ULL)
+ 
+-#define MDSS_HW_VERSION                   0x0AE00000ULL
+-#define MDP_CTL_0_START                   0x0AE1601CULL
+-#define MDP_INTF_1_FRAME_COUNT            0x0AE360ACULL
+-#define MDP_INTF_1_TEAR_CHECK_EN          0x0AE36284ULL
+-#define MDP_INTF_1_AUTOREFRESH_CONFIG     0x0AE362B4ULL
++#define MDSS_BASE                         0x0AE00000ULL
++#define MDSS_HW_VERSION                   (MDSS_BASE + 0x00000ULL)
++#define MDP_CTL_0_START                   (MDSS_BASE + 0x1601CULL)
++
++/* INTF_1 @ MDSS + 0x36000 */
++#define MDP_INTF_1_FLC_EN                 (MDSS_BASE + 0x360A8ULL)
++#define MDP_INTF_1_FRAME_COUNT            (MDSS_BASE + 0x360ACULL)
++#define MDP_INTF_1_TEAR_CHECK_EN          (MDSS_BASE + 0x36284ULL)
++#define MDP_INTF_1_SYNC_VSYNC             (MDSS_BASE + 0x36288ULL)
++#define MDP_INTF_1_TEAR_INT_COUNT         (MDSS_BASE + 0x36298ULL)
++#define MDP_INTF_1_AUTOREFRESH_CONFIG     (MDSS_BASE + 0x362B4ULL)
++#define MDP_INTF_1_AUTOREFRESH_STATUS     (MDSS_BASE + 0x362C0ULL)
++
++/* DSI0_CTRL @ MDSS + 0x94000 */
++#define DSI0_BASE                         (MDSS_BASE + 0x94000ULL)
++#define DSI0_CTRL                         (DSI0_BASE + 0x004ULL)
++#define DSI0_STATUS                       (DSI0_BASE + 0x008ULL)
++#define DSI0_CMD_MODE_DMA_CTRL            (DSI0_BASE + 0x03CULL)
++#define DSI0_DMA_CMD_LENGTH               (DSI0_BASE + 0x04CULL)
++#define DSI0_CMD_MODE_DMA_SW_TRIGGER      (DSI0_BASE + 0x090ULL)
++#define DSI0_INT_CTRL                     (DSI0_BASE + 0x110ULL)
++#define DSI0_TPG_MAIN_CONTROL             (DSI0_BASE + 0x15CULL)
++#define DSI0_TPG_DMA_FIFO_DATA            (DSI0_BASE + 0x17CULL)
++#define DSI0_TPG_DMA_FIFO_RESET           (DSI0_BASE + 0x1ECULL)
+ 
+ /* Bit 31 = ENABLE, bits [15:0] = FRAME_COUNT (2 -> 60 Hz refresh from 120 Hz TE) */
+ #define AUTOREFRESH_ENABLE_60HZ           0x80000002U
+ 
+-STATIC EFI_EVENT  mRefreshTimer = NULL;
+-STATIC EFI_EVENT  mExitBootEvent = NULL;
+-STATIC UINT32     mLastFrameCount = 0;
+-STATIC BOOLEAN    mHaveFrameSample = FALSE;
+-
+-STATIC
+-BOOLEAN
+-IsMdssPoweredAndClocked (
+-  VOID
++/* Enable QCOM DSI v2.7 TPG-FIFO S6E3FAC wake fallback by default (set 0 to disable) */
++#ifndef S23_ENABLE_DSI_TPG_WAKE
++#define S23_ENABLE_DSI_TPG_WAKE           1
++#endif
++
++STATIC EFI_EVENT  mRefreshTimer    = NULL;
++STATIC EFI_EVENT  mExitBootEvent   = NULL;
++STATIC UINT32     mLastFrameCount  = 0;
++STATIC UINT32     mLastTeIntCnt    = 0;
++STATIC UINT32     mLastArStatus    = 0;
++STATIC BOOLEAN    mHaveSample      = FALSE;
++STATIC BOOLEAN    mObservedTicking = FALSE;
++STATIC UINT32     mStallStreak     = 0;
++
++STATIC UINT32
++Rd32 (
++  IN UINT64  Addr
+   )
+ {
+-  UINT32  Gdscr;
+-  UINT32  AhbCbcr;
+-  UINT32  MdpCbcr;
++  UINT32  Val;
+ 
+   ArmDataMemoryBarrier ();
+-  Gdscr   = MmioRead32 ((UINTN)DISP_CC_MDSS_CORE_GDSCR);
+-  AhbCbcr = MmioRead32 ((UINTN)DISP_CC_MDSS_AHB_CLK_CBCR);
+-  MdpCbcr = MmioRead32 ((UINTN)DISP_CC_MDSS_MDP_CLK_CBCR);
++  Val = MmioRead32 ((UINTN)Addr);
+   ArmDataMemoryBarrier ();
++  return Val;
++}
++
++STATIC VOID
++Wr32 (
++  IN UINT64  Addr,
++  IN UINT32  Val
++  )
++{
++  ArmDataMemoryBarrier ();
++  MmioWrite32 ((UINTN)Addr, Val);
++  ArmDataMemoryBarrier ();
++}
++
++STATIC VOID
++DelayMs (
++  IN UINT32  Ms
++  )
++{
++  UINT32  I;
++
++  for (I = 0; I < Ms; I++) {
++    gBS->Stall (1000);
++  }
++}
+ 
+-  if ((Gdscr & 0x80000000U) == 0) {
++/* ============================================================================
++ * Full 5-Register SM8550 G116Gate (Prevents AXI SError When MDSS Is Off)
++ * ============================================================================ */
++STATIC BOOLEAN
++IsMdssG116GateOpen (
++  VOID
++  )
++{
++  UINT32  CoreBcr;
++  UINT32  MdpCbcr;
++  UINT32  AhbCbcr;
++  UINT32  Gdscr;
++  UINT32  CfgGdscr;
++
++  CoreBcr  = Rd32 (DISP_CC_MDSS_CORE_BCR);
++  MdpCbcr  = Rd32 (DISP_CC_MDSS_MDP_CLK_CBCR);
++  AhbCbcr  = Rd32 (DISP_CC_MDSS_AHB_CLK_CBCR);
++  Gdscr    = Rd32 (DISP_CC_MDSS_CORE_GDSCR);
++  CfgGdscr = Rd32 (DISP_CC_MDSS_CORE_CFG_GDSCR);
++
++  if ((CoreBcr & 1U) != 0U) {
++    return FALSE;
++  }
++  if ((MdpCbcr & 0x80000001U) != 1U) {
++    return FALSE;
++  }
++  if ((AhbCbcr & 0x80000001U) != 1U) {
+     return FALSE;
+   }
+-  if ((AhbCbcr & 0x80000000U) != 0) {
++  if ((Gdscr & 0x80000007U) != 0x80000000U) {
+     return FALSE;
+   }
+-  if ((MdpCbcr & 0x80000000U) != 0) {
++  if ((CfgGdscr & 0x00018000U) != 0x00010000U) {
+     return FALSE;
+   }
+   return TRUE;
+ }
+ 
+-STATIC
+-VOID
+-RearmAutoRefreshAndKick (
+-  IN BOOLEAN  ForceKick
++/* ============================================================================
++ * Optional QCOM DSI v2.7 TPG-FIFO S6E3FAC Wake Fallback (Zero DDR DMA)
++ * Verified against S23 kernel dsi_ctrl_hw_cmn.c & s23disp_diag.c v1.0.0.2:
++ *   Short write (dtype 0x05): [b0=cmd, b1=0x00, b2=0x05, b3=0x80(LAST)]
++ *   Long write  (dtype 0x29): [b0=wc_lo, b1=wc_hi, b2=0x29, b3=0xC0(LAST|LONG)]
++ *                             + payload + 0xFF pad (4-byte aligned)
++ * ============================================================================ */
++#if S23_ENABLE_DSI_TPG_WAKE
++STATIC BOOLEAN
++Dsi0WaitIdle (
++  VOID
+   )
+ {
+-  UINT32  HwVer;
+-  UINT32  AutoRef;
+-  UINT32  TearEn;
+-  UINT32  FrameCnt;
++  UINT32  I;
+ 
+-  if (!IsMdssPoweredAndClocked ()) {
++  for (I = 0; I < 60U; I++) {
++    if ((Rd32 (DSI0_STATUS) & 0x07U) == 0U) {
++      return TRUE;
++    }
++    gBS->Stall ((I < 10U) ? 20U : 1000U);
++  }
++  return FALSE;
++}
++
++STATIC BOOLEAN
++Dsi0SendTpgFifoPkt (
++  IN CONST UINT32  *Dwords,
++  IN UINT32        NumDwords
++  )
++{
++  UINT32   SavedDmaCtrl;
++  UINT32   DmaCtrl;
++  UINT32   IntCtrl;
++  UINT32   FinalInt = 0;
++  UINT32   I;
++  BOOLEAN  Done = FALSE;
++
++  if (!Dsi0WaitIdle ()) {
++    return FALSE;
++  }
++
++  SavedDmaCtrl = Rd32 (DSI0_CMD_MODE_DMA_CTRL);
++
++  /* Cleanly reset TPG FIFO before loading */
++  Wr32 (DSI0_TPG_MAIN_CONTROL, 0U);
++  Wr32 (DSI0_TPG_DMA_FIFO_RESET, 1U);
++  gBS->Stall (2);
++  Wr32 (DSI0_TPG_DMA_FIFO_RESET, 0U);
++
++  /* CMD_DMA_TPG_EN (BIT1) | TPG_DMA_FIFO_MODE (BIT2) | custom pattern (3 << 16) */
++  Wr32 (DSI0_TPG_MAIN_CONTROL, (1U << 1) | (1U << 2) | (3U << 16));
++
++  /* Push command DWORDs; hardware requires trailing zero DWORD for odd counts */
++  for (I = 0; I < NumDwords; I++) {
++    Wr32 (DSI0_TPG_DMA_FIFO_DATA, Dwords[I]);
++  }
++  if ((NumDwords & 1U) != 0U) {
++    Wr32 (DSI0_TPG_DMA_FIFO_DATA, 0U);
++  }
++
++  /* Embedded mode (BIT28) + LPM (BIT26), clear broadcast/wc_sel/pkt_type bits */
++  DmaCtrl  = SavedDmaCtrl;
++  DmaCtrl &= ~((1U << 31) | (1U << 30) | (1U << 29) | (1U << 24));
++  DmaCtrl |= (1U << 28) | (1U << 26);
++  Wr32 (DSI0_CMD_MODE_DMA_CTRL, DmaCtrl);
++
++  /* Clear only CMD_MODE_DMA_DONE (BIT0) while preserving enable masks & BIT24/28 */
++  IntCtrl = Rd32 (DSI0_INT_CTRL);
++  Wr32 (DSI0_INT_CTRL, (IntCtrl & 0xAAEEAAFEU) | 1U);
++
++  Wr32 (DSI0_DMA_CMD_LENGTH, NumDwords * 4U);
++  Wr32 (DSI0_CMD_MODE_DMA_SW_TRIGGER, 1U);
++
++  for (I = 0; I < 75U; I++) {
++    FinalInt = Rd32 (DSI0_INT_CTRL);
++    if ((FinalInt & 1U) != 0U) {
++      Wr32 (DSI0_INT_CTRL, (FinalInt & 0xAAEEAAFEU) | 1U);
++      Done = TRUE;
++      break;
++    }
++    gBS->Stall ((I < 25U) ? 20U : 1000U);
++  }
++
++  /* Disable TPG FIFO and restore DSI_COMMAND_MODE_DMA_CTRL */
++  Wr32 (DSI0_TPG_MAIN_CONTROL, 0U);
++  Wr32 (DSI0_TPG_DMA_FIFO_RESET, 1U);
++  gBS->Stall (2);
++  Wr32 (DSI0_TPG_DMA_FIFO_RESET, 0U);
++  Wr32 (DSI0_CMD_MODE_DMA_CTRL, SavedDmaCtrl);
++  return Done;
++}
++
++STATIC VOID
++TryDsi0S6e3facWakeFallback (
++  IN BOOLEAN  SendSleepOut
++  )
++{
++  STATIC CONST UINT32  PktUnlock9f[2] = { 0xC0290003U, 0xFFA5A59FU }; /* 9F A5 A5 */
++  STATIC CONST UINT32  PktUnlockF0[2] = { 0xC0290003U, 0xFF5A5AF0U }; /* F0 5A 5A */
++  STATIC CONST UINT32  PktSlpOut[1]   = { 0x80050011U };              /* 11 (Sleep Out) */
++  STATIC CONST UINT32  PktWrCtrld[2]  = { 0xC0290002U, 0xFFFF2853U }; /* 53 28 */
++  STATIC CONST UINT32  PktDbvMax[2]   = { 0xC0290003U, 0xFFFF0751U }; /* 51 07 FF */
++  STATIC CONST UINT32  PktLatchF7[2]  = { 0xC0290002U, 0xFFFF0FF7U }; /* F7 0F */
++  STATIC CONST UINT32  PktDispOn[1]   = { 0x80050029U };              /* 29 (Display On) */
++  STATIC CONST UINT32  PktLockF0[2]   = { 0xC0290003U, 0xFFA5A5F0U }; /* F0 A5 A5 */
++  STATIC CONST UINT32  PktLock9f[2]   = { 0xC0290003U, 0xFF5A5A9FU }; /* 9F 5A 5A */
++
++  UINT32  EscCbcr  = Rd32 (DISP_CC_MDSS_ESC0_CLK_CBCR);
++  UINT32  DsiCtrl  = Rd32 (DSI0_CTRL);
++  UINT32  PrevAr;
++
++  /* Require ESC0 clock active and DSI0 enabled in command mode */
++  if ((EscCbcr & 0x80000001U) != 1U || (DsiCtrl & 0x05U) != 0x05U) {
+     return;
+   }
+ 
+-  ArmDataMemoryBarrier ();
+-  HwVer = MmioRead32 ((UINTN)MDSS_HW_VERSION);
++  /* Pause Auto-Refresh during DCS transmit so MDP and DMA do not collide */
++  PrevAr = Rd32 (MDP_INTF_1_AUTOREFRESH_CONFIG);
++  if ((PrevAr & 0x80000000U) != 0U) {
++    Wr32 (MDP_INTF_1_AUTOREFRESH_CONFIG, PrevAr & ~0x80000000U);
++    DelayMs (20);
++  }
++
++  DEBUG ((DEBUG_WARN, "S23DisplayFixDxe v2: Running DSI0 TPG-FIFO S6E3FAC wake (SlpOut=%u)\n", SendSleepOut ? 1U : 0U));
++
++  (VOID)Dsi0SendTpgFifoPkt (PktUnlock9f, 2);
++  (VOID)Dsi0SendTpgFifoPkt (PktUnlockF0, 2);
++  if (SendSleepOut) {
++    (VOID)Dsi0SendTpgFifoPkt (PktSlpOut, 1);
++    DelayMs (120);
++  }
++  (VOID)Dsi0SendTpgFifoPkt (PktWrCtrld, 2);
++  (VOID)Dsi0SendTpgFifoPkt (PktDbvMax,  2);
++  (VOID)Dsi0SendTpgFifoPkt (PktLatchF7, 2);
++  (VOID)Dsi0SendTpgFifoPkt (PktDispOn,  1);
++  (VOID)Dsi0SendTpgFifoPkt (PktLockF0,  2);
++  (VOID)Dsi0SendTpgFifoPkt (PktLock9f,  2);
++}
++#endif
++
++/* ============================================================================
++ * Command-Mode Refresh Monitor & Non-Colliding Re-Arm / Kick Logic
++ * ============================================================================ */
++STATIC VOID
++MonitorAndHealRefresh (
++  IN BOOLEAN  IsExitBootServices
++  )
++{
++  UINT32   HwVer;
++  UINT32   DsiCtrl;
++  UINT32   SyncVsync;
++  UINT32   FlcEn;
++  UINT32   FrameCnt;
++  UINT32   TearEn;
++  UINT32   TeIntCnt;
++  UINT32   AutoRef;
++  UINT32   ArStatus;
++  BOOLEAN  ArArmed;
++  BOOLEAN  Ticked = FALSE;
++  BOOLEAN  NeedKick = FALSE;
++
++  if (!IsMdssG116GateOpen ()) {
++    return;
++  }
++
++  HwVer = Rd32 (MDSS_HW_VERSION);
+   if ((HwVer == 0U) || (HwVer == 0xFFFFFFFFU)) {
+     return;
+   }
+ 
+-  TearEn   = MmioRead32 ((UINTN)MDP_INTF_1_TEAR_CHECK_EN);
+-  AutoRef  = MmioRead32 ((UINTN)MDP_INTF_1_AUTOREFRESH_CONFIG);
+-  FrameCnt = MmioRead32 ((UINTN)MDP_INTF_1_FRAME_COUNT);
+-
+-  if (ForceKick || ((TearEn & 1U) == 0U) || ((AutoRef & 0x80000000U) == 0U) ||
+-      (mHaveFrameSample && (FrameCnt == mLastFrameCount)))
+-  {
+-    MmioWrite32 ((UINTN)MDP_INTF_1_TEAR_CHECK_EN, 1U);
+-    MmioWrite32 ((UINTN)MDP_INTF_1_AUTOREFRESH_CONFIG, AUTOREFRESH_ENABLE_60HZ);
+-    ArmDataMemoryBarrier ();
+-    MmioWrite32 ((UINTN)MDP_CTL_0_START, 1U);
+-    ArmDataMemoryBarrier ();
++  /* Verify DSI0 command mode & TE VSYNC path are configured before touching AR/CTL_0 */
++  DsiCtrl   = Rd32 (DSI0_CTRL);
++  SyncVsync = Rd32 (MDP_INTF_1_SYNC_VSYNC);
++  if (((DsiCtrl & 0x05U) != 0x05U) || ((SyncVsync & (1U << 19)) == 0U)) {
++    return;
+   }
+ 
+-  mLastFrameCount  = FrameCnt;
+-  mHaveFrameSample = TRUE;
++  FlcEn    = Rd32 (MDP_INTF_1_FLC_EN);
++  FrameCnt = Rd32 (MDP_INTF_1_FRAME_COUNT);
++  TearEn   = Rd32 (MDP_INTF_1_TEAR_CHECK_EN);
++  TeIntCnt = Rd32 (MDP_INTF_1_TEAR_INT_COUNT);
++  AutoRef  = Rd32 (MDP_INTF_1_AUTOREFRESH_CONFIG);
++  ArStatus = Rd32 (MDP_INTF_1_AUTOREFRESH_STATUS);
++
++  ArArmed = ((TearEn & 1U) != 0U) && ((AutoRef & 0x80000000U) != 0U);
++
++  if (mHaveSample) {
++    /* Primary command-mode progress signals: AR_STATUS (+0x2C0) and TE_INT_CNT (+0x298).
++     * Only consult FRAME_COUNT (+0xAC) when FLC_EN (+0xA8) != 0 (avoids false-stall spam!). */
++    if ((ArStatus != mLastArStatus) || (TeIntCnt != mLastTeIntCnt) ||
++        ((FlcEn != 0U) && (FrameCnt != mLastFrameCount))) {
++      Ticked = TRUE;
++      mObservedTicking = TRUE;
++      mStallStreak = 0;
++    } else if (ArArmed) {
++      mStallStreak++;
++    }
++  }
++
++  if (!ArArmed) {
++    NeedKick = TRUE;
++  } else if (IsExitBootServices) {
++    /* Non-colliding ExitBootServices handoff: if AR is armed and has been ticking cleanly,
++     * do NOT slam MDP_CTL_0_START mid-scanout; only kick if stalled! */
++    if (!mObservedTicking || (mStallStreak >= 2U)) {
++      NeedKick = TRUE;
++    }
++  } else if (mHaveSample && !Ticked && (mStallStreak >= 2U)) {
++    NeedKick = TRUE;
++  }
++
++  if (NeedKick) {
++    Wr32 (MDP_INTF_1_TEAR_CHECK_EN, 1U);
++    Wr32 (MDP_INTF_1_AUTOREFRESH_CONFIG, AUTOREFRESH_ENABLE_60HZ);
++    Wr32 (MDP_CTL_0_START, 1U);
++    mStallStreak = 0;
++  }
++
++  mLastFrameCount = FrameCnt;
++  mLastTeIntCnt   = TeIntCnt;
++  mLastArStatus   = ArStatus;
++  mHaveSample     = TRUE;
+ }
+ 
+-STATIC
+-VOID
++STATIC VOID
+ EFIAPI
+ OnRefreshTimer (
+   IN EFI_EVENT  Event,
+@@ -109,11 +385,10 @@
+ {
+   (VOID)Event;
+   (VOID)Context;
+-  RearmAutoRefreshAndKick (FALSE);
++  MonitorAndHealRefresh (FALSE);
+ }
+ 
+-STATIC
+-VOID
++STATIC VOID
+ EFIAPI
+ OnExitBootServices (
+   IN EFI_EVENT  Event,
+@@ -127,7 +402,7 @@
+     gBS->SetTimer (mRefreshTimer, TimerCancel, 0);
+   }
+ 
+-  RearmAutoRefreshAndKick (TRUE);
++  MonitorAndHealRefresh (TRUE);
+ }
+ 
+ EFI_STATUS
+@@ -142,12 +417,44 @@
+   (VOID)ImageHandle;
+   (VOID)SystemTable;
+ 
+-  if (IsMdssPoweredAndClocked ()) {
+-    DEBUG ((DEBUG_INFO, "S23DisplayFixDxe: MDSS gate open (HW_VER=0x%08X), arming Auto-Refresh\n",
+-      MmioRead32 ((UINTN)MDSS_HW_VERSION)));
+-    RearmAutoRefreshAndKick (TRUE);
++  if (IsMdssG116GateOpen ()) {
++    UINT32  HwVer    = Rd32 (MDSS_HW_VERSION);
++    UINT32  DsiCtrl  = Rd32 (DSI0_CTRL);
++    UINT32  SyncVs   = Rd32 (MDP_INTF_1_SYNC_VSYNC);
++    UINT32  Te1      = Rd32 (MDP_INTF_1_TEAR_INT_COUNT);
++    UINT32  ArSt1    = Rd32 (MDP_INTF_1_AUTOREFRESH_STATUS);
++    UINT32  Te2;
++    UINT32  ArSt2;
++
++    DEBUG ((DEBUG_INFO, "S23DisplayFixDxe v2: G116Gate OPEN (HW_VER=0x%08X DSI0=0x%08X SYNC=0x%08X)\n",
++      HwVer, DsiCtrl, SyncVs));
++
++    /* Observe 35 ms window at DXE entry to classify live ticking vs warm-reboot blanked panel */
++    DelayMs (35);
++    Te2   = Rd32 (MDP_INTF_1_TEAR_INT_COUNT);
++    ArSt2 = Rd32 (MDP_INTF_1_AUTOREFRESH_STATUS);
++
++    if ((ArSt2 != ArSt1) || (Te2 != Te1)) {
++      mObservedTicking = TRUE;
++    }
++
++#if S23_ENABLE_DSI_TPG_WAKE
++    /* If DSI0 command mode & TE VSYNC are configured but TE_INT_CNT did not tick over 35 ms,
++     * panel is likely blanked/asleep after warm reboot from recovery: wake via TPG-FIFO first. */
++    if (((DsiCtrl & 0x05U) == 0x05U) && ((SyncVs & (1U << 19)) != 0U) && (Te2 == Te1)) {
++      TryDsi0S6e3facWakeFallback (TRUE);
++    }
++#endif
++
++    mLastFrameCount = Rd32 (MDP_INTF_1_FRAME_COUNT);
++    mLastTeIntCnt   = Te2;
++    mLastArStatus   = ArSt2;
++    mHaveSample     = TRUE;
++
++    /* Ensure Auto-Refresh is armed once if not already armed & ticking */
++    MonitorAndHealRefresh (FALSE);
+   } else {
+-    DEBUG ((DEBUG_WARN, "S23DisplayFixDxe: MDSS GDSC/clocks off at DXE entry; skipping MMIO\n"));
++    DEBUG ((DEBUG_WARN, "S23DisplayFixDxe v2: 5-register G116Gate CLOSED at DXE entry; skipping MMIO\n"));
+   }
+ 
+   Status = gBS->CreateEvent (
+@@ -158,7 +465,8 @@
+                   &mRefreshTimer
+                   );
+   if (!EFI_ERROR (Status)) {
+-    gBS->SetTimer (mRefreshTimer, TimerPeriodic, 330000ULL);
++    /* 100 ms periodic watchdog (non-intrusive; checks AR_STATUS + TE_INT_CNT deltas) */
++    gBS->SetTimer (mRefreshTimer, TimerPeriodic, 1000000ULL);
+   }
+ 
+   gBS->CreateEventEx (

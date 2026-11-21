@@ -1,0 +1,47 @@
+; s23keys.inf - Samsung Galaxy S23 (dm1q) Native HID Physical Buttons Minidriver
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = HIDClass
+ClassGuid   = {745a17a0-74d3-11d0-b6fe-00a0c90f57da}
+Provider    = %ProviderName%
+DriverVer   = 11/21/2026,1.0.0.1
+CatalogFile = s23keys.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+s23keys.sys = 1
+
+[Manufacturer]
+%ManufacturerName% = Models,NTARM64
+
+[Models.NTARM64]
+%DeviceName% = S23Keys_Inst, ROOT\S23KEYS
+
+[S23Keys_Inst.NT]
+CopyFiles = S23Keys_Copy
+
+[S23Keys_Copy]
+s23keys.sys
+
+[S23Keys_Inst.NT.Services]
+AddService = s23keys, 0x00000002, S23Keys_Service
+
+[S23Keys_Service]
+DisplayName    = %ServiceName%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %13%\s23keys.sys
+
+[Strings]
+ProviderName     = "S23 Windows Bringup"
+ManufacturerName = "Samsung Galaxy S23"
+DiskName         = "S23 Physical Buttons Driver Disk"
+DeviceName       = "Samsung Galaxy S23 Physical Power and Volume Buttons"
+ServiceName      = "S23 Native HID Physical Buttons Minidriver"

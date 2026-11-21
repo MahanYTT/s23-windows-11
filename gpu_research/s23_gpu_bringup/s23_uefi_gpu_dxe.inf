@@ -1,0 +1,40 @@
+## @file
+#  s23_uefi_gpu_dxe.inf - Samsung Galaxy S23 (dm1q / SM8550-AC) Adreno 740 Pre-EBS UEFI DXE
+#
+#  Staged offline under gpu_research/s23_gpu_bringup/ (do NOT modify Mu-Silicium during live session).
+#  To integrate into Mu-dm1q-gpu.img later:
+#    1. Copy s23_uefi_gpu_dxe.{c,inf} and s23_gpu_acpi.hex into Platforms/Samsung/dm1qPkg/Drivers/S23GpuDxe/
+#    2. Add S23GpuDxe.inf to dm1q.dsc and dm1q.fdf (optional: -DS23_INCLUDE_GPU_SSDT_AML)
+#    3. Ensure IORT.aml includes level-triggered GPU SMMU-500 (0x03DA0000) context interrupts.
+##
+
+[Defines]
+  INF_VERSION                    = 0x0001001B
+  BASE_NAME                      = S23GpuDxe
+  FILE_GUID                      = 8B4E3C21-7A10-4D6F-9B83-2E4F5A6B7C8D
+  MODULE_TYPE                    = DXE_DRIVER
+  VERSION_STRING                 = 1.0
+  ENTRY_POINT                    = S23GpuDxeEntry
+
+[Sources]
+  s23_uefi_gpu_dxe.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  ArmPkg/ArmPkg.dec
+
+[LibraryClasses]
+  BaseLib
+  BaseMemoryLib
+  DebugLib
+  DxeServicesTableLib
+  IoLib
+  TimerLib
+  UefiBootServicesTableLib
+  UefiDriverEntryPoint
+
+[Protocols]
+  gEfiAcpiTableProtocolGuid
+
+[Depex]
+  gEfiAcpiTableProtocolGuid

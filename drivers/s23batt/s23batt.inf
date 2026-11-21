@@ -1,0 +1,53 @@
+; s23batt.inf - Samsung Galaxy S23 (dm1q) MAX77705 Native Battery Miniclass Driver
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Battery
+ClassGuid   = {72631e54-78a4-11d0-bcf7-00aa00b7b32a}
+Provider    = %ProviderName%
+DriverVer   = 01/15/2024,1.0.0.1
+CatalogFile = s23batt.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+s23batt.sys = 1
+
+[Manufacturer]
+%ManufacturerName% = Models,NTARM64
+
+[Models.NTARM64]
+%DeviceName% = S23Batt_Inst, ROOT\S23BATT
+
+[S23Batt_Inst.NT]
+Include   = battery.inf
+Needs     = Battery_Inst
+CopyFiles = S23Batt_Copy
+AddReg    = S23Batt_AddReg
+
+[S23Batt_Copy]
+s23batt.sys
+
+[S23Batt_AddReg]
+HKR,,PowerSourceType,0x00000001,00,00,00,00
+
+[S23Batt_Inst.NT.Services]
+AddService = s23batt, 0x00000002, S23Batt_Service
+
+[S23Batt_Service]
+DisplayName    = %ServiceName%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %13%\s23batt.sys
+
+[Strings]
+ProviderName     = "S23 Windows Bringup"
+ManufacturerName = "Samsung Galaxy S23"
+DiskName         = "S23 Battery Driver Disk"
+DeviceName       = "Samsung Galaxy S23 MAX77705 Battery"
+ServiceName      = "S23 MAX77705 Battery Miniclass Driver"

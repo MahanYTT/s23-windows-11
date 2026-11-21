@@ -1,0 +1,596 @@
+--- /dev/null
++++ b/Platforms/Samsung/dm1qPkg/Library/MemoryMapLib/MemoryMapLib.c
+@@ -0,0 +1,69 @@
++#include <Library/MemoryMapLib.h>
++STATIC
++EFI_MEMORY_REGION_DESCRIPTOR
++gMemoryDescriptor[] = {
++  // Name, Address, Length, HobOption, ResourceType, ResourceAttribute, MemoryType, ArmAttribute
++  // DDR Regions (exact Samsung Galaxy S23 dm1q S911BXXS8DYI3 + Gunyah/Windows carveouts)
++  {"HYP",                0x80000000, 0x00A00000, AddMem, MEM_RES, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},
++  {"CPUSYS VM",          0x80A00000, 0x00400000, AddMem, MEM_RES, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},
++  {"NOMAP Tail",         0x80E00000, 0x00400000, AddMem, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},
++  {"RSRV0",              0x81200000, 0x00800000, AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},
++  {"XBL DT",             0x81A00000, 0x00040000, AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},
++  {"XBL Ramdump",        0x81A40000, 0x001C0000, AddMem, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},
++  {"AOP",                0x81C00000, 0x000F4000, AddMem, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},
++  {"Chip Info",          0x81CF4000, 0x00001000, AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},
++  {"SMEM",               0x81D00000, 0x00200000, AddMem, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},
++  {"ADSP MHI",           0x81F00000, 0x00020000, AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},
++  {"TZ STATS",           0x82700000, 0x00100000, AddMem, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},
++  {"RSRV1",              0x86E00000, 0x02A00000, AddMem, MEM_RES, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},
++  {"PIL Reserved",       0x89800000, 0x19280000, AddMem, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},
++  {"Display Demura",     0xA2A80000, 0x02B00000, AddMem, MEM_RES, SYS_MEM_CAP, Reserv, WRITE_THROUGH_XN},
++  {"RSRV2",              0xA5580000, 0x00B80000, AddMem, MEM_RES, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},
++  {"DBI Dump",           0xA6100000, 0x00F00000, NoHob,  MMAP_IO, INITIALIZED, Conv,   UNCACHED_UNBUFFERED_XN},
++  {"FD Reserved",        0xA7000000, 0x00100000, AddMem, SYS_MEM, SYS_MEM_CAP, BsData, WRITE_BACK},
++  {"UEFI FD",            0xA7100000, 0x00300000, AddMem, SYS_MEM, SYS_MEM_CAP, BsData, WRITE_BACK},
++  {"UEFI FD Reserved",   0xA7400000, 0x00200000, AddMem, SYS_MEM, SYS_MEM_CAP, BsData, WRITE_BACK},
++  {"CPU Vectors",        0xA7600000, 0x00001000, AddMem, SYS_MEM, SYS_MEM_CAP, BsData, WRITE_BACK},
++  {"Info Blk",           0xA7601000, 0x00001000, AddMem, SYS_MEM, SYS_MEM_CAP, RtData, WRITE_BACK_XN},
++  {"MMU PageTables",     0xA7602000, 0x00003000, AddMem, SYS_MEM, SYS_MEM_CAP, BsData, WRITE_BACK_XN},
++  {"Log Buffer",         0xA7605000, 0x00008000, AddMem, SYS_MEM, SYS_MEM_CAP, RtData, WRITE_BACK_XN},
++  {"UEFI Stack",         0xA760D000, 0x00040000, AddMem, SYS_MEM, SYS_MEM_CAP, BsData, WRITE_BACK_XN},
++  {"SEC Heap",           0xA764D000, 0x0008C000, AddMem, SYS_MEM, SYS_MEM_CAP, BsData, WRITE_BACK_XN},
++  {"Sched Heap",         0xA76D9000, 0x00400000, AddMem, SYS_MEM, SYS_MEM_CAP, BsData, WRITE_BACK_XN},
++  {"FV Region",          0xA7AD9000, 0x00400000, AddMem, SYS_MEM, SYS_MEM_CAP, BsData, WRITE_BACK_XN},
++  {"UEFI RESV",          0xA7ED9000, 0x00127000, AddMem, SYS_MEM, SYS_MEM_CAP, BsData, WRITE_BACK_XN},
++  {"Kernel",             0xA8000000, 0x10000000, AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},
++  {"Display Reserved",   0xB8000000, 0x02B00000, AddMem, MEM_RES, SYS_MEM_CAP, Reserv, WRITE_THROUGH_XN},
++  {"DXE Heap",           0xBAB00000, 0x0D1C0000, AddMem, SYS_MEM, SYS_MEM_CAP, Conv,   WRITE_BACK_XN},
++  {"CPUCP FW",           0xD8140000, 0x001C0000, AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, UNCACHED_UNBUFFERED_XN},
++  {"QTEE",               0xD8300000, 0x00500000, AddMem, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},
++  {"TZApps Reserved",    0xD8800000, 0x08A00000, AddMem, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},
++  {"RSRV3",              0xEEB00000, 0x04B00000, AddMem, MEM_RES, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},
++  {"NOMAP High",         0xFF800000, 0x00800000, AddMem, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},
++  // Other Memory Regions
++  {"IMEM Base",          0x14680000, 0x0002A000, NoHob,  MMAP_IO, INITIALIZED, Conv,   NS_DEVICE},
++  {"IMEM Cookie Base",   0x146AA000, 0x00016000, AddDev, MMAP_IO, INITIALIZED, Conv,   NS_DEVICE},
++  // Register Regions
++  {"IPC_ROUTER_TOP",     0x00400000, 0x00100000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
++  {"SECURITY CONTROL",   0x00780000, 0x00007000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
++  {"QUP",                0x00800000, 0x00300000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
++  {"PRNG_CFG_PRNG",      0x010C0000, 0x0000C000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
++  {"CRYPTO0 CRYPTO",     0x01DC0000, 0x00040000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
++  {"CORE_TOP_CSR",       0x01F00000, 0x00100000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
++  {"PERIPH_SS",          0x08800000, 0x00100000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
++  {"USB",                0x0A600000, 0x00200000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
++  {"MDSS",               0x0AE00000, 0x00100000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
++  {"DISP_CC",            0x0AF00000, 0x00020000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
++  {"AOSS",               0x0B000000, 0x04000000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
++  {"TLMM",               0x0F000000, 0x01000000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
++  {"SMMU",               0x15000000, 0x00200000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
++  {"APSS_HM",            0x17000000, 0x02000000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE}
++};
++VOID
++GetMemoryMap (
++  OUT EFI_MEMORY_REGION_DESCRIPTOR **MemoryDescriptor,
++  OUT UINT8                         *MemoryDescriptorCount)
++{
++  *MemoryDescriptor      = gMemoryDescriptor;
++  *MemoryDescriptorCount = ARRAY_SIZE (gMemoryDescriptor);
++}
+--- /dev/null
++++ b/Platforms/Samsung/dm1qPkg/dm1q.dsc
+@@ -0,0 +1,87 @@
++##
++#  Copyright (c) 2011 - 2022, ARM Limited. All rights reserved.
++#  Copyright (c) 2014, Linaro Limited. All rights reserved.
++#  Copyright (c) 2015 - 2020, Intel Corporation. All rights reserved.
++#  Copyright (c) 2018, Bingxing Wang. All rights reserved.
++#  Copyright (c) Microsoft Corporation.
++#
++#  SPDX-License-Identifier: BSD-2-Clause-Patent
++##
++
++################################################################################
++#
++# Defines Section - statements that will be processed to create a Makefile.
++#
++################################################################################
++[Defines]
++  PLATFORM_NAME                  = dm1q
++  PLATFORM_GUID                  = 4C8D9B1E-3F7A-4A52-9C11-D1A2E5B7C811
++  PLATFORM_VERSION               = 0.1
++  DSC_SPECIFICATION              = 0x00010005
++  OUTPUT_DIRECTORY               = Build/dm1qPkg
++  SUPPORTED_ARCHITECTURES        = AARCH64
++  BUILD_TARGETS                  = RELEASE|DEBUG
++  SKUID_IDENTIFIER               = DEFAULT
++  FLASH_DEFINITION               = dm1qPkg/dm1q.fdf
++  USE_CUSTOM_DISPLAY_DRIVER      = 0
++
++  #
++  # 0 = SM8550-AB
++  # 1 = SM8550-AC
++  #
++  SOC_TYPE                       = 1
++
++!include KailuaPkg/KailuaPkg.dsc.inc
++
++[PcdsFixedAtBuild]
++  #
++  # DDR Memory
++  #
++  gArmTokenSpaceGuid.PcdSystemMemoryBase|0x80000000
++
++  #
++  # UEFI Stack
++  #
++  gArmPlatformTokenSpaceGuid.PcdCPUCoresStackBase|0xA760D000
++  gArmPlatformTokenSpaceGuid.PcdCPUCorePrimaryStackSize|0x40000
++
++  #
++  # SMBIOS
++  #
++  gSiliciumPkgTokenSpaceGuid.PcdSmbiosSystemManufacturer|"Samsung"
++  gSiliciumPkgTokenSpaceGuid.PcdSmbiosSystemModel|"Galaxy S23"
++  gSiliciumPkgTokenSpaceGuid.PcdSmbiosSystemRetailModel|"dm1q"
++  gSiliciumPkgTokenSpaceGuid.PcdSmbiosSystemRetailSku|"Galaxy_S23+_dm1q"
++  gSiliciumPkgTokenSpaceGuid.PcdSmbiosSystemBoardModel|"Galaxy S23"
++
++  #
++  # Simple Frame Buffer
++  #
++  gSiliciumPkgTokenSpaceGuid.PcdFrameBufferWidth|1080
++  gSiliciumPkgTokenSpaceGuid.PcdFrameBufferHeight|2340
++  gSiliciumPkgTokenSpaceGuid.PcdFrameBufferColorDepth|32
++
++  #
++  # Platform PEI
++  #
++  gQcomPkgTokenSpaceGuid.PcdPlatformType|"WP"
++
++[LibraryClasses]
++  #
++  # Memory Libraries
++  #
++  MemoryMapLib|dm1qPkg/Library/MemoryMapLib/MemoryMapLib.inf
++
++  #
++  # QCOM Libraries
++  #
++  ConfigurationMapLib|dm1qPkg/Library/ConfigurationMapLib/ConfigurationMapLib.inf
++
++[Components]
++  #
++  # ACPI Tables
++  #
++  dm1q/AcpiTables.inf
++
++  # S23 Command-Mode Display Auto-Refresh Keeper
++  dm1qPkg/Drivers/S23DisplayFixDxe/S23DisplayFixDxe.inf
+--- /dev/null
++++ b/Platforms/Samsung/dm1qPkg/Include/DXE.inc
+@@ -0,0 +1,107 @@
++  INF MdeModulePkg/Core/Dxe/DxeMain.inf
++  INF MdeModulePkg/Universal/PCD/Dxe/Pcd.inf
++
++  INF Binaries/dm1q/QcomPkg/Drivers/EnvDxe/EnvDxe.inf
++
++  INF MdeModulePkg/Universal/ReportStatusCodeRouter/RuntimeDxe/ReportStatusCodeRouterRuntimeDxe.inf
++  INF MdeModulePkg/Universal/StatusCodeHandler/RuntimeDxe/StatusCodeHandlerRuntimeDxe.inf
++  INF ArmPkg/Drivers/CpuDxe/CpuDxe.inf
++  INF MdeModulePkg/Core/RuntimeDxe/RuntimeDxe.inf
++  INF MdeModulePkg/Universal/SecurityStubDxe/SecurityStubDxe.inf
++
++  INF Binaries/dm1q/QcomPkg/Drivers/ShmBridgeDxe/ShmBridgeDxeLA.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/TzDxe/ScmDxeCompat.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/TzDxe/TzDxeLA.inf
++
++  INF MdeModulePkg/Universal/WatchdogTimerDxe/WatchdogTimer.inf
++  INF MdeModulePkg/Universal/CapsuleRuntimeDxe/CapsuleRuntimeDxe.inf
++  INF MdeModulePkg/Universal/Variable/RuntimeDxe/VariableRuntimeDxe.inf
++  INF EmbeddedPkg/EmbeddedMonotonicCounter/EmbeddedMonotonicCounter.inf
++  INF MdeModulePkg/Universal/ResetSystemRuntimeDxe/ResetSystemRuntimeDxe.inf
++  INF EmbeddedPkg/RealTimeClockRuntimeDxe/RealTimeClockRuntimeDxe.inf
++  INF EmbeddedPkg/MetronomeDxe/MetronomeDxe.inf
++  INF MdeModulePkg/Universal/HiiDatabaseDxe/HiiDatabaseDxe.inf
++  INF ArmPkg/Drivers/ArmGicDxe/ArmGicDxe.inf
++  INF ArmPkg/Drivers/TimerDxe/TimerDxe.inf
++
++  INF Binaries/dm1q/QcomPkg/Drivers/ChipInfoDxe/ChipInfoDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/IPCCDxe/IPCCDxe.inf
++  #INF Binaries/dm1q/QcomPkg/Drivers/GLinkDxe/GLinkDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/PlatformInfoDxe/PlatformInfoDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/DALSYSDxe/DALSYSDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/HALIOMMUDxe/HALIOMMUDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/HWIODxe/HWIODxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/I2CDxe/I2CDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/TLMMDxe/TLMMDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/PmicDxe/PmicDxeLa.inf
++
++  INF MdeModulePkg/Universal/DevicePathDxe/DevicePathDxe.inf
++  INF MdeModulePkg/Universal/Disk/DiskIoDxe/DiskIoDxe.inf
++  INF MdeModulePkg/Universal/Disk/PartitionDxe/PartitionDxe.inf
++  INF FatPkg/EnhancedFatDxe/Fat.inf
++  INF MdeModulePkg/Universal/Disk/UnicodeCollation/EnglishDxe/EnglishDxe.inf
++
++  INF Binaries/dm1q/QcomPkg/Drivers/UFSDxe/UFSDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/CmdDbDxe/CmdDbDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/PwrUtilsDxe/PwrUtilsDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/RpmhDxe/RpmhDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/NpaDxe/NpaDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/ULogDxe/ULogDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/VcsDxe/VcsDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/ClockDxe/ClockDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/SPMIDxe/SPMIDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/ICBDxe/ICBDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/SmemDxe/SmemDxe.inf
++
++  INF MdeModulePkg/Universal/BdsDxe/BdsDxe.inf
++
++  INF Binaries/dm1q/QcomPkg/Drivers/RscDxe/RscDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/DDRInfoDxe/DDRInfoDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/SamsungDxe/SubPmicDxe/SubPmicDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/SamsungDxe/CcicDxe/CcicDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/SamsungDxe/RedriverDxe/RedriverDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/SamsungDxe/MuicDxe/MuicDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/SamsungDxe/ChgDxe/ChgDxe.inf
++
++  INF EmbeddedPkg/SimpleTextInOutSerial/SimpleTextInOutSerial.inf
++  INF MdeModulePkg/Universal/PrintDxe/PrintDxe.inf
++  INF MdeModulePkg/Universal/Console/ConPlatformDxe/ConPlatformDxe.inf
++  INF MdeModulePkg/Universal/Console/ConSplitterDxe/ConSplitterDxe.inf
++  INF MdeModulePkg/Universal/Console/GraphicsConsoleDxe/GraphicsConsoleDxe.inf
++
++!if $(USE_CUSTOM_DISPLAY_DRIVER) == 1
++  INF Binaries/dm1q/QcomPkg/Drivers/CPRDxe/CPRDxe.inf
++!endif
++  INF Binaries/dm1q/QcomPkg/Drivers/GpiDxe/GpiDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/SPIDxe/SPIDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/SdccDxe/SdccDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/FeatureEnablerDxe/FeatureEnablerDxe.inf
++
++!if $(USE_CUSTOM_DISPLAY_DRIVER) == 1
++  INF Binaries/dm1q/QcomPkg/Drivers/DisplayDxe/DisplayDxe.inf
++!else
++  INF SiliciumPkg/Drivers/SimpleFbDxe/SimpleFbDxe.inf
++  INF dm1qPkg/Drivers/S23DisplayFixDxe/S23DisplayFixDxe.inf
++!endif
++
++  INF Binaries/dm1q/QcomPkg/Drivers/ButtonsDxe/ButtonsDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/UsbPwrCtrlDxe/UsbPwrCtrlDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/TsensDxe/TsensDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/LimitsDxe/LimitsDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/UsbfnDwc3Dxe/UsbfnDwc3Dxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/XhciPciEmulationDxe/XhciPciEmulationDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/XhciDxe/XhciDxe.inf
++
++  INF MdeModulePkg/Bus/Usb/UsbBusDxe/UsbBusDxe.inf
++  INF MdeModulePkg/Bus/Usb/UsbKbDxe/UsbKbDxe.inf
++  INF MdeModulePkg/Bus/Usb/UsbMassStorageDxe/UsbMassStorageDxe.inf
++
++  INF Binaries/dm1q/QcomPkg/Drivers/UsbMsdDxe/UsbMsdDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/UsbDeviceDxe/UsbDeviceDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/UsbConfigDxe/UsbConfigDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/UsbInitDxe/UsbInitDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/UCDxe/UCDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/RNGDxe/RngDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/PILDxe/PILDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/PILProxyDxe/PILProxyDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/SPSSDxe/SPSSDxe.inf
+--- /dev/null
++++ b/Platforms/Samsung/dm1qPkg/Include/APRIORI.inc
+@@ -0,0 +1,113 @@
++APRIORI DXE {
++  INF MdeModulePkg/Core/Dxe/DxeMain.inf
++  INF MdeModulePkg/Universal/PCD/Dxe/Pcd.inf
++  INF QcomPkg/Drivers/IortDtDxe/IortDtDxe.inf
++
++  INF Binaries/dm1q/QcomPkg/Drivers/EnvDxe/EnvDxe.inf
++
++  INF MdeModulePkg/Universal/ReportStatusCodeRouter/RuntimeDxe/ReportStatusCodeRouterRuntimeDxe.inf
++  INF MdeModulePkg/Universal/StatusCodeHandler/RuntimeDxe/StatusCodeHandlerRuntimeDxe.inf
++  INF MdeModulePkg/Core/RuntimeDxe/RuntimeDxe.inf
++  INF ArmPkg/Drivers/CpuDxe/CpuDxe.inf
++  INF ArmPkg/Drivers/ArmGicDxe/ArmGicDxe.inf
++  INF EmbeddedPkg/MetronomeDxe/MetronomeDxe.inf
++  INF ArmPkg/Drivers/TimerDxe/TimerDxe.inf
++
++  INF Binaries/dm1q/QcomPkg/Drivers/SmemDxe/SmemDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/DALSYSDxe/DALSYSDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/HWIODxe/HWIODxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/ChipInfoDxe/ChipInfoDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/PlatformInfoDxe/PlatformInfoDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/HALIOMMUDxe/HALIOMMUDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/ULogDxe/ULogDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/IPCCDxe/IPCCDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/GLinkDxe/GLinkDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/CmdDbDxe/CmdDbDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/PwrUtilsDxe/PwrUtilsDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/NpaDxe/NpaDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/RpmhDxe/RpmhDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/VcsDxe/VcsDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/ClockDxe/ClockDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/ICBDxe/ICBDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/ShmBridgeDxe/ShmBridgeDxeLA.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/TzDxe/ScmDxeCompat.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/TLMMDxe/TLMMDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/I2CDxe/I2CDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/SPMIDxe/SPMIDxe.inf
++
++  INF MdeModulePkg/Universal/ResetSystemRuntimeDxe/ResetSystemRuntimeDxe.inf
++
++  INF Binaries/dm1q/QcomPkg/Drivers/PmicDxe/PmicDxeLa.inf
++
++  INF MdeModulePkg/Universal/Disk/DiskIoDxe/DiskIoDxe.inf
++  INF MdeModulePkg/Universal/Disk/PartitionDxe/PartitionDxe.inf
++  INF MdeModulePkg/Universal/Disk/UnicodeCollation/EnglishDxe/EnglishDxe.inf
++
++  INF Binaries/dm1q/QcomPkg/Drivers/SdccDxe/SdccDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/UFSDxe/UFSDxe.inf
++
++  INF FatPkg/EnhancedFatDxe/Fat.inf
++
++  INF Binaries/dm1q/QcomPkg/Drivers/TzDxe/TzDxeLA.inf
++
++  INF MdeModulePkg/Universal/Variable/RuntimeDxe/VariableRuntimeDxe.inf
++
++  INF Binaries/dm1q/QcomPkg/Drivers/DDRInfoDxe/DDRInfoDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/SamsungDxe/SubPmicDxe/SubPmicDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/SamsungDxe/CcicDxe/CcicDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/SamsungDxe/RedriverDxe/RedriverDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/SamsungDxe/MuicDxe/MuicDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/SamsungDxe/ChgDxe/ChgDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/FeatureEnablerDxe/FeatureEnablerDxe.inf
++
++!if $(USE_CUSTOM_DISPLAY_DRIVER) == 1
++  INF Binaries/dm1q/QcomPkg/Drivers/DisplayDxe/DisplayDxe.inf
++!else
++  INF SiliciumPkg/Drivers/SimpleFbDxe/SimpleFbDxe.inf
++  INF dm1qPkg/Drivers/S23DisplayFixDxe/S23DisplayFixDxe.inf
++!endif
++
++  INF Binaries/dm1q/QcomPkg/Drivers/PILProxyDxe/PILProxyDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/PILDxe/PILDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/SPSSDxe/SPSSDxe.inf
++
++  INF MdeModulePkg/Universal/WatchdogTimerDxe/WatchdogTimer.inf
++  INF MdeModulePkg/Universal/SecurityStubDxe/SecurityStubDxe.inf
++  INF EmbeddedPkg/EmbeddedMonotonicCounter/EmbeddedMonotonicCounter.inf
++  INF EmbeddedPkg/RealTimeClockRuntimeDxe/RealTimeClockRuntimeDxe.inf
++  INF MdeModulePkg/Universal/PrintDxe/PrintDxe.inf
++  INF MdeModulePkg/Universal/DevicePathDxe/DevicePathDxe.inf
++  INF MdeModulePkg/Universal/CapsuleRuntimeDxe/CapsuleRuntimeDxe.inf
++  INF MdeModulePkg/Universal/HiiDatabaseDxe/HiiDatabaseDxe.inf
++  INF MdeModulePkg/Universal/BdsDxe/BdsDxe.inf
++
++  INF Binaries/dm1q/QcomPkg/Drivers/SPIDxe/SPIDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/UsbPwrCtrlDxe/UsbPwrCtrlDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/UsbfnDwc3Dxe/UsbfnDwc3Dxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/XhciPciEmulationDxe/XhciPciEmulationDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/XhciDxe/XhciDxe.inf
++
++  INF MdeModulePkg/Bus/Usb/UsbBusDxe/UsbBusDxe.inf
++  INF MdeModulePkg/Bus/Usb/UsbKbDxe/UsbKbDxe.inf
++  INF MdeModulePkg/Bus/Usb/UsbMassStorageDxe/UsbMassStorageDxe.inf
++
++  INF Binaries/dm1q/QcomPkg/Drivers/UsbMsdDxe/UsbMsdDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/UsbDeviceDxe/UsbDeviceDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/UsbConfigDxe/UsbConfigDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/ButtonsDxe/ButtonsDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/TsensDxe/TsensDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/LimitsDxe/LimitsDxe.inf
++!if $(USE_CUSTOM_DISPLAY_DRIVER) == 1
++  INF Binaries/dm1q/QcomPkg/Drivers/CPRDxe/CPRDxe.inf
++!endif
++  INF Binaries/dm1q/QcomPkg/Drivers/GpiDxe/GpiDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/UCDxe/UCDxe.inf
++  INF Binaries/dm1q/QcomPkg/Drivers/RNGDxe/RngDxe.inf
++
++  INF EmbeddedPkg/SimpleTextInOutSerial/SimpleTextInOutSerial.inf
++  INF MdeModulePkg/Universal/Console/ConPlatformDxe/ConPlatformDxe.inf
++  INF MdeModulePkg/Universal/Console/ConSplitterDxe/ConSplitterDxe.inf
++  INF MdeModulePkg/Universal/Console/GraphicsConsoleDxe/GraphicsConsoleDxe.inf
++
++  INF Binaries/dm1q/QcomPkg/Drivers/RscDxe/RscDxe.inf
++}
+--- /dev/null
++++ b/Platforms/Samsung/dm1qPkg/Drivers/S23DisplayFixDxe/S23DisplayFixDxe.c
+@@ -0,0 +1,174 @@
++/** @file
++  S23DisplayFixDxe - Samsung Galaxy S23 (dm1q / SM8550-AC) Command-Mode Display Auto-Refresh Keeper.
++
++  Ensures the DM1_S6E3FAC_AMB606AW01 DSI command-mode panel stays actively refreshed
++  across UEFI boot and ExitBootServices handoff into Windows 11 SimpleFB (0xB8000000),
++  strictly gated by DISP_CC GDSC + AHB/MDP clock checks (G116Gate) to avoid AXI SErrors.
++**/
++
++#include <Uefi.h>
++#include <Guid/EventGroup.h>
++#include <Library/ArmLib.h>
++#include <Library/DebugLib.h>
++#include <Library/IoLib.h>
++#include <Library/UefiBootServicesTableLib.h>
++
++#define DISP_CC_BASE                      0x0AF00000ULL
++#define DISP_CC_MDSS_CORE_GDSCR           (DISP_CC_BASE + 0x9000ULL)
++#define DISP_CC_MDSS_MDP_CLK_CBCR         (DISP_CC_BASE + 0x800CULL)
++#define DISP_CC_MDSS_AHB_CLK_CBCR         (DISP_CC_BASE + 0x80A4ULL)
++
++#define MDSS_HW_VERSION                   0x0AE00000ULL
++#define MDP_CTL_0_START                   0x0AE1601CULL
++#define MDP_INTF_1_FRAME_COUNT            0x0AE360ACULL
++#define MDP_INTF_1_TEAR_CHECK_EN          0x0AE36284ULL
++#define MDP_INTF_1_AUTOREFRESH_CONFIG     0x0AE362B4ULL
++
++/* Bit 31 = ENABLE, bits [15:0] = FRAME_COUNT (2 -> 60 Hz refresh from 120 Hz TE) */
++#define AUTOREFRESH_ENABLE_60HZ           0x80000002U
++
++STATIC EFI_EVENT  mRefreshTimer = NULL;
++STATIC EFI_EVENT  mExitBootEvent = NULL;
++STATIC UINT32     mLastFrameCount = 0;
++STATIC BOOLEAN    mHaveFrameSample = FALSE;
++
++STATIC
++BOOLEAN
++IsMdssPoweredAndClocked (
++  VOID
++  )
++{
++  UINT32  Gdscr;
++  UINT32  AhbCbcr;
++  UINT32  MdpCbcr;
++
++  ArmDataMemoryBarrier ();
++  Gdscr   = MmioRead32 ((UINTN)DISP_CC_MDSS_CORE_GDSCR);
++  AhbCbcr = MmioRead32 ((UINTN)DISP_CC_MDSS_AHB_CLK_CBCR);
++  MdpCbcr = MmioRead32 ((UINTN)DISP_CC_MDSS_MDP_CLK_CBCR);
++  ArmDataMemoryBarrier ();
++
++  if ((Gdscr & 0x80000000U) == 0) {
++    return FALSE;
++  }
++  if ((AhbCbcr & 0x80000000U) != 0) {
++    return FALSE;
++  }
++  if ((MdpCbcr & 0x80000000U) != 0) {
++    return FALSE;
++  }
++  return TRUE;
++}
++
++STATIC
++VOID
++RearmAutoRefreshAndKick (
++  IN BOOLEAN  ForceKick
++  )
++{
++  UINT32  HwVer;
++  UINT32  AutoRef;
++  UINT32  TearEn;
++  UINT32  FrameCnt;
++
++  if (!IsMdssPoweredAndClocked ()) {
++    return;
++  }
++
++  ArmDataMemoryBarrier ();
++  HwVer = MmioRead32 ((UINTN)MDSS_HW_VERSION);
++  if ((HwVer == 0U) || (HwVer == 0xFFFFFFFFU)) {
++    return;
++  }
++
++  TearEn   = MmioRead32 ((UINTN)MDP_INTF_1_TEAR_CHECK_EN);
++  AutoRef  = MmioRead32 ((UINTN)MDP_INTF_1_AUTOREFRESH_CONFIG);
++  FrameCnt = MmioRead32 ((UINTN)MDP_INTF_1_FRAME_COUNT);
++
++  if (ForceKick || ((TearEn & 1U) == 0U) || ((AutoRef & 0x80000000U) == 0U) ||
++      (mHaveFrameSample && (FrameCnt == mLastFrameCount)))
++  {
++    MmioWrite32 ((UINTN)MDP_INTF_1_TEAR_CHECK_EN, 1U);
++    MmioWrite32 ((UINTN)MDP_INTF_1_AUTOREFRESH_CONFIG, AUTOREFRESH_ENABLE_60HZ);
++    ArmDataMemoryBarrier ();
++    MmioWrite32 ((UINTN)MDP_CTL_0_START, 1U);
++    ArmDataMemoryBarrier ();
++  }
++
++  mLastFrameCount  = FrameCnt;
++  mHaveFrameSample = TRUE;
++}
++
++STATIC
++VOID
++EFIAPI
++OnRefreshTimer (
++  IN EFI_EVENT  Event,
++  IN VOID       *Context
++  )
++{
++  (VOID)Event;
++  (VOID)Context;
++  RearmAutoRefreshAndKick (FALSE);
++}
++
++STATIC
++VOID
++EFIAPI
++OnExitBootServices (
++  IN EFI_EVENT  Event,
++  IN VOID       *Context
++  )
++{
++  (VOID)Event;
++  (VOID)Context;
++
++  if (mRefreshTimer != NULL) {
++    gBS->SetTimer (mRefreshTimer, TimerCancel, 0);
++  }
++
++  RearmAutoRefreshAndKick (TRUE);
++}
++
++EFI_STATUS
++EFIAPI
++S23DisplayFixEntryPoint (
++  IN EFI_HANDLE        ImageHandle,
++  IN EFI_SYSTEM_TABLE  *SystemTable
++  )
++{
++  EFI_STATUS  Status;
++
++  (VOID)ImageHandle;
++  (VOID)SystemTable;
++
++  if (IsMdssPoweredAndClocked ()) {
++    DEBUG ((DEBUG_INFO, "S23DisplayFixDxe: MDSS gate open (HW_VER=0x%08X), arming Auto-Refresh\n",
++      MmioRead32 ((UINTN)MDSS_HW_VERSION)));
++    RearmAutoRefreshAndKick (TRUE);
++  } else {
++    DEBUG ((DEBUG_WARN, "S23DisplayFixDxe: MDSS GDSC/clocks off at DXE entry; skipping MMIO\n"));
++  }
++
++  Status = gBS->CreateEvent (
++                  EVT_TIMER | EVT_NOTIFY_SIGNAL,
++                  TPL_CALLBACK,
++                  OnRefreshTimer,
++                  NULL,
++                  &mRefreshTimer
++                  );
++  if (!EFI_ERROR (Status)) {
++    gBS->SetTimer (mRefreshTimer, TimerPeriodic, 330000ULL);
++  }
++
++  gBS->CreateEventEx (
++         EVT_NOTIFY_SIGNAL,
++         TPL_NOTIFY,
++         OnExitBootServices,
++         NULL,
++         &gEfiEventExitBootServicesGuid,
++         &mExitBootEvent
++         );
++
++  return EFI_SUCCESS;
++}
+--- /dev/null
++++ b/Platforms/Samsung/dm1qPkg/Drivers/S23DisplayFixDxe/S23DisplayFixDxe.inf
+@@ -0,0 +1,28 @@
++[Defines]
++  INF_VERSION                    = 0x00010005
++  BASE_NAME                      = S23DisplayFixDxe
++  FILE_GUID                      = 6F4A92C1-8D2E-4E7A-9B31-5A1C0E28F401
++  MODULE_TYPE                    = DXE_DRIVER
++  VERSION_STRING                 = 1.0
++  ENTRY_POINT                    = S23DisplayFixEntryPoint
++
++[Sources]
++  S23DisplayFixDxe.c
++
++[Packages]
++  ArmPkg/ArmPkg.dec
++  MdePkg/MdePkg.dec
++  MdeModulePkg/MdeModulePkg.dec
++
++[LibraryClasses]
++  ArmLib
++  DebugLib
++  IoLib
++  UefiBootServicesTableLib
++  UefiDriverEntryPoint
++
++[Guids]
++  gEfiEventExitBootServicesGuid
++
++[Depex]
++  TRUE
