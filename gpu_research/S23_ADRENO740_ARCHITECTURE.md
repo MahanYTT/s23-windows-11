@@ -323,6 +323,41 @@ Tested live on the Galaxy S23 (`StageMask = 0x3B` -> restored to `0x01`, capture
      - `KGSL_CP_SQE_CNTL(5B) (0x03D02020) = 0x00000000`
    - Clean teardown verified: released `OOB_ACK` (`BIT 31` on `GMU_H2G_SET`), asserted `GMU_CM3_SYSRESET(stopped) = 1`, fault-pinned and disabled `KGSL-SMMU` CB2 (`tlb_done=1 CM3_RST=1 CB2_SCTLR=00000000 TLBSTATUS=00000000`), and freed the 89-page pool.
 
-5. **Next On-Device Step — `KGSL-SMMU` CB0 + CP `SQE` (`a740_sqe.fw`) + TZ `a740_zap.mbn` + WDDM (`G779`) + Mesa (`G739`):**
-   - Integrate `s23_gpu_acpi.aml` (`MMU1` `OPEN0D01` + `GPU0` `OPEN0515`) into a dedicated UEFI test build, bring up `KGSL-SMMU` CB0 (`SID = 0/1`) + `SET_CP_POOL_SIZE` (`0x02000C1B`) + `PAS_ID = 13` (`a740_zap.mbn`) + `a740_sqe.fw` CP ringbuffer (`G433`/`G456`), and connect the open-source WDDM KMD (`G779`) + ARM64 Mesa Freedreno/Turnip (`G739`) stack.
+5. **Next On-Device Step — Persistent WDDM Render-Only KMD + ARM64 Mesa (`Turnip` / `Freedreno`)**:
+   - Stage 6A/6B/6C are now verified live (see Section 5.5 below). Integrate `s23_gpu_acpi.asl` (`MMU1` `OPEN0D01` + `GPU0` `OPEN0515`) into a UEFI test build, build a persistent ARM64 WDDM Render-Only KMD (preserving UEFI SimpleFB display scanout while offloading 3D/compute to Adreno 740), and connect ARM64 Mesa (`Turnip` Vulkan + `Freedreno`/`Zink` OpenGL).
+
+### 5.5 Live Stage 6A/6B/6C Full Adreno 740 Execution: `KGSL-SMMU` CB0 + `QTB` ECATS + `a740_sqe.fw` + PM4 Fences + TZ `a740_zap.mbn` (`s23gpuprobe.sys v1.0.0.7`)
+
+Tested incrementally live on the Galaxy S23 (`RFCW90N0N7X`, `StageMask = 0x7B` -> `0xFB` -> `0x1FB`, unconditionally restored to `0x01`):
+
+1. **Stage 6A (`StageMask = 0x7B`, `drivers/s23gpuprobe/s23gpuprobe_v7_s6a_live.log`) — CB0 + `gpu_qtb` ECATS + A740 `gpuHwInit()`:**
+   - Moved GMU CB2 from `SMR[0]` to `SMR[2]` (`0x80000005` / `S2CR[2] = 0x00000302`) so slots `0` & `1` are dedicated to the GPU (`SID=0` `gfx3d_user`, `SID=1` `gfx3d_lpac`).
+   - Allocated 34-page (`139,264 B`, `< 64 GB` 36-bit OAS) `MmNonCached` CB0 pool @ `PA = 0x0009FFC30000`, copied `a740_sqe.fw` (`76,724 B`, minus 4-byte header = `76,720 B` payload) to IOVA `0x00100000` (`R+X`, NC), Ring 0 to `0x00200000` (`32 KiB`), Memptrs/Fence to `0x00300000`, `pwrup_reglist` (`16` preemption registers) to `0x00301000`, and Scratch to `0x00302000`.
+   - Armed `KGSL-SMMU` CB0 (`ASID = 1`, `CB0_TTBR0 = 0x00010009FFC30000`):
+     - `CB0_SCTLR(armed) = 0x00000167`, `CB0_ACTLR = 0x00000301` (`CMTLB | PREFETCH_DEEP`, `CPRE=0`), `CB0_TCR = 0x80803519`, `CB0_TCR2 = 0x00038071`, `CB0_FSR = 0x00000400`, `SMR[0] = 0x80000000`, `SMR[1] = 0x80000001`, `S2CR[0..1] = 0`, `SMMU_sGFSR = 0`.
+   - **`gpu_qtb@0x03DE8000` Hardware ECATS Walk (`SID=0`, `IOVA = 0x00100000`):**
+     - **`QTB ECATS: MATCH status=0x0000000000000001 out=0x00009FFC34000000 extracted=0x0009FFC34000 expected=0x0009FFC34000 fsr=0x00000000`**
+   - Cleared `GBIF_HALT (0x03D0F114) = 0` & `RBBM_GBIF_HALT (0x03D00058) = 0` (note: `GBIF_HALT_ACK (0x03D0F118) = 0x00000003` when idle with no traffic in flight, matching Linux `a6xx_gpu.c` / S23 `adreno_gen7_gmu.c`).
+   - Completed full A740 `gpuHwInit()` (`AO_HWCG`, 54 `HWCG` entries, `RBBM_CLOCK_CNTL = 0x8AA8AA82`, 5 `GBIF` QoS/QSB regs, `UCHE` GMEM `0x01000000..0x012FFFFF`, 45 `CP_PROTECT` entries, `APRIV`, UBWC 4.0 `HBB=16` on `RB`/`TPL1`/`SP`/`GRAS` via BR+BV apertures, `RBBM_INT_0_MASK = 0x33D283C2`, Ring 0 + SQE bases):
+     - `GMU_AO_AHB_FENCE_ST(6A) = 0`, `RBBM_STATUS(6A) = 0x1`, `CP_SQE_INSTR_BASE_LO = 0x00100000`, `CP_RB_RPTR = 0`, `CP_SQE_CNTL = 0`, `CB0_FSR = 0x400`, `SMMU_sGFSR = 0`.
+
+2. **Stage 6B (`StageMask = 0xFB`, `drivers/s23gpuprobe/s23gpuprobe_v7_s6b_live.log`) — Live SQE (`CP_SQE_CNTL=1`) + `CP_ME_INIT` + `CP_MEM_WRITE`:**
+   - Wrote `CP_SQE_CNTL (0x03D02020) = 1`: returned cleanly (`AHB = 0`, `RBBM_STATUS = 0x00C00015`, `CB0_FSR = 0x400`).
+   - Submitted `CP_THREAD_CONTROL + CP_ME_INIT` + `CACHE_CLEAN` (`WPTR = 17`):
+     - **`Fence1: val=1 polls=1 rptr_shadow=0x00000011 RPTR=0x00000011 WPTR=0x00000011`**
+     - `RBBM_STATUS(f1) = 0x1` (idle), `RBBM_INT_0_STATUS(f1) = 0x00100000`, `CP_HW_FAULT = 0`, `CB0_FSR = 0x400`, `SMMU_sGFSR = 0`.
+   - Submitted `CP_MEM_WRITE(0x05E9A740)` -> Scratch IOVA `0x00302000` + `CACHE_CLEAN` (`WPTR = 28`):
+     - **`Fence2: val=2 polls=2 scratch=0x05E9A740 RPTR=0x0000001C RBBM_STATUS=0x00000001 CB0_FSR=0x00000400`**
+
+3. **Stage 6C (`StageMask = 0x1FB`, `drivers/s23gpuprobe/s23gpuprobe_v7_s6c_live.log`) — TZ Aperture + `PAS_ID=13` ZAP + Non-Secure Mode:**
+   - **`SCM CP_SMMU_APERTURE_ID(CB0)` (`0x42000C1B`): `r0=0, r1=0`**
+   - Loaded `C:\Users\Public\a740_zap.mbn` (`12,088 B`) ELF32 segments into `gpu_micro_code_region@0x9B09A000` (`0x2000 B`):
+     - **`PAS_INIT_IMAGE(13)` (`0x42000201`): `r0=0, r1=0`**
+     - **`PAS_MEM_SETUP(13)` (`0x42000202`): `r0=0, r1=0`**
+     - **`PAS_AUTH_RESET(13)` (`0x42000205`): `r0=0, r1=0`**
+   - Submitted `CP_SET_SECURE_MODE(0)` + `CACHE_CLEAN` (`WPTR = 37`):
+     - **`Fence3(non-sec): val=3 polls=3`**
+     - **`SECVID_TRUST_CNTL(6C) (0x03D3D000) = 0x00000000`** (switched from `1` -> `0`: full non-secure GPU execution active!), `RBBM_STATUS(6C) = 0x1`, `CB0_FSR = 0x400`.
+   - Clean teardown verified (`CP_SQE_CNTL=3` -> `GBIF_HALT` drain -> `RBBM_SW_RESET_CMD` -> `CP_SQE_CNTL=0` -> `CB0` & `CB2` SMMU teardown `tlb_done=1` -> `GMU_CM3_SYSRESET=1`).
+
 

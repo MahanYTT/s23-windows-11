@@ -1,5 +1,5 @@
 /*
- * s23gpuprobe.c - Samsung Galaxy S23 (dm1q / SM8550-AC) Adreno 740 Kernel Probe v1.0.0.4
+ * s23gpuprobe.c - Samsung Galaxy S23 (dm1q / SM8550-AC) Adreno 740 Kernel Probe v1.0.0.7
  *
  * Pure-C ARM64 WDM Demand-Start (Start = 3) diagnostic & opt-in bring-up driver.
  * Uses FILE_OPEN_IF on pre-allocated 64 KB C:\Users\Public\s23gpuprobe.log with
@@ -11,32 +11,19 @@
  *   Safe default if missing: StageMask = 0x01 (read-only telemetry ONLY!)
  *
  * StageMask bits:
- *   0x01 : Stage 1 (Safe Read-Only Telemetry - DEFAULT):
- *          - CMD_DB (0x81C60000) lookup & AUX VLVL dump for cx/mx/mxc/gfx/gx/gmxc/mmcx/xo.lvl
- *          - ChipInfo (0x81CF4000) header read
- *          - GCC (0x00100000) GPLL0 + GCC_GPU_* CBCR/BCR dump
- *          - Strictly gated GPUCC (0x03D90000) dump (ONLY if GCC_GPU_BCR==0 & CFG_AHB active)
- *          - Strictly AXI-gated read-only GMU/KGSL probe (NEVER touches 0x03D00000/0x03D6A000
- *            unless CX_GDSCR PWR_ON==1 & AHB ready, and GX_GDSCR PWR_ON==1 for GX regs!)
- *   0x02 : Stage 2 (Opt-In Clock/Power Bring-Up & Live Adreno 740 ID/Status Read):
- *          - Direct APPS_RSC DRV2 TCS0 (0x17A20000) RPMh ARC votes (cx, mx, mxc, gfx)
- *          - GCC_GPU_CFG_AHB + GPLL0 vote + GPUCC_CX_GDSC + SMMU/MEMNOC/DVM/DDRSS clocks
- *          - GPUCC HUB (200 MHz), FF (200 MHz), AHB/CRC_AHB/HUB_AON/HUB_CX_INT/CX_FF
- *          - GPU_CC_PLL0 (0x03D90000) & GPU_CC_PLL1 (0x03D91000, 440 MHz) Lucid OLE lock
- *          - GPUCC GMU RCG (220 MHz) + CXO_AON/CXO/CX_GMU + GX_GDSC + GX_GFX3D/GX_GMU/GX_FF
- *          - Re-verifies CX & GX AXI gates, then reads live GMU_CX, GMU_AO, RBBM_STATUS,
- *            RBBM_STATUS3, GBIF, CP_SQE_CNTL, SECVID/TSB registers
- *   0x04 : Stage 3 (Opt-In Non-Destructive Scratch R/W & GX Power-Collapse Recovery Test):
- *          - CX scratch R/W/restore on GEN7_GMU_GENERAL_0 (0x03D7E714) while CM3_SYSRESET==1
- *          - GX scratch R/W/restore on GEN7_RBBM_SP_HYST_CNT (0x03D00108) &
- *            GEN7_RBBM_RAC_THRESHOLD_CNT (0x03D00110) while CP_SQE_CNTL==0
- *          - GX GDSC SW_COLLAPSE=1 -> CFG[15]==1 -> SW_COLLAPSE=0 -> GDSCR[31]==1 recovery test
- *   0x08 : Stage 4 (Read-Only GMU Cold-Preflight Inspection when CX Gate is OPEN):
- *          - GMU ITCM (0x03D6D000, 16 KB) & DTCM (0x03D71000, 16 KB + G190_DTCM_VERSION 0x03D74FE0)
- *          - GPU CX_MISC (0x03D9E000, TCM_RET_CNTL 0x03D9E0E4) & GMU cache/HFI/RSCC bridge regs
- *          - G482_RSCC (0x03D50000: STATUS0, PDC_SEQ, SEQ_BUSY, SEQ_MEM_0..4, TCS0..3_STATUS)
- *          - GMU_PDC (0x0B280000: ENABLE_PDC, MATCH_LO/HI, SEQ_START_ADDR, STATUS_1024)
- *          - GPUCC GX / ACD / MEMNOC / MND1X / SLEEP / DEMET detailed clock & BCR state
+ *   0x01  : Stage 1 (Safe Read-Only Telemetry - DEFAULT):
+ *           - CMD_DB (0x81C60000), ChipInfo (0x81CF4000), GCC (0x00100000), AXI-gated GPUCC/GMU/KGSL
+ *   0x02  : Stage 2 (Opt-In Clock/Power Bring-Up & Live Adreno 740 ID/Status Read):
+ *           - APPS_RSC DRV2 TCS0 RPMh ARC votes (cx, mx, mxc, gfx)
+ *           - GCC_GPU_CFG_AHB + GPLL0 votes (BIT15|BIT16) + CX_GDSC + SMMU/MEMNOC/DVM/DDRSS
+ *           - GPUCC HUB/FF/AHB/DEMET/CXO + PLL0 standby + PLL1 locked + GMU 220 MHz
+ *   0x04  : Stage 3 (Opt-In Non-Destructive Scratch R/W & GX Power-Collapse Recovery Test)
+ *   0x08  : Stage 4 (Read-Only GMU ITCM/DTCM, CX_MISC, RSCC, GMU_PDC Inspection)
+ *   0x10  : Stage 5A (Read-Only ARM64 SCM IS_CALL_AVAIL & AXI-Gated KGSL-SMMU Telemetry)
+ *   0x20  : Stage 5B (Opt-In KGSL-SMMU CB2 + GMU CM3 + HFI + OOB GX Wake)
+ *   0x40  : Stage 6A (Opt-In KGSL-SMMU CB0 SID0/SID1 + QTB ECATS + A740 HwInit + Ring0/SQE Load)
+ *   0x80  : Stage 6B (Opt-In CP_SQE_CNTL=1 + CP_ME_INIT fence=1 + CP_MEM_WRITE fence=2)
+ *   0x100 : Stage 6C (Opt-In SCM CP_SMMU_APERTURE + ZAP PAS_ID=13 + CP_SET_SECURE_MODE(0) fence=3)
  */
 
 #include <stdint.h>
@@ -191,6 +178,9 @@ __declspec(dllimport) PHYSICAL_ADDRESS MmGetPhysicalAddress(PVOID BaseAddress);
 #define PA_KGSL_SMMU      0x03DA0000ULL  /* s23_live.dts kgsl-smmu@3da0000 */
 #define SZ_KGSL_SMMU      0x00040000UL
 
+#define PA_GPU_QTB        0x03DE8000ULL  /* s23_live.dts gpu_qtb@3de8000 */
+#define SZ_GPU_QTB        0x00001000UL
+
 #define PA_GMU_PDC        0x0B280000ULL  /* G482_PDC / s23_live.dts reg-names="gmu_pdc" */
 #define SZ_GMU_PDC        0x00010000UL
 
@@ -202,6 +192,9 @@ __declspec(dllimport) PHYSICAL_ADDRESS MmGetPhysicalAddress(PVOID BaseAddress);
 
 #define PA_CHIPINFO       0x81CF4000ULL
 #define SZ_CHIPINFO       0x00001000UL
+
+#define PA_ZAP_REGION     0x9B09A000ULL  /* s23_live.dts gpu_micro_code_region@9b09a000 */
+#define SZ_ZAP_REGION     0x00002000UL
 
 /* GCC offsets (gcc-kalama.c) */
 #define GCC_GPLL0_MODE             0x00000U
@@ -381,9 +374,22 @@ static inline uint32_t mmio_r32(volatile uint8_t *base, uint32_t off) {
     return v;
 }
 
+static inline uint64_t mmio_r64(volatile uint8_t *base, uint32_t off) {
+    dmb_sy();
+    uint64_t v = *(volatile uint64_t *)(base + off);
+    dmb_sy();
+    return v;
+}
+
 static inline void mmio_w32(volatile uint8_t *base, uint32_t off, uint32_t v) {
     dmb_sy();
     *(volatile uint32_t *)(base + off) = v;
+    dmb_sy();
+}
+
+static inline void mmio_w64(volatile uint8_t *base, uint32_t off, uint64_t v) {
+    dmb_sy();
+    *(volatile uint64_t *)(base + off) = v;
     dmb_sy();
 }
 
@@ -1232,8 +1238,8 @@ static int RunStage2BringUp(void) {
         return 0;
     }
     uint32_t br_vote = mmio_r32(g_gcc, GCC_APCS_CLK_BR_ENA_VOTE);
-    if ((br_vote & (1U << 15)) == 0U) {
-        mmio_w32(g_gcc, GCC_APCS_CLK_BR_ENA_VOTE, br_vote | (1U << 15));
+    if ((br_vote & 0x00018000U) != 0x00018000U) {
+        mmio_w32(g_gcc, GCC_APCS_CLK_BR_ENA_VOTE, br_vote | 0x00018000U);
         StallUs(10U);
     }
     LogReg("GCC_APCS_CLK_VOTE_AFTER", 0x00152000U, mmio_r32(g_gcc, GCC_APCS_CLK_BR_ENA_VOTE));
@@ -1286,6 +1292,7 @@ static int RunStage2BringUp(void) {
         ProgramRcg(g_gpucc, GPUCC_GMU_RCG_CMD, 0x00100001U, "gpu_cc_gmu_clk_src(xo)");
     }
     EnableBranch(g_gpucc, GPUCC_CXO_AON_CBCR, "gpu_cc_cxo_aon_clk", 0, 0);
+    EnableBranch(g_gpucc, GPUCC_DEMET_CBCR,   "gpu_cc_demet_clk",   0, 0);
     EnableBranch(g_gpucc, GPUCC_CXO_CBCR,     "gpu_cc_cxo_clk",     0, 0);
     EnableBranch(g_gpucc, GPUCC_CX_GMU_CBCR,  "gpu_cc_cx_gmu_clk",  0, 0);
 
@@ -1566,10 +1573,11 @@ static int ScmCall64(
     uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     uint64_t *r0_out, uint64_t *r1_out, uint64_t *r2_out, uint64_t *r3_out)
 {
-    uint64_t x1 = arginfo, x2 = a0, x3 = a1, x4 = a2, x5 = a3, x6 = 0, x7 = 0;
+    uint64_t next_x0 = fid, x1 = arginfo, x2 = a0, x3 = a1, x4 = a2, x5 = a3, x6 = 0, x7 = 0;
     uint64_t last_r0 = ~0ULL;
-    for (uint32_t tries = 0; tries < 64U; tries++) {
-        register uint64_t rx0 __asm__("x0") = (tries == 0U) ? fid : 1ULL;
+    uint32_t busy = 0;
+    for (uint32_t tries = 0; tries < 10000U; tries++) {
+        register uint64_t rx0 __asm__("x0") = next_x0;
         register uint64_t rx1 __asm__("x1") = x1;
         register uint64_t rx2 __asm__("x2") = x2;
         register uint64_t rx3 __asm__("x3") = x3;
@@ -1585,7 +1593,15 @@ static int ScmCall64(
         );
         last_r0 = rx0;
         if (rx0 == 1ULL) { /* QCOM_SCM_INTERRUPTED */
+            next_x0 = 1ULL;
             x1 = rx1; x2 = rx2; x3 = rx3; x4 = rx4; x5 = rx5; x6 = rx6; x7 = rx7;
+            continue;
+        }
+        if (rx0 == (uint64_t)(int64_t)-12 && busy < 20U) { /* QCOM_SCM_V2_EBUSY */
+            busy++;
+            SleepMs(30U);
+            next_x0 = fid;
+            x1 = arginfo; x2 = a0; x3 = a1; x4 = a2; x5 = a3; x6 = 0ULL; x7 = 0ULL;
             continue;
         }
         if (r0_out) *r0_out = rx0;
@@ -1706,14 +1722,27 @@ static void RunStage5AScmAndSmmu(uint32_t mask) {
  * ============================================================================ */
 static uint8_t g_gmu_fw_buf[131072];
 
+static uint16_t ReadLe16U(const uint8_t *p) {
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
 static uint32_t ReadLe32U(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-static inline void mmio_w64(volatile uint8_t *base, uint32_t off, uint64_t v) {
-    dmb_sy();
-    *(volatile uint64_t *)(base + off) = v;
-    dmb_sy();
+static uint32_t Pm4OddParity(uint32_t v) {
+    return (0x9669U >> (0xFU & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^
+            (v >> 16) ^ (v >> 20) ^ (v >> 24) ^ (v >> 28)))) & 1U;
+}
+
+static uint32_t Pm4Type4(uint32_t reg_dw, uint32_t cnt) {
+    return 0x40000000U | (cnt & 0x7FU) | (Pm4OddParity(cnt) << 7) |
+           ((reg_dw & 0x3FFFFU) << 8) | (Pm4OddParity(reg_dw) << 27);
+}
+
+static uint32_t Pm4Type7(uint32_t op, uint32_t cnt) {
+    return 0x70000000U | (cnt & 0x7FFFU) | (Pm4OddParity(cnt) << 15) |
+           ((op & 0x7FU) << 16) | (Pm4OddParity(op) << 23);
 }
 
 static int PollMmioBit0Clear(volatile uint8_t *base, uint32_t off, uint32_t max_us) {
@@ -1725,12 +1754,12 @@ static int PollMmioBit0Clear(volatile uint8_t *base, uint32_t off, uint32_t max_
     return 0;
 }
 
-static int ReadGmuFwFile(uint32_t *out_len) {
+static int ReadFwFile(const WCHAR *nt_path, uint32_t *out_len) {
     UNICODE_STRING u;
     OBJECT_ATTRIBUTES oa;
     IO_STATUS_BLOCK iosb;
     HANDLE hf = NULL;
-    RtlInitUnicodeString(&u, L"\\??\\C:\\Users\\Public\\gmu_gen70200.bin");
+    RtlInitUnicodeString(&u, nt_path);
     InitObjAttr(&oa, &u, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE);
     if (!NT_SUCCESS(ZwCreateFile(
             &hf, FILE_GENERIC_READ, &oa, &iosb, NULL, FILE_ATTRIBUTE_NORMAL,
@@ -1984,11 +2013,721 @@ static const GMU_EXTENT_SPEC g_gmu_extents[8] = {
 
 static uint32_t g_hfi_msg_buf[160];
 
-static void RunStage5BGmuBoot(void) {
+/* ============================================================================
+ * Stage 0x40 / 0x80 / 0x100 (Stage 6A/6B/6C): CB0 + QTB + HwInit + SQE + ZAP
+ * ============================================================================ */
+static const uint32_t kA740Gbif[5][2] = {
+    { 0x3C03U, 0x00071620U }, { 0x3C04U, 0x00071620U },
+    { 0x3C05U, 0x00071620U }, { 0x3C06U, 0x00071620U },
+    { 0x0011U, 0x02120212U },
+};
+
+static const uint32_t kA740AoHwcg[3][2] = {
+    { 0x23B09U, 0x00020202U },
+    { 0x23B0AU, 0x00010111U },
+    { 0x23B0BU, 0x00005555U },
+};
+
+static const uint32_t kA740Hwcg[54][2] = {
+    { 0x00B0U, 0x02222222U }, { 0x00B4U, 0x22022222U }, { 0x00BCU, 0x003CF3CFU }, { 0x00B8U, 0x00000080U },
+    { 0x00C0U, 0x22222220U }, { 0x00C4U, 0x22222222U }, { 0x00C8U, 0x22222222U }, { 0x00CCU, 0x00222222U },
+    { 0x00E0U, 0x77777777U }, { 0x00E4U, 0x77777777U }, { 0x00E8U, 0x77777777U }, { 0x00ECU, 0x00077777U },
+    { 0x00D0U, 0x11111111U }, { 0x00D4U, 0x11111111U }, { 0x00D8U, 0x11111111U }, { 0x00DCU, 0x00011111U },
+    { 0x010BU, 0x22222222U }, { 0x010CU, 0x00222222U }, { 0x0110U, 0x00000444U }, { 0x010FU, 0x00000222U },
+    { 0x00F0U, 0x22222222U }, { 0x00F4U, 0x01002222U }, { 0x00F8U, 0x00002220U }, { 0x0100U, 0x44000F00U },
+    { 0x0104U, 0x25222022U }, { 0x0105U, 0x00555555U }, { 0x0106U, 0x00000011U }, { 0x0107U, 0x00440044U },
+    { 0x0108U, 0x04222222U }, { 0x0286U, 0x00000222U }, { 0x0285U, 0x00222222U }, { 0x0114U, 0x02222223U },
+    { 0x0111U, 0x00222222U }, { 0x0288U, 0x00222222U }, { 0x0287U, 0x00002222U }, { 0x010AU, 0x00000000U },
+    { 0x0116U, 0x04104004U }, { 0x0113U, 0x00000000U }, { 0x0109U, 0x00000000U }, { 0x0115U, 0x00000200U },
+    { 0x0112U, 0x00000000U }, { 0x011BU, 0x00002222U }, { 0x011CU, 0x00000000U }, { 0x011DU, 0x00000000U },
+    { 0x0284U, 0x55555552U }, { 0x012FU, 0x00000000U }, { 0x0260U, 0x00000222U }, { 0x00AEU, 0x8AA8AA82U },
+    { 0x0533U, 0x00000182U }, { 0x0044U, 0x00000000U }, { 0x0042U, 0x00000000U }, { 0x0118U, 0x00000222U },
+    { 0x0119U, 0x00000111U }, { 0x011AU, 0x00000555U },
+};
+
+static const uint32_t kA740Protect[45][2] = {
+    { 0x0850U, 0x13FC0000U }, { 0x0851U, 0x0160050BU }, { 0x0852U, 0x8000050EU },
+    { 0x0853U, 0x80000510U }, { 0x0854U, 0x80000534U }, { 0x0855U, 0x027405FBU },
+    { 0x0856U, 0x87A40699U }, { 0x0857U, 0x802008A0U }, { 0x0858U, 0x809008ABU },
+    { 0x0859U, 0x05C008D0U }, { 0x085AU, 0x81340900U }, { 0x085BU, 0x82C8098DU },
+    { 0x085CU, 0x86F80A41U }, { 0x085DU, 0x80040DF0U }, { 0x085EU, 0x80000E01U },
+    { 0x085FU, 0x80200E07U }, { 0x0860U, 0x830C3C00U }, { 0x0861U, 0x7FFC3CC4U },
+    { 0x0862U, 0x873C8630U }, { 0x0863U, 0x80008E00U }, { 0x0864U, 0x80008E08U },
+    { 0x0865U, 0x807C8E50U }, { 0x0866U, 0x8A008E80U }, { 0x0867U, 0x876C9624U },
+    { 0x0868U, 0x80009E40U }, { 0x0869U, 0x80349E64U }, { 0x086AU, 0x861C9E78U },
+    { 0x086BU, 0x873CA630U }, { 0x086CU, 0x8000AE02U }, { 0x086DU, 0x803CAE50U },
+    { 0x086EU, 0x800CAE66U }, { 0x086FU, 0x800CAE6FU }, { 0x0870U, 0x800CB604U },
+    { 0x0871U, 0xBFFCEC00U }, { 0x0872U, 0x7FFCFC00U }, { 0x0873U, 0x814D8400U },
+    { 0x0874U, 0x00118454U }, { 0x0875U, 0xFFFD8459U }, { 0x0876U, 0xFFFDA459U },
+    { 0x0877U, 0xFFFDC459U }, { 0x0878U, 0x910DF400U }, { 0x0879U, 0x01EDF844U },
+    { 0x087AU, 0x8001F860U }, { 0x087BU, 0x80A9F878U }, { 0x087FU, 0x8001F8C0U },
+};
+
+static const uint32_t kA740PreemptRegs[16] = {
+    0x0E09U, 0x0E0AU, 0x0E07U, 0x0E08U, 0x0E0BU, 0x0E0CU, 0x0E0DU, 0x0E0EU,
+    0x0E17U, 0x0E01U, 0x8E08U, 0x8E28U, 0x8602U, 0x8E50U, 0x0E3AU, 0x0E19U,
+};
+
+static inline void KgslW32(uint32_t dw, uint32_t v) { mmio_w32(g_kgsl, dw * 4U, v); }
+static inline uint32_t KgslR32(uint32_t dw) { return mmio_r32(g_kgsl, dw * 4U); }
+static inline void GmuDwW32(uint32_t dw, uint32_t v) { mmio_w32(g_gmu, (dw - 0x1A800U) * 4U, v); }
+static inline uint32_t GmuDwR32(uint32_t dw) { return mmio_r32(g_gmu, (dw - 0x1A800U) * 4U); }
+
+static uint32_t ZapPh(uint32_t phoff, uint32_t idx, uint32_t field) {
+    return ReadLe32U(g_gmu_fw_buf + phoff + idx * 32U + field * 4U);
+}
+
+static void RunStage6GpuCp(uint32_t mask, volatile uint8_t *smmu) {
+    LogS("=== STAGE 0x40 (Stage 6A): CB0 (SID0/1) + QTB ECATS + A740 HwInit + SQE ==="); LogNL();
+
+    if (!g_kgsl || !g_gmu || !smmu) {
+        LogS("  [ERR] Missing KGSL/GMU/SMMU mapping for Stage 6."); LogNL();
+        return;
+    }
+
+    uint32_t sqe_len = 0;
+    if (!ReadFwFile(L"\\??\\C:\\Users\\Public\\a740_sqe.fw", &sqe_len) || sqe_len < 8U || (sqe_len - 4U) > 0x13000U) {
+        LogS("  [SKIP] Invalid or missing C:\\Users\\Public\\a740_sqe.fw (len="); LogDec((int64_t)sqe_len); LogS(")."); LogNL();
+        return;
+    }
+    uint32_t sqe_payload_len = sqe_len - 4U;
+    LogS("  Loaded C:\\Users\\Public\\a740_sqe.fw: "); LogDec((int64_t)sqe_len);
+    LogS(" B (payload="); LogDec((int64_t)sqe_payload_len); LogS(" B)"); LogNL();
+
+    const uint32_t cb0 = 0x20000U;
+    if (mmio_r32(smmu, cb0 + 0x000U) & 1U) {
+        LogS("  [SKIP] KGSL-SMMU CB0 SCTLR already active."); LogNL();
+        return;
+    }
+    if ((mmio_r32(smmu, 0x0800U) & 0x80000000U) || (mmio_r32(smmu, 0x0804U) & 0x80000000U)) {
+        LogS("  [SKIP] KGSL-SMMU SMR[0] or SMR[1] already valid."); LogNL();
+        return;
+    }
+
+    const uint32_t kCb0Pages = 34U;
+    PHYSICAL_ADDRESS lo, hi, bound;
+    lo.QuadPart = 0LL;
+    hi.QuadPart = 0x0000000FFFFFFFFFLL;
+    bound.QuadPart = 0LL;
+    volatile uint32_t *cb0_pool_va = (volatile uint32_t *)MmAllocateContiguousMemorySpecifyCache(
+        kCb0Pages * 4096U, lo, hi, bound, MmNonCached);
+    if (!cb0_pool_va) {
+        LogS("  [ERR] Failed allocating 34-page (<64GB) CB0 pool."); LogNL();
+        return;
+    }
+    uint64_t cb0_pa = (uint64_t)MmGetPhysicalAddress((PVOID)cb0_pool_va).QuadPart;
+    if ((cb0_pa & 0xFFFULL) != 0ULL || cb0_pa + (uint64_t)kCb0Pages * 4096ULL > (1ULL << 36)) {
+        LogS("  [ERR] CB0 pool PA out of 36-bit OAS or unaligned: 0x"); LogHex(cb0_pa, 16); LogNL();
+        MmFreeContiguousMemorySpecifyCache((PVOID)cb0_pool_va, kCb0Pages * 4096U, MmNonCached);
+        return;
+    }
+    ZeroBuf32(cb0_pool_va, kCb0Pages * 1024U);
+
+    /* Copy SQE payload (minus 4-byte header) into pages 4..22 and verify readback */
+    volatile uint8_t *sqe_bytes_va = (volatile uint8_t *)cb0_pool_va + 4U * 4096U;
+    for (uint32_t i = 0U; i < sqe_payload_len; i++) {
+        sqe_bytes_va[i] = g_gmu_fw_buf[4U + i];
+    }
+    dmb_sy();
+    for (uint32_t i = 0U; i < sqe_payload_len; i++) {
+        if (sqe_bytes_va[i] != g_gmu_fw_buf[4U + i]) {
+            LogS("  [ERR] SQE copy mismatch at byte 0x"); LogHex(i, 5); LogNL();
+            MmFreeContiguousMemorySpecifyCache((PVOID)cb0_pool_va, kCb0Pages * 4096U, MmNonCached);
+            return;
+        }
+    }
+
+    /* Populate 3-level 4 KiB page tables for CB0 (39-bit IAS) */
+    volatile uint64_t *pt_l1   = (volatile uint64_t *)((volatile uint8_t *)cb0_pool_va + 0x0000U);
+    volatile uint64_t *pt_l2   = (volatile uint64_t *)((volatile uint8_t *)cb0_pool_va + 0x1000U);
+    volatile uint64_t *pt_l3_0 = (volatile uint64_t *)((volatile uint8_t *)cb0_pool_va + 0x2000U);
+    volatile uint64_t *pt_l3_1 = (volatile uint64_t *)((volatile uint8_t *)cb0_pool_va + 0x3000U);
+
+    pt_l1[0] = (cb0_pa + 0x1000ULL) | 3ULL;
+    pt_l2[0] = (cb0_pa + 0x2000ULL) | 3ULL;
+    pt_l2[1] = (cb0_pa + 0x3000ULL) | 3ULL;
+
+    const uint64_t kAttrSqeRx = 0x0000000000000EC3ULL; /* nG=1 AF=1 SH=2(OSH) RO+X NC */
+    const uint64_t kAttrGpuRw = 0x0060000000000E43ULL; /* UXN|PXN nG=1 AF=1 SH=2(OSH) RW NC */
+
+    for (uint32_t p = 0U; p < 19U; p++) {
+        pt_l3_0[0x100U + p] = (cb0_pa + (4ULL + (uint64_t)p) * 4096ULL) | kAttrSqeRx;
+    }
+    for (uint32_t p = 0U; p < 8U; p++) {
+        pt_l3_1[p] = (cb0_pa + (23ULL + (uint64_t)p) * 4096ULL) | kAttrGpuRw;
+    }
+    pt_l3_1[0x100U] = (cb0_pa + 31ULL * 4096ULL) | kAttrGpuRw; /* Memptrs/Fence @ 0x00300000 */
+    pt_l3_1[0x101U] = (cb0_pa + 32ULL * 4096ULL) | kAttrGpuRw; /* Pwrup reglist @ 0x00301000 */
+    pt_l3_1[0x102U] = (cb0_pa + 33ULL * 4096ULL) | kAttrGpuRw; /* Scratch       @ 0x00302000 */
+    dmb_sy();
+
+    volatile uint32_t *ring_va    = (volatile uint32_t *)((volatile uint8_t *)cb0_pool_va + 23U * 4096U);
+    volatile uint32_t *memptrs_va = (volatile uint32_t *)((volatile uint8_t *)cb0_pool_va + 31U * 4096U);
+    volatile uint32_t *pwrup_va   = (volatile uint32_t *)((volatile uint8_t *)cb0_pool_va + 32U * 4096U);
+    volatile uint32_t *scratch_va = (volatile uint32_t *)((volatile uint8_t *)cb0_pool_va + 33U * 4096U);
+
+    LogS("  Allocated 34p CB0 pool @ PA=0x"); LogHex(cb0_pa, 12);
+    LogS(" TTBR0=0x"); LogHex(cb0_pa | (1ULL << 48), 16); LogNL();
+
+    int cb0_active = 0;
+    int sqe_started = 0;
+    int abort_sqe = 0;
+
+    /* Program KGSL-SMMU Context Bank 0 (Bank=0, Asid=1, SID 0 + SID 1) */
+    mmio_w32(smmu, 0x0C00U, 0x00020000U); /* S2CR[0] = FAULT */
+    mmio_w32(smmu, 0x0C04U, 0x00020000U); /* S2CR[1] = FAULT */
+    mmio_w32(smmu, cb0 + 0x000U, 0U);          /* CB0_SCTLR = 0 */
+    mmio_w32(smmu, cb0 + 0x004U, 0x00000301U); /* CB0_ACTLR: CMTLB | PREFETCH_DEEP, CPRE=0 */
+    mmio_w32(smmu, 0x1800U, 1U);               /* CBA2R[0] = VA64 */
+    mmio_w32(smmu, 0x1000U, 0x0001F300U);      /* CBAR[0] = S1 trans, S2 bypass */
+    mmio_w32(smmu, cb0 + 0x010U, 0x00038011U); /* CB0_TCR2 */
+    mmio_w32(smmu, cb0 + 0x030U, 0x80803519U); /* CB0_TCR */
+    mmio_w64(smmu, cb0 + 0x020U, cb0_pa | (1ULL << 48)); /* CB0_TTBR0 */
+    mmio_w64(smmu, cb0 + 0x028U, (1ULL << 48));          /* CB0_TTBR1 */
+    mmio_w32(smmu, cb0 + 0x038U, 0x0000FF44U); /* CB0_MAIR0 */
+    mmio_w32(smmu, cb0 + 0x03CU, 0U);          /* CB0_MAIR1 */
+    uint32_t cb0_fsr0 = mmio_r32(smmu, cb0 + 0x058U);
+    mmio_w32(smmu, cb0 + 0x058U, cb0_fsr0 & 0xC00001FEU);
+
+    mmio_w32(smmu, cb0 + 0x618U, 0U);          /* CB0_TLBIALL */
+    mmio_w32(smmu, cb0 + 0x7F0U, 0xFFFFFFFFU); /* CB0_TLBSYNC */
+    if (!PollMmioBit0Clear(smmu, cb0 + 0x7F4U, 1000U)) {
+        LogS("  [ERR] SMMU CB0 TLBSYNC timeout."); LogNL();
+        goto teardown_cb0;
+    }
+
+    mmio_w32(smmu, cb0 + 0x000U, 0x00001167U); /* CB0_SCTLR enable */
+    mmio_w32(smmu, 0x0C00U, 0x00000000U);      /* S2CR[0] -> CB0 */
+    mmio_w32(smmu, 0x0800U, 0x80000000U);      /* SMR[0]: VALID | SID=0 (gfx3d_user) */
+    mmio_w32(smmu, 0x0C04U, 0x00000000U);      /* S2CR[1] -> CB0 */
+    mmio_w32(smmu, 0x0804U, 0x80000001U);      /* SMR[1]: VALID | SID=1 (gfx3d_lpac) */
+    dmb_sy();
+    cb0_active = 1;
+
+    LogReg("CB0_SCTLR(armed)",   0x03DC0000U, mmio_r32(smmu, cb0 + 0x000U));
+    LogReg("CB0_ACTLR(armed)",   0x03DC0004U, mmio_r32(smmu, cb0 + 0x004U));
+    LogReg("CB0_TCR(armed)",     0x03DC0030U, mmio_r32(smmu, cb0 + 0x030U));
+    LogReg("CB0_TCR2(armed)",    0x03DC0010U, mmio_r32(smmu, cb0 + 0x010U));
+    LogReg("CB0_TTBR0_LO",       0x03DC0020U, mmio_r32(smmu, cb0 + 0x020U));
+    LogReg("CB0_TTBR0_HI",       0x03DC0024U, mmio_r32(smmu, cb0 + 0x024U));
+    LogReg("CB0_FSR(armed)",     0x03DC0058U, mmio_r32(smmu, cb0 + 0x058U));
+    LogReg("SMR[0](armed)",      0x03DA0800U, mmio_r32(smmu, 0x0800U));
+    LogReg("SMR[1](armed)",      0x03DA0804U, mmio_r32(smmu, 0x0804U));
+    LogReg("S2CR[0](armed)",     0x03DA0C00U, mmio_r32(smmu, 0x0C00U));
+    LogReg("S2CR[1](armed)",     0x03DA0C04U, mmio_r32(smmu, 0x0C04U));
+    LogReg("SMMU_sGFSR(cb0)",    0x03DA0048U, mmio_r32(smmu, 0x0048U));
+
+    /* Optional Non-Destructive gpu_qtb@0x03DE8000 ECATS Hardware Walk Self-Test */
+    PHYSICAL_ADDRESS qtb_pa;
+    qtb_pa.QuadPart = (int64_t)PA_GPU_QTB;
+    volatile uint8_t *qtb = (volatile uint8_t *)MmMapIoSpace(qtb_pa, SZ_GPU_QTB, MmNonCached);
+    if (qtb) {
+        uint64_t q_req  = mmio_r64(qtb, 0x410U);
+        uint64_t q_trig = mmio_r64(qtb, 0x448U);
+        if (q_req != ~0ULL && (q_req & 1ULL) == 0ULL && q_trig == 0ULL) {
+            uint32_t sctlr_saved = mmio_r32(smmu, cb0 + 0x000U);
+            mmio_w64(qtb, 0x410U, q_req | 1ULL);
+            int halt_ok = 0;
+            for (uint32_t t = 0U; t <= 200U; t += 5U) {
+                if (mmio_r64(qtb, 0x418U) & 1ULL) { halt_ok = 1; break; }
+                StallUs(5U);
+            }
+            if (!halt_ok) {
+                LogS("  [WARN] QTB ECATS HALT_TIMEOUT (req=0x"); LogHex(q_req, 16);
+                LogS(" ack=0x"); LogHex(mmio_r64(qtb, 0x418U), 16); LogS(")"); LogNL();
+                mmio_w64(qtb, 0x410U, q_req);
+            } else {
+                mmio_w32(smmu, cb0 + 0x000U, sctlr_saved & ~0xC0U);
+                mmio_w64(qtb, 0x430U, 0ULL);
+                mmio_w64(qtb, 0x438U, 0x3408ULL);
+                mmio_w64(qtb, 0x440U, 0x00100000ULL);
+                mmio_w64(qtb, 0x448U, 1ULL);
+                uint64_t q_status = 0ULL, q_out = 0ULL;
+                int ecats_ok = 0;
+                for (uint32_t t = 0U; t <= 200U; t += 5U) {
+                    q_status = mmio_r64(qtb, 0x450U);
+                    q_out    = mmio_r64(qtb, 0x458U);
+                    if ((q_status | q_out) & 1ULL) { ecats_ok = 1; break; }
+                    StallUs(5U);
+                }
+                uint32_t q_fsr = mmio_r32(smmu, cb0 + 0x058U) & ~0x600U;
+                uint64_t expected_sqe_pa = cb0_pa + 4ULL * 4096ULL;
+                uint64_t extracted = q_out >> 12;
+
+                mmio_w64(qtb, 0x448U, 0ULL);
+                mmio_w32(smmu, cb0 + 0x000U, sctlr_saved);
+                mmio_w64(qtb, 0x410U, q_req);
+                dmb_sy();
+
+                const char *res_str = "TIMEOUT";
+                if (ecats_ok) {
+                    if ((q_out & 1ULL) != 0ULL || q_fsr != 0U) {
+                        res_str = "FAULT";
+                        abort_sqe = 1;
+                    } else if (extracted == expected_sqe_pa) {
+                        res_str = "MATCH";
+                    } else {
+                        res_str = "MISMATCH";
+                        abort_sqe = 1;
+                    }
+                }
+                LogS("  QTB ECATS: "); LogS(res_str);
+                LogS(" status=0x"); LogHex(q_status, 16);
+                LogS(" out=0x"); LogHex(q_out, 16);
+                LogS(" extracted=0x"); LogHex(extracted, 12);
+                LogS(" expected=0x"); LogHex(expected_sqe_pa, 12);
+                LogS(" fsr=0x"); LogHex(q_fsr, 8); LogNL();
+            }
+        } else {
+            LogS("  [INFO] QTB ECATS skipped (req=0x"); LogHex(q_req, 16);
+            LogS(" trig=0x"); LogHex(q_trig, 16); LogS(")"); LogNL();
+        }
+        MmUnmapIoSpace((PVOID)qtb, SZ_GPU_QTB);
+    }
+
+    /* A740 gpuHwInit() */
+    KgslW32(0x3C45U, 0U);
+    uint32_t gbif_halt_post = KgslR32(0x3C45U);
+    uint32_t gbif_ack_post  = KgslR32(0x3C46U);
+    LogReg("GBIF_HALT(clr)",     0x03D0F114U, gbif_halt_post);
+    LogReg("GBIF_HALT_ACK(clr)", 0x03D0F118U, gbif_ack_post);
+
+    KgslW32(0x0016U, 0U);
+    LogReg("RBBM_GBIF_HALT(clr)",     0x03D00058U, KgslR32(0x0016U));
+    LogReg("RBBM_GBIF_HALT_ACK(clr)", 0x03D0005CU, KgslR32(0x0017U));
+    LogReg("SECVID_TRUST_CNTL(pre)",  0x03D3D000U, KgslR32(0xF400U));
+
+    KgslW32(0xF803U, 0U);
+    KgslW32(0xF800U, 0U);
+    KgslW32(0xF801U, 0U);
+    KgslW32(0xF802U, 0U);
+
+    for (uint32_t i = 0U; i < 3U; i++) {
+        GmuDwW32(kA740AoHwcg[i][0], kA740AoHwcg[i][1]);
+    }
+    if (KgslR32(0x00AEU) != 0x8AA8AA82U) {
+        for (uint32_t i = 0U; i < 54U; i++) {
+            KgslW32(kA740Hwcg[i][0], kA740Hwcg[i][1]);
+        }
+        KgslW32(0x00AEU, 0x8AA8AA82U);
+    }
+    for (uint32_t i = 0U; i < 5U; i++) {
+        KgslW32(kA740Gbif[i][0], kA740Gbif[i][1]);
+    }
+
+    KgslW32(0x0E3AU, 0x010240E0U); /* UCHE_GBIF_GX_CONFIG */
+    KgslW32(0x050BU, 0xFFFFFFFFU); /* RBBM_PERFCTR_GPU_BUSY_MASKED */
+    KgslW32(0x0E09U, 0xFFFFF000U); /* UCHE_TRAP_BASE_LO */
+    KgslW32(0x0E0AU, 0x0001FFFFU); /* UCHE_TRAP_BASE_HI */
+    KgslW32(0x0E07U, 0xFFFFF000U); /* UCHE_WRITE_THRU_BASE_LO */
+    KgslW32(0x0E08U, 0x0001FFFFU); /* UCHE_WRITE_THRU_BASE_HI */
+    KgslW32(0x0E0BU, 0x01000000U); /* UCHE_GMEM_RANGE_MIN_LO */
+    KgslW32(0x0E0CU, 0U);          /* UCHE_GMEM_RANGE_MIN_HI */
+    KgslW32(0x0E0DU, 0x012FFFFFU); /* UCHE_GMEM_RANGE_MAX_LO */
+    KgslW32(0x0E0EU, 0U);          /* UCHE_GMEM_RANGE_MAX_HI */
+    KgslW32(0x0E17U, 0x00800000U); /* UCHE_CACHE_WAYS */
+    KgslW32(0x098DU, 1U);          /* CP_AHB_CNTL */
+    KgslW32(0x0500U, 1U);          /* RBBM_PERFCTR_CNTL */
+    KgslW32(0x001FU, 0x40CFFFFFU); /* RBBM_INTERFACE_HANG_INT_CNTL */
+    KgslW32(0x0E19U, 0x00000081U); /* UCHE_CLIENT_PF */
+    KgslW32(0x0E3CU, 0x0006690EU); /* UCHE_CMDQ_CONFIG */
+
+    KgslW32(0x084FU, 0x0000000BU); /* CP_PROTECT_CNTL */
+    for (uint32_t i = 0U; i < 45U; i++) {
+        KgslW32(kA740Protect[i][0], kA740Protect[i][1]);
+    }
+
+    KgslW32(0x0844U, 0x6FU); /* CP_APRIV_CNTL */
+    KgslW32(0x0AD0U, 0x0FU); /* CP_BV_APRIV_CNTL */
+    KgslW32(0x0B31U, 0x0FU); /* CP_LPAC_APRIV_CNTL */
+    KgslW32(0x0841U, 1U);    /* CP_CHICKEN_DBG */
+    KgslW32(0x0ADAU, 1U);    /* CP_BV_CHICKEN_DBG */
+    KgslW32(0x0B30U, 1U);    /* CP_LPAC_CHICKEN_DBG */
+
+    KgslW32(0x8E28U, KgslR32(0x8E28U) | 0x800U); /* RB_CMP_DBG_ECO_CNTL */
+
+    /* S23 UBWC 4.0 / HBB=16 (lo=3, hi=0, mal=32) */
+    KgslW32(0x8E08U, 0x00000816U); /* RB_NC_MODE_CNTL */
+    KgslW32(0xB604U, 0x00000006U); /* TPL1_NC_MODE_CNTL */
+    KgslW32(0xAE02U, 0x00000026U); /* SP_NC_MODE_CNTL */
+    for (uint32_t pipe = 1U; pipe <= 2U; pipe++) {
+        KgslW32(0x0A00U, pipe << 12);
+        KgslW32(0x8602U, 0x00000060U); /* GRAS_NC_MODE_CNTL */
+    }
+    KgslW32(0x0A00U, 0U);          /* CP_APERTURE_CNTL_HOST = PIPE_NONE */
+    KgslW32(0x0E01U, 0x00600000U); /* UCHE_MODE_CNTL */
+    KgslW32(0x0534U, 1U);          /* RBBM_NC_MODE_CNTL */
+
+    GmuDwW32(0x23B0EU, 0xFF000000U); /* GMU_AO_GPU_CX_BUSY_MASK */
+    GmuDwW32(0x1F841U, (GmuDwR32(0x1F841U) & ~0xFFU) | 0x20U);
+    GmuDwW32(0x1F842U, 4U);
+    GmuDwW32(0x1F840U, 1U);
+
+    KgslW32(0x0038U, 0x33D283C2U); /* RBBM_INT_0_MASK */
+
+    /* Ring 0 & SQE Base Setup */
+    KgslW32(0x0800U, 0x00200000U); /* CP_RB_BASE_LO */
+    KgslW32(0x0801U, 0U);          /* CP_RB_BASE_HI */
+    KgslW32(0x0802U, 0x0000020CU); /* CP_RB_CNTL */
+    KgslW32(0x0804U, 0x00300000U); /* CP_RB_RPTR_ADDR_LO */
+    KgslW32(0x0805U, 0U);          /* CP_RB_RPTR_ADDR_HI */
+    KgslW32(0x0A98U, 0x00300008U); /* CP_BV_RB_RPTR_ADDR_LO */
+    KgslW32(0x0A99U, 0U);          /* CP_BV_RB_RPTR_ADDR_HI */
+    KgslW32(0x0807U, 0U);          /* CP_RB_WPTR */
+    KgslW32(0x0885U, 0U);          /* CP_SCRATCH_REG2 */
+    KgslW32(0x0830U, 0x00100000U); /* CP_SQE_INSTR_BASE_LO */
+    KgslW32(0x0831U, 0U);          /* CP_SQE_INSTR_BASE_HI */
+
+    /* Build pwrup_reglist at 0x00301000 */
+    pwrup_va[0] = 0U; pwrup_va[1] = 0U; pwrup_va[2] = 0U;
+    pwrup_va[3] = (16U << 8); /* ifpc=0, preempt=16, dynamic=0 */
+    for (uint32_t i = 0U; i < 16U; i++) {
+        pwrup_va[4U + 2U * i] = kA740PreemptRegs[i];
+        pwrup_va[5U + 2U * i] = KgslR32(kA740PreemptRegs[i]);
+    }
+    dmb_sy();
+
+    uint32_t ahb_post     = mmio_r32(g_gmu, GMU_AO_AHB_FENCE_STATUS);
+    uint32_t rbbm_post    = KgslR32(0x0210U);
+    uint32_t clk_post     = KgslR32(0x00AEU);
+    uint32_t sqe_lo_post  = KgslR32(0x0830U);
+    uint32_t sqe_hi_post  = KgslR32(0x0831U);
+    uint32_t rptr_post    = KgslR32(0x0806U);
+    uint32_t sqe_ctl_post = KgslR32(0x0808U);
+    uint32_t cb0_fsr_post = mmio_r32(smmu, cb0 + 0x058U);
+    uint32_t sgfsr_post   = mmio_r32(smmu, 0x0048U);
+
+    LogS("--- Stage 6A Post-HwInit Checkpoint ---"); LogNL();
+    LogReg("GMU_AO_AHB_FENCE_ST(6A)", 0x03D8EC4CU, ahb_post);
+    LogReg("RBBM_STATUS(6A)",         0x03D00840U, rbbm_post);
+    LogReg("RBBM_CLOCK_CNTL(6A)",     0x03D002B8U, clk_post);
+    LogReg("CP_SQE_INSTR_BASE_LO",    0x03D020C0U, sqe_lo_post);
+    LogReg("CP_SQE_INSTR_BASE_HI",    0x03D020C4U, sqe_hi_post);
+    LogReg("CP_RB_RPTR(6A)",          0x03D02018U, rptr_post);
+    LogReg("CP_SQE_CNTL(6A)",         0x03D02020U, sqe_ctl_post);
+    LogReg("CB0_FSR(6A)",             0x03DC0058U, cb0_fsr_post);
+    LogReg("SMMU_sGFSR(6A)",          0x03DA0048U, sgfsr_post);
+
+    int pre_ok = (ahb_post == 0U) && (gbif_halt_post == 0U) &&
+                 ((cb0_fsr_post & ~0x600U) == 0U) && (sgfsr_post == 0U) &&
+                 (sqe_lo_post == 0x00100000U) && (sqe_hi_post == 0U) &&
+                 (rptr_post == 0U) && (sqe_ctl_post == 0U) && !abort_sqe;
+
+    /* Stage 6B (mask & 0x80): Release CP_SQE_CNTL=1 & submit PM4 CP_ME_INIT + CP_MEM_WRITE */
+    if ((mask & 0x80U) == 0U) {
+        LogS("  Stage 0x80 not set; skipping CP_SQE_CNTL=1 (Stage 6A checkpoint complete)."); LogNL();
+        goto teardown_cb0;
+    }
+    if (!pre_ok) {
+        LogS("  [ABORT] Stage 6A pre-SQE verification failed (abort_sqe="); LogDec(abort_sqe);
+        LogS("); refusing CP_SQE_CNTL=1."); LogNL();
+        goto teardown_cb0;
+    }
+
+    LogS("=== STAGE 0x80 (Stage 6B): Releasing CP_SQE_CNTL=1 + PM4 Init/Scratch Fences ==="); LogNL();
+    KgslW32(0x0808U, 1U);
+    dmb_sy();
+    sqe_started = 1;
+    LogS("  CP_SQE_CNTL=1 returned: AHB=0x"); LogHex(mmio_r32(g_gmu, GMU_AO_AHB_FENCE_STATUS), 8);
+    LogS(" RBBM_STATUS=0x"); LogHex(KgslR32(0x0210U), 8);
+    LogS(" CB0_FSR=0x"); LogHex(mmio_r32(smmu, cb0 + 0x058U), 8); LogNL();
+
+    ring_va[0]  = Pm4Type7(0x17U, 1U);
+    ring_va[1]  = (1U << 27);
+    ring_va[2]  = Pm4Type7(0x48U, 7U);
+    ring_va[3]  = 0x0000094BU;
+    ring_va[4]  = 3U;
+    ring_va[5]  = 0x20000000U;
+    ring_va[6]  = 2U;
+    ring_va[7]  = 0x00301000U;
+    ring_va[8]  = 0U;
+    ring_va[9]  = (1U << 31);
+    ring_va[10] = Pm4Type4(0x0885U, 1U);
+    ring_va[11] = 1U;
+    ring_va[12] = Pm4Type7(0x46U, 4U);
+    ring_va[13] = 0x88000031U;
+    ring_va[14] = 0x00300004U;
+    ring_va[15] = 0U;
+    ring_va[16] = 1U;
+    dmb_sy();
+    KgslW32(0x0807U, 17U);
+    dmb_sy();
+    LogS("  Posted WPTR=17: AHB=0x"); LogHex(mmio_r32(g_gmu, GMU_AO_AHB_FENCE_STATUS), 8); LogNL();
+
+    uint32_t fence1 = 0U, polls1 = 0U;
+    for (uint32_t i = 0U; i < 5000U; i++) {
+        dmb_sy();
+        fence1 = memptrs_va[1];
+        polls1 = i + 1U;
+        if (fence1 >= 1U) break;
+        StallUs(100U);
+    }
+    LogS("  Fence1: val="); LogDec((int64_t)fence1);
+    LogS(" polls="); LogDec((int64_t)polls1);
+    LogS(" rptr_shadow=0x"); LogHex(memptrs_va[0], 8);
+    LogS(" RPTR=0x"); LogHex(KgslR32(0x0806U), 8);
+    LogS(" WPTR=0x"); LogHex(KgslR32(0x0807U), 8); LogNL();
+    LogReg("RBBM_STATUS(f1)",       0x03D00840U, KgslR32(0x0210U));
+    LogReg("RBBM_STATUS3(f1)",      0x03D0084CU, KgslR32(0x0213U));
+    LogReg("RBBM_INT_0_STATUS(f1)", 0x03D00804U, KgslR32(0x0201U));
+    LogReg("CP_HW_FAULT(f1)",       0x03D02084U, KgslR32(0x0821U));
+    LogReg("CP_INT_STATUS(f1)",     0x03D0208CU, KgslR32(0x0823U));
+    LogReg("CB0_FSR(f1)",           0x03DC0058U, mmio_r32(smmu, cb0 + 0x058U));
+    LogReg("CB0_FAR_LO(f1)",        0x03DC0060U, mmio_r32(smmu, cb0 + 0x060U));
+    LogReg("CB0_FAR_HI(f1)",        0x03DC0064U, mmio_r32(smmu, cb0 + 0x064U));
+    LogReg("SMMU_sGFSR(f1)",        0x03DA0048U, mmio_r32(smmu, 0x0048U));
+
+    if (fence1 != 1U) {
+        LogS("  [WARN] Fence 1 did not complete."); LogNL();
+        goto teardown_cb0;
+    }
+
+    /* Second batch: CP_MEM_WRITE(0x05E9A740) -> 0x00302000 + fence 2 */
+    scratch_va[0] = 0U;
+    dmb_sy();
+    ring_va[17] = Pm4Type7(0x3DU, 3U);
+    ring_va[18] = 0x00302000U;
+    ring_va[19] = 0U;
+    ring_va[20] = 0x05E9A740U;
+    ring_va[21] = Pm4Type4(0x0885U, 1U);
+    ring_va[22] = 2U;
+    ring_va[23] = Pm4Type7(0x46U, 4U);
+    ring_va[24] = 0x88000031U;
+    ring_va[25] = 0x00300004U;
+    ring_va[26] = 0U;
+    ring_va[27] = 2U;
+    dmb_sy();
+    KgslW32(0x0807U, 28U);
+    dmb_sy();
+
+    uint32_t fence2 = 0U, polls2 = 0U;
+    for (uint32_t i = 0U; i < 5000U; i++) {
+        dmb_sy();
+        fence2 = memptrs_va[1];
+        polls2 = i + 1U;
+        if (fence2 >= 2U) break;
+        StallUs(100U);
+    }
+    dmb_sy();
+    uint32_t scratch_val = scratch_va[0];
+    LogS("  Fence2: val="); LogDec((int64_t)fence2);
+    LogS(" polls="); LogDec((int64_t)polls2);
+    LogS(" scratch=0x"); LogHex(scratch_val, 8);
+    LogS(" RPTR=0x"); LogHex(KgslR32(0x0806U), 8);
+    LogS(" RBBM_STATUS=0x"); LogHex(KgslR32(0x0210U), 8);
+    LogS(" CB0_FSR=0x"); LogHex(mmio_r32(smmu, cb0 + 0x058U), 8); LogNL();
+
+    if ((mask & 0x100U) == 0U || fence2 != 2U || scratch_val != 0x05E9A740U) {
+        goto teardown_cb0;
+    }
+
+    /* Stage 6C (mask & 0x100): CP_SMMU_APERTURE + ZAP PAS_ID=13 + CP_SET_SECURE_MODE(0) */
+    LogS("=== STAGE 0x100 (Stage 6C): CP_SMMU_APERTURE + ZAP PAS13 + Non-Secure ==="); LogNL();
+    {
+        uint64_t r0 = ~0ULL, r1 = 0ULL, r2 = 0ULL, r3 = 0ULL;
+        (void)ScmCall64(0x42000C1BULL, 4ULL, 0xFFFF0000ULL, 0xFFFFFFFFULL, 0xFFFFFFFFULL, 0xFFFFFFFFULL, &r0, &r1, &r2, &r3);
+        LogS("  SCM CP_SMMU_APERTURE_ID(CB0): r0=0x"); LogHex(r0, 16);
+        LogS(" r1=0x"); LogHex(r1, 16); LogNL();
+
+        uint32_t zap_len = 0U;
+        if (!ReadFwFile(L"\\??\\C:\\Users\\Public\\a740_zap.mbn", &zap_len) || zap_len < 52U ||
+            g_gmu_fw_buf[0] != 0x7FU || g_gmu_fw_buf[1] != 'E' ||
+            g_gmu_fw_buf[2] != 'L'  || g_gmu_fw_buf[3] != 'F' || g_gmu_fw_buf[4] != 1U) {
+            LogS("  [SKIP] Invalid or missing C:\\Users\\Public\\a740_zap.mbn (len="); LogDec((int64_t)zap_len); LogS(")."); LogNL();
+            goto teardown_cb0;
+        }
+        LogS("  Loaded C:\\Users\\Public\\a740_zap.mbn: "); LogDec((int64_t)zap_len); LogS(" bytes"); LogNL();
+
+        uint32_t phoff = ReadLe32U(g_gmu_fw_buf + 28U);
+        uint32_t phent = ReadLe16U(g_gmu_fw_buf + 42U);
+        uint32_t phnum = ReadLe16U(g_gmu_fw_buf + 44U);
+        if (phent != 32U || phnum < 2U || phnum > 16U || (uint64_t)phoff + (uint64_t)phnum * 32ULL > zap_len) {
+            LogS("  [ERR] ZAP ELF phdr bounds error."); LogNL();
+            goto teardown_cb0;
+        }
+        if (ZapPh(phoff, 0U, 0U) == 1U) {
+            LogS("  [ERR] ZAP phdr[0] is PT_LOAD."); LogNL();
+            goto teardown_cb0;
+        }
+        uint32_t hash_idx = 0U;
+        for (uint32_t i = 1U; i < phnum; i++) {
+            if (((ZapPh(phoff, i, 6U) >> 24) & 7U) == 2U) {
+                hash_idx = i;
+                break;
+            }
+        }
+        if (hash_idx == 0U) {
+            LogS("  [ERR] ZAP hash segment not found."); LogNL();
+            goto teardown_cb0;
+        }
+        uint64_t zlo = ~0ULL, zhi = 0ULL;
+        int relocate = 0;
+        for (uint32_t i = 0U; i < phnum; i++) {
+            uint32_t ptype = ZapPh(phoff, i, 0U);
+            uint32_t flags = ZapPh(phoff, i, 6U);
+            uint32_t memsz = ZapPh(phoff, i, 5U);
+            uint32_t paddr = ZapPh(phoff, i, 3U);
+            if (ptype != 1U || ((flags >> 24) & 7U) == 2U || memsz == 0U) continue;
+            if (flags & (1U << 27)) relocate = 1;
+            if ((uint64_t)paddr < zlo) zlo = (uint64_t)paddr;
+            uint64_t end = ((uint64_t)paddr + (uint64_t)memsz + 0xFFFULL) & ~0xFFFULL;
+            if (end > zhi) zhi = end;
+        }
+        if (zlo >= zhi || (zhi - zlo) > SZ_ZAP_REGION) {
+            LogS("  [ERR] ZAP region span invalid lo=0x"); LogHex(zlo, 8);
+            LogS(" hi=0x"); LogHex(zhi, 8); LogNL();
+            goto teardown_cb0;
+        }
+        uint32_t ehdr_bytes = ZapPh(phoff, 0U, 4U);
+        uint32_t hash_bytes = ZapPh(phoff, hash_idx, 4U);
+        uint32_t hash_off   = ZapPh(phoff, hash_idx, 1U);
+        if (ehdr_bytes > zap_len || (uint64_t)hash_off + (uint64_t)hash_bytes > zap_len ||
+            ehdr_bytes + hash_bytes > 0x4000U) {
+            LogS("  [ERR] ZAP metadata bounds invalid."); LogNL();
+            goto teardown_cb0;
+        }
+
+        uint32_t meta_pages = (ehdr_bytes + hash_bytes + 0xFFFU) >> 12;
+        volatile uint8_t *meta_va = (volatile uint8_t *)MmAllocateContiguousMemorySpecifyCache(
+            meta_pages * 4096U, lo, hi, bound, MmNonCached);
+        if (!meta_va) {
+            LogS("  [ERR] Failed allocating ZAP metadata buffer."); LogNL();
+            goto teardown_cb0;
+        }
+        uint64_t meta_pa = (uint64_t)MmGetPhysicalAddress((PVOID)meta_va).QuadPart;
+        ZeroBuf32((volatile uint32_t *)meta_va, meta_pages * 1024U);
+        for (uint32_t i = 0U; i < ehdr_bytes; i++) meta_va[i] = g_gmu_fw_buf[i];
+        for (uint32_t i = 0U; i < hash_bytes; i++) meta_va[ehdr_bytes + i] = g_gmu_fw_buf[hash_off + i];
+        dmb_sy();
+
+        (void)ScmCall64(0x42000201ULL, 2ULL | (2ULL << 6), 13ULL, meta_pa, 0ULL, 0ULL, &r0, &r1, NULL, NULL);
+        LogS("  PAS_INIT_IMAGE(13): r0=0x"); LogHex(r0, 16); LogS(" r1=0x"); LogHex(r1, 16); LogNL();
+
+        if (r0 == 0ULL && r1 == 0ULL && relocate) {
+            (void)ScmCall64(0x42000202ULL, 3ULL, 13ULL, PA_ZAP_REGION, zhi - zlo, 0ULL, &r0, &r1, NULL, NULL);
+            LogS("  PAS_MEM_SETUP(13):  r0=0x"); LogHex(r0, 16); LogS(" r1=0x"); LogHex(r1, 16); LogNL();
+        }
+        if (r0 == 0ULL && r1 == 0ULL) {
+            PHYSICAL_ADDRESS zpa;
+            zpa.QuadPart = (int64_t)PA_ZAP_REGION;
+            volatile uint8_t *zreg = (volatile uint8_t *)MmMapIoSpace(zpa, SZ_ZAP_REGION, MmNonCached);
+            if (!zreg) {
+                LogS("  [ERR] Failed mapping PA_ZAP_REGION 0x9B09A000."); LogNL();
+                MmFreeContiguousMemorySpecifyCache((PVOID)meta_va, meta_pages * 4096U, MmNonCached);
+                goto teardown_cb0;
+            }
+            uint64_t zbase = relocate ? zlo : PA_ZAP_REGION;
+            int seg_ok = 1;
+            for (uint32_t i = 0U; i < phnum; i++) {
+                uint32_t ptype = ZapPh(phoff, i, 0U);
+                uint32_t flags = ZapPh(phoff, i, 6U);
+                uint32_t memsz = ZapPh(phoff, i, 5U);
+                if (ptype != 1U || ((flags >> 24) & 7U) == 2U || memsz == 0U) continue;
+                uint64_t paddr  = (uint64_t)ZapPh(phoff, i, 3U);
+                uint32_t filesz = ZapPh(phoff, i, 4U);
+                uint32_t foff   = ZapPh(phoff, i, 1U);
+                uint64_t at     = paddr - zbase;
+                if (paddr < zbase || at + memsz > SZ_ZAP_REGION || filesz > memsz || (uint64_t)foff + filesz > zap_len) {
+                    seg_ok = 0;
+                    break;
+                }
+                for (uint32_t b = 0U; b < filesz; b++) zreg[at + b] = g_gmu_fw_buf[foff + b];
+                for (uint32_t b = filesz; b < memsz; b++) zreg[at + b] = 0U;
+            }
+            dmb_sy();
+            MmUnmapIoSpace((PVOID)zreg, SZ_ZAP_REGION);
+            if (!seg_ok) {
+                LogS("  [ERR] ZAP segment copy bounds failure."); LogNL();
+                MmFreeContiguousMemorySpecifyCache((PVOID)meta_va, meta_pages * 4096U, MmNonCached);
+                goto teardown_cb0;
+            }
+            (void)ScmCall64(0x42000205ULL, 1ULL, 13ULL, 0ULL, 0ULL, 0ULL, &r0, &r1, NULL, NULL);
+            LogS("  PAS_AUTH_RESET(13): r0=0x"); LogHex(r0, 16); LogS(" r1=0x"); LogHex(r1, 16); LogNL();
+        }
+
+        MmFreeContiguousMemorySpecifyCache((PVOID)meta_va, meta_pages * 4096U, MmNonCached);
+
+        if (r0 == 0ULL && r1 == 0ULL) {
+            ring_va[28] = Pm4Type7(0x66U, 1U);
+            ring_va[29] = 0U;
+            ring_va[30] = Pm4Type4(0x0885U, 1U);
+            ring_va[31] = 3U;
+            ring_va[32] = Pm4Type7(0x46U, 4U);
+            ring_va[33] = 0x88000031U;
+            ring_va[34] = 0x00300004U;
+            ring_va[35] = 0U;
+            ring_va[36] = 3U;
+            dmb_sy();
+            KgslW32(0x0807U, 37U);
+            dmb_sy();
+
+            uint32_t fence3 = 0U, polls3 = 0U;
+            for (uint32_t i = 0U; i < 5000U; i++) {
+                dmb_sy();
+                fence3 = memptrs_va[1];
+                polls3 = i + 1U;
+                if (fence3 >= 3U) break;
+                StallUs(100U);
+            }
+            LogS("  Fence3(non-sec): val="); LogDec((int64_t)fence3);
+            LogS(" polls="); LogDec((int64_t)polls3); LogNL();
+            LogReg("SECVID_TRUST_CNTL(6C)", 0x03D3D000U, KgslR32(0xF400U));
+            LogReg("RBBM_STATUS(6C)",       0x03D00840U, KgslR32(0x0210U));
+            LogReg("CB0_FSR(6C)",           0x03DC0058U, mmio_r32(smmu, cb0 + 0x058U));
+        }
+    }
+
+teardown_cb0:
+    if (sqe_started) {
+        KgslW32(0x0808U, 3U);
+        dmb_sy();
+        KgslW32(0x3C45U, 1U);
+        for (uint32_t i = 0U; i < 500U && (KgslR32(0x3C46U) & 1U) == 0U; i++) StallUs(100U);
+        KgslW32(0x3C45U, 3U);
+        for (uint32_t i = 0U; i < 500U && (KgslR32(0x3C46U) & 2U) == 0U; i++) StallUs(100U);
+        KgslW32(0x3C45U, 0U);
+        KgslW32(0x0043U, 1U);
+        (void)KgslR32(0x0043U);
+        StallUs(150U);
+        KgslW32(0x0043U, 0U);
+        (void)KgslR32(0x0043U);
+        LogReg("RBBM_STATUS(reset)",  0x03D00840U, KgslR32(0x0210U));
+        LogReg("CP_SQE_CNTL(reset)",  0x03D02020U, KgslR32(0x0808U));
+    }
+
+    if (cb0_active) {
+        mmio_w32(smmu, 0x0C00U, 0x00020000U);
+        mmio_w32(smmu, 0x0C04U, 0x00020000U);
+        mmio_w32(smmu, 0x0800U, 0U);
+        mmio_w32(smmu, 0x0804U, 0U);
+        mmio_w32(smmu, cb0 + 0x000U, 0U);
+        mmio_w32(smmu, cb0 + 0x618U, 0U);
+        mmio_w32(smmu, cb0 + 0x7F0U, 0xFFFFFFFFU);
+        int cb0_tlb = PollMmioBit0Clear(smmu, cb0 + 0x7F4U, 1000U);
+        dmb_sy();
+
+        uint32_t sqe_now   = KgslR32(0x0808U);
+        uint32_t cb0_sctlr = mmio_r32(smmu, cb0 + 0x000U);
+        uint32_t cb0_tlb_st = mmio_r32(smmu, cb0 + 0x7F4U);
+        LogS("  CB0 teardown: tlb_done="); LogDec((int64_t)cb0_tlb);
+        LogS(" SQE="); LogHex(sqe_now, 8);
+        LogS(" CB0_SCTLR="); LogHex(cb0_sctlr, 8);
+        LogS(" TLBSTATUS="); LogHex(cb0_tlb_st, 8); LogNL();
+
+        if ((sqe_started && sqe_now != 0U) || cb0_sctlr != 0U || (cb0_tlb_st & 1U) != 0U) {
+            LogS("  [WARN] Unsafe to free CB0 pool (retained)."); LogNL();
+            return;
+        }
+    }
+
+    MmFreeContiguousMemorySpecifyCache((PVOID)cb0_pool_va, kCb0Pages * 4096U, MmNonCached);
+}
+
+static void RunStage5BGmuBoot(uint32_t mask) {
     LogS("=== STAGE 0x20 (Stage 5B): Opt-In KGSL-SMMU CB2 + GMU CM3 + HFI + OOB ==="); LogNL();
 
     uint32_t fw_len = 0;
-    if (!ReadGmuFwFile(&fw_len)) {
+    if (!ReadFwFile(L"\\??\\C:\\Users\\Public\\gmu_gen70200.bin", &fw_len)) {
         LogS("  [SKIP] C:\\Users\\Public\\gmu_gen70200.bin not found -- pull via Lineage Recovery pull_s23_gpu_fw.py first"); LogNL();
         return;
     }
@@ -2043,12 +2782,20 @@ static void RunStage5BGmuBoot(void) {
         LogS("  [SKIP] SMMU IDR mismatch."); LogNL();
         goto cleanup_maps;
     }
+    if (mmio_r32(smmu, 0x20000U) & 1U) {
+        LogS("  [SKIP] KGSL-SMMU CB0 SCTLR already active."); LogNL();
+        goto cleanup_maps;
+    }
     if (mmio_r32(smmu, 0x22000U) & 1U) {
         LogS("  [SKIP] KGSL-SMMU CB2 SCTLR already active."); LogNL();
         goto cleanup_maps;
     }
-    if (mmio_r32(smmu, 0x0800U) & 0x80000000U) {
-        LogS("  [SKIP] KGSL-SMMU SMR[0] already valid (0x"); LogHex(mmio_r32(smmu, 0x0800U), 8); LogS(")."); LogNL();
+    if ((mmio_r32(smmu, 0x0800U) & 0x80000000U) ||
+        (mmio_r32(smmu, 0x0804U) & 0x80000000U) ||
+        (mmio_r32(smmu, 0x0808U) & 0x80000000U)) {
+        LogS("  [SKIP] KGSL-SMMU SMR[0..2] already valid (0x"); LogHex(mmio_r32(smmu, 0x0800U), 8);
+        LogS("/0x"); LogHex(mmio_r32(smmu, 0x0804U), 8);
+        LogS("/0x"); LogHex(mmio_r32(smmu, 0x0808U), 8); LogS(")."); LogNL();
         goto cleanup_maps;
     }
 
@@ -2193,10 +2940,10 @@ static void RunStage5BGmuBoot(void) {
     }
     dmb_sy();
 
-    /* Program KGSL-SMMU Context Bank 2 (Bank=2, Asid=2, Slot=0, SID=5, CB=0x22000) */
+    /* Program KGSL-SMMU Context Bank 2 (Bank=2, Asid=2, Slot=2, SID=5, CB=0x22000) */
     const uint32_t cb = 0x22000U;
-    uint32_t s2cr0_init = mmio_r32(smmu, 0x0C00U);
-    mmio_w32(smmu, 0x0C00U, (s2cr0_init & ~0x30000U) | 0x20000U);
+    uint32_t s2cr2_init = mmio_r32(smmu, 0x0C08U);
+    mmio_w32(smmu, 0x0C08U, (s2cr2_init & ~0x30000U) | 0x20000U);
 
     uint32_t nsacr = mmio_r32(smmu, 0x0010U);
     if (nsacr & (1U << 26)) {
@@ -2238,8 +2985,8 @@ static void RunStage5BGmuBoot(void) {
     }
 
     mmio_w32(smmu, cb + 0x000U, 0x00C00067U); /* CB2_SCTLR enable */
-    mmio_w32(smmu, 0x0800U, 0x80000005U);     /* SMR[0]: VALID | SID=5 */
-    mmio_w32(smmu, 0x0C00U, 0x00000302U);     /* S2CR[0]: TRANS | PRIV=3 | CB=2 */
+    mmio_w32(smmu, 0x0808U, 0x80000005U);     /* SMR[2]: VALID | SID=5 */
+    mmio_w32(smmu, 0x0C08U, 0x00000302U);     /* S2CR[2]: TRANS | PRIV=3 | CB=2 */
     dmb_sy();
     smmu_active = 1;
 
@@ -2247,8 +2994,8 @@ static void RunStage5BGmuBoot(void) {
     LogReg("CB2_SCTLR(armed)",   0x03DC2000U, mmio_r32(smmu, cb + 0x000U));
     LogReg("CB2_TTBR0_LO",       0x03DC2020U, mmio_r32(smmu, cb + 0x020U));
     LogReg("CB2_TTBR0_HI",       0x03DC2024U, mmio_r32(smmu, cb + 0x024U));
-    LogReg("SMR[0](armed)",      0x03DA0800U, mmio_r32(smmu, 0x0800U));
-    LogReg("S2CR[0](armed)",     0x03DA0C00U, mmio_r32(smmu, 0x0C00U));
+    LogReg("SMR[2](armed)",      0x03DA0808U, mmio_r32(smmu, 0x0808U));
+    LogReg("S2CR[2](armed)",     0x03DA0C08U, mmio_r32(smmu, 0x0C08U));
     LogReg("CB2_FSR(armed)",     0x03DC2058U, mmio_r32(smmu, cb + 0x058U));
 
     /* Mask & clear both G2H and AO interrupt banks before configuring GMU core */
@@ -2469,6 +3216,9 @@ static void RunStage5BGmuBoot(void) {
             LogReg("KGSL_GBIF_HALT(5B)",    0x03D0F114U, mmio_r32(g_kgsl, KGSL_GBIF_HALT));
             LogReg("KGSL_GBIF_HALT_ACK(5B)",0x03D0F118U, mmio_r32(g_kgsl, KGSL_GBIF_HALT_ACK));
             LogReg("KGSL_CP_SQE_CNTL(5B)",  0x03D02020U, mmio_r32(g_kgsl, KGSL_CP_SQE_CNTL));
+            if (mask & 0x40U) {
+                RunStage6GpuCp(mask, smmu);
+            }
         }
     } else {
         LogS("  [INFO] GX gate/clock closed (PWR_CLK_ST=0x"); LogHex(gfx_pwr_st, 8);
@@ -2487,13 +3237,13 @@ stop_cm3:
 
 teardown_smmu:
     if (smmu_active) {
-        mmio_w32(smmu, 0x0C00U, 0x00020302U);
+        mmio_w32(smmu, 0x0C08U, 0x00020302U);
         mmio_w32(smmu, cb + 0x000U, 0U);
         mmio_w32(smmu, cb + 0x610U, 2U);
         mmio_w32(smmu, cb + 0x7F0U, 0xFFFFFFFFU);
         int tlb_done = PollMmioBit0Clear(smmu, cb + 0x7F4U, 1000U);
-        mmio_w32(smmu, 0x0800U, 0U);
-        mmio_w32(smmu, 0x0C00U, 0x00020000U);
+        mmio_w32(smmu, 0x0808U, 0U);
+        mmio_w32(smmu, 0x0C08U, 0x00020000U);
         dmb_sy();
 
         uint32_t cm3_now = mmio_r32(g_gmu, GMU_CM3_SYSRESET);
@@ -2535,8 +3285,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 
     LogOpen();
     uint32_t mask = ReadStageMask();
-    LogS("=== s23gpuprobe.sys v1.0.0.6 started (StageMask=0x");
-    LogHex(mask, 2);
+    LogS("=== s23gpuprobe.sys v1.0.0.7 started (StageMask=0x");
+    LogHex(mask, 3);
     LogS(") ===");
     LogNL();
 
@@ -2577,10 +3327,10 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         RunStage5AScmAndSmmu(mask);
     }
     if (mask & 0x20U) {
-        RunStage5BGmuBoot();
+        RunStage5BGmuBoot(mask);
     }
 
-    LogS("=== s23gpuprobe.sys v1.0.0.6 completed cleanly ==="); LogNL();
+    LogS("=== s23gpuprobe.sys v1.0.0.7 completed cleanly ==="); LogNL();
 
     if (g_kgsl)     { MmUnmapIoSpace((PVOID)g_kgsl,     SZ_KGSL);          g_kgsl     = NULL; }
     if (g_gmu)      { MmUnmapIoSpace((PVOID)g_gmu,      SZ_GMU_CORE);      g_gmu      = NULL; }
