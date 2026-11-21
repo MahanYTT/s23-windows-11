@@ -189,3 +189,17 @@ Verified directly in `drivers/soc/qcom/smem.c`:
 
 1. **Inert ACPI SSDT (`modem_5g_research\s23_subsys_pil.asl` -> `.aml` & `.hex`):** Declares `SMEM`, `IPCC`, `AMSS` (`0x04080000`, `GSI 296`), `ADSP` (`0x03000000`, `GSI 518`), `CDSP` (`0x32300000`, `GSI 610`), `SPSS` (`0x0188101C`, `GSI 384`), and `IPA0` (`0x03E00000`/`0x03E04000`, `GSI 686`/`464`) — all gated behind master switch `S23P = 0x00` (`_STA = 0`) so it is 100% inert until explicitly enabled.
 2. **Read-Only Live Probe (`drivers\s23pilprobe\pkg\s23pilprobe.sys`, `v1.0.0.1`, `StageMask = 0x01` default):** Zero MMIO writes, zero unclocked subsystem accesses, and skips `spss_region@9B100000` by default to prevent Gunyah/XPU faults while capturing SMEM v12 TOC/items/SocInfo/ImageVersions/SMP2P/GLink, CMD_DB, IMEM `ImageLoadInfo`, GCC clocks, and HLOS-readable PIL carveout headers into `C:\Users\Public\s23pilprobe.log`.
+
+---
+
+## 7. Extracted S23 Stock 5G Modem, DSP & Subsystem Firmware Inventory (Lineage Recovery)
+
+All stock firmware images below were extracted strictly read-only (`-o ro`) from the S23 in **Lineage Recovery** via [`pull_s23_5g_and_subsys_fw.py`](pull_s23_5g_and_subsys_fw.py) into gitignored local folders (`modem_5g_research/s23_vendor_5g_fw/` and `audio_sensors_research/s23_vendor_audio_haptics_fw/`):
+
+| Destination Folder | Source Partition (Mount) | File Count | Key Verified Artifacts |
+|---|---|---:|---|
+| `modem_5g_research/s23_vendor_5g_fw/modem_image/` | `modem` (`/dev/block/sda24`, `vfat` RO) | `85` | `modem.mdt` (`6,364 B`) + `modem.b00..b31`, `modem_dtb.mdt` (`4,044 B`) + `.b00..b02`, `ipa_fws.mdt` (`4,204 B`) + `.b00..b04`, `fw_ipa_gsi_5.5_w.elf` (`36,760 B`), `kailua/qdsp6m.qdb`, carrier `mcfg_hw/sw.mbn` |
+| `modem_5g_research/s23_vendor_5g_fw/apnhlos_image/` | `apnhlos` (`/dev/block/sda19`, `vfat` RO) | `523` | `adsp.mdt` (`7,884 B`) + `adsp.b00..b50`, `adsp_dtb.*`, `adspr/adsps/adspua.jsn`, `cdsp.mdt` (`5,084 B`) + `.b00..b15`, `cdsp_dtb.*`, `cdspr.jsn`, `spss1p.mdt` (`4,044 B`) + `.b00..b02`, `cpusys_vm.*`, `ipa_fws.*`, `fw_ipa_gsi_5.5_w.elf`, `verinfo/ver_info.txt` |
+| `modem_5g_research/s23_vendor_5g_fw/dsp_image/` | `dsp` (`/dev/block/sda17`, `ext4` RO) | `79` | Hexagon `adsp/` + `cdsp/` shared dynamic libraries (`*.so`, `fastrpc_shell_*`, `map_*.txt`) |
+| `modem_5g_research/s23_vendor_5g_fw/core_nhlos_a.img` | `core_nhlos_a` (`/dev/block/sda39`, raw RO) | `1` | `67,108,864 B` (`64 MiB`) UEFI `_FVH` Firmware Volume supplying `CORE_ADSP` / `CORE_CDSP` / `CORE_MODEM` (`PILDxe` / `PILProxyDxe`) |
+| `audio_sensors_research/s23_vendor_audio_haptics_fw/` | `super/vendor` (`/dev/block/sda30`, `erofs` RO) | `23` | `cs35l43*` (`4` files, `133,124 B` total `.wmfw`/`.bin`), `cs40l26*` (`13` files, `157,300 B` total `.wmfw`/`.bin`), `SoundBoosterParam.bin`, `dax_param.bin`, display panel `.dat` calibration files, `vpu30_4v.mbn` |

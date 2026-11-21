@@ -53,6 +53,8 @@ wifi_research/res_*.json
 wifi_research/res_*.md
 wifi_research/plan.md
 gpu_research/s23_gpu_bringup/fw/s23_vendor_gpu_fw/
+modem_5g_research/s23_vendor_5g_fw/
+audio_sensors_research/s23_vendor_audio_haptics_fw/
 *.bin
 *.tlv
 *.mbn

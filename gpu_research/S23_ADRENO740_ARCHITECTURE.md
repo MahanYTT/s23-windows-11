@@ -197,7 +197,7 @@ An exhaustive read-only scan of `s23_dm1q\`, `s23_dm1q\backups\`, `s23_dm1q\repo
 | `s23_dm1q\wifi_research\s23_vendor_wifi_fw\` | `qca6490/{amss20.bin,bdwlan.elf,m3.bin,regdb.bin}`, `hpbtfw21.tlv`, `hpnv21.bin`, `hpnv21g.bin`, `Data.msc` | Wi-Fi & Bluetooth firmware only (no GPU firmware). |
 | `s23_dm1q\backups\` | `abl.img`, `boot.img`, `dtbo.img`, `efs.img`, `fsc.img`, `fsg.img`, `init_boot.img`, `live_fdt.dtb`, `misc.img`, `modemst1.img`, `modemst2.img`, `param.img`, `persist.img`, `sec_efs.img`, `uefi.img`, `vbmeta.img`, `vendor_boot.img`, `xbl.img`, `xbl_config.img` | Boot/NV backups only (`vendor` / `vendor_firmware_mnt` / `modem` partition images were not backed up to PC). |
 | `repos/oneplus-open-windows/` | Source-only snapshot (proprietary firmware excluded by `README.md` publication policy). | Source reference only. |
-| **Required S23 Adreno 740 Firmware Files (NOT yet extracted to PC)** | 1. **`a740_sqe.fw`** (CP SQE microcode)<br>2. **`gmu_gen70200.bin`** (GMU CM3 firmware — Linux upstream alias `a740_gmu.bin`, GMU v4.1.0)<br>3. **`a740_zap.mbn`** (or split `a740_zap.mdt` + `a740_zap.b00..b02`, signed by Samsung/QCOM for S23's TZ!) | **Action Required Once Live Device Access Resumes:** Pull from S23 Android/Recovery `/vendor/firmware/a740_sqe.fw`, `/vendor/firmware/gmu_gen70200.bin` (or `a740_gmu.bin`), and `/vendor/firmware_mnt/image/a740_zap.*` into `gpu_research\s23_gpu_fw\`. |
+| **Pulled S23 Adreno 740 Firmware Files (Gitignored local folder `gpu_research\s23_gpu_bringup\fw\s23_vendor_gpu_fw\`)** | 1. **`a740_sqe.fw`** (`76,724 B`, SHA-256 `96fee336424b139100fc60b5b45a907360e4b3936d7e1d00406b9bd80ca48473`)<br>2. **`gmu_gen70200.bin`** (`66,844 B`, `15` blocks, `DTCM_VER=0x40010009`, SHA-256 `1a2a419c39046d3141fc5fed5aa7f971de2db40cc7a1d89693c3e26fad64dd98`)<br>3. **`a740_zap.mbn`** (`12,088 B`, `362882ec...`), **`a740_zap.elf`** (`5,168 B`), **`a740_zap.mdt` + `.b00..b02`** | **PULLED & VERIFIED VIA LINEAGE RECOVERY (`pull_s23_gpu_fw.py`):** Both `gmu_gen70200.bin` and `a740_sqe.fw` match OnePlus Open `G191_STOCK_GMU_SHA256` and `G433_SQE_SHA256` **100% bit-for-bit**. |
 
 ---
 
@@ -256,16 +256,19 @@ Tested live on the S23 (`StageMask = 0x1B` = `0x01 | 0x02 | 0x08 | 0x10`, captur
   - `\_SB.GPU0` (`_HID "OPEN0515"`): `_DEP { \_SB.MMU1 }`, 5 MMIO banks (`0x03D00000`, `0x03D50000`, `0x03D68000`, `0x03D9A000`, `0x0B280000`) + Level ActiveHigh GSIs `332, 336, 337`.
 - Validated via `iasl -tc`: **0 Errors, 0 Warnings, 0 Remarks, 1 Optimizations** (`744 bytes` AML).
 
-### 5.3 Stage 5B & WDDM Bring-Up Runbook
+### 5.3 Live Stage 5B Execution & Verified S23 Stock Firmware (`s23gpuprobe.sys v1.0.0.5`)
 
-1. **Pull Stock S23 GPU Firmware (Lineage Recovery only, strictly read-only):**
-   Boot the phone into **Lineage Recovery** (`Power + VolUp` over USB) and run:
-   ```powershell
-   python gpu_research/s23_gpu_bringup/fw/pull_s23_gpu_fw.py
-   ```
-   This maps `/dev/block/mapper/vendor{_a,_b}` via `lptools_new` read-only (`-o ro`), extracts `gmu_gen70200.bin` (and/or `a740_gmu.bin`), `a740_sqe.fw`, and `a740_zap.*` into `gpu_research/s23_gpu_bringup/fw/s23_vendor_gpu_fw/`, and runs `extract_and_verify_s23_gpu_fw.py`.
-2. **Stage `gmu_gen70200.bin` on Windows & Test Stage 5B (`StageMask = 0x3B`):**
-   Upload `gmu_gen70200.bin` to `C:\Users\Public\gmu_gen70200.bin`, set `StageMask = 0x3B` (`0x01 | 0x02 | 0x08 | 0x10 | 0x20`) on `HKLM\SYSTEM\CurrentControlSet\Services\s23gpuprobe\Parameters`, run `sc.exe start s23gpuprobe`, inspect `C:\Users\Public\s23gpuprobe.log`, and restore `StageMask = 0x01`.
-3. **ACPI + Native WDDM (`G1287`/`G1348`/`G779`) + Mesa (`G739`):**
-   Once Stage 5B confirms GMU CM3 boot + `GPUCC_GX_GDSCR` (`PWR_ON` bit 31) + `SQE` / `SET_CP_POOL_SIZE` / `a740_zap` bring-up, integrate `s23_gpu_acpi.aml` into a dedicated UEFI build and connect the open-source WDDM + ARM64 Mesa Freedreno/Turnip stack.
+1. **Extracted & Verified Stock S23 GPU Firmware (Lineage Recovery, read-only via `pull_s23_gpu_fw.py`):**
+   - Parsed `0PLA` `LpMetadataHeader` from `/dev/block/by-name/super` (`/dev/block/sda30`, `vendor` offset `8559525888`, mounted read-only via `losetup -r` + `erofs`) and extracted all `8` stock files into `gpu_research/s23_gpu_bringup/fw/s23_vendor_gpu_fw/`.
+   - **100% Bit-Exact SHA-256 Matches to `G1287-cold-aperture` Reference Pins (`extract_and_verify_s23_gpu_fw.py`):**
+     - `gmu_gen70200.bin`: `66,844 B`, `15` blocks (`ITCM 476 B`, `ICACHE 66,064 B`, `DTCM 40 B + 24 B`), `GMU DTCM Version Word (0x10007FE0) = 0x40010009`, SHA-256 `1a2a419c39046d3141fc5fed5aa7f971de2db40cc7a1d89693c3e26fad64dd98` (**EXACT MATCH** to `G191_STOCK_GMU_SHA256`).
+     - `a740_sqe.fw`: `76,724 B`, SHA-256 `96fee336424b139100fc60b5b45a907360e4b3936d7e1d00406b9bd80ca48473` (**EXACT MATCH** to `G433_SQE_SHA256`).
+     - `s23_rsc_seq_ucode.bin`: `20 B`, SHA-256 `20175df4f9aafab7f958205d71bf931a30a484bd6e94db348da5497a4e13ce90` (**EXACT MATCH** to `G482RscSha`).
+     - `a740_zap.mbn` (`12,088 B`, ELF magic, `362882eca2c5112b5aa1b8b56c2606947b7b73314070c9c514cf108bbffadfa8`), `a740_zap.elf` (`5,168 B`, `3cbdf8d0ca6744c368170e8d248c409c3b93963e56fa1ef0d3951eae0ef5148b`), `a740_zap.mdt` (`4,044 B`) + `a740_zap.b00..b02`.
+2. **Live Stage 5B Execution (`StageMask = 0x3B` -> restored to `0x01`, `drivers/s23gpuprobe/s23gpuprobe_v5_s5b_live.log`):**
+   - Staged `gmu_gen70200.bin`, `a740_sqe.fw`, and `a740_zap.mbn` to `C:\Users\Public\` on the phone and executed `s23gpuprobe.sys v1.0.0.5` with `StageMask = 0x3B`.
+   - Stage `0x02` brought CX up cleanly from cold reset (`GPUCC_CX_GDSCR` `0x0022F801` -> `0xF822F800`, `PLL0`/`PLL1` locked `0xE0000005`).
+   - Stage `0x20` (`Stage 5B`) loaded `C:\Users\Public\gmu_gen70200.bin` (`66,844 B`), parsed all `15` blocks (`ITCM=1`, `ICACHE=1`, `DTCM=2`), wrote `ITCM` (`476 B`) and `DTCM` (`40 B + 24 B`) to live GMU TCM hardware and read back every 32-bit word with **0 mismatches** (`ITCM/DTCM verified cleanly`), and safely skipped CM3 reset release because `FW Region2(ICACHE) blk#12 addr=0x00004000 len=0x010210` requires active `KGSL-SMMU` CB5 page tables.
+3. **Next On-Device Step — ACPI + `KGSL-SMMU` CB5 + WDDM (`G1287`/`G1348`/`G779`) + Mesa (`G739`):**
+   - Integrate `s23_gpu_acpi.aml` (`MMU1` `OPEN0D01` + `GPU0` `OPEN0515`) and an `IORT` entry for `0x03DA0000` into a dedicated UEFI test build, then port `G1287-cold-aperture` `OpenSmmuD0` + `OpenGpuStart` (programming `KGSL-SMMU` CB5 for `0x00004000` ICACHE + `0x60000000` persistent + HFI/log IOVAs before releasing `GMU_CM3_SYSRESET` -> `GPUCC_GX_GDSCR` bit 31 `PWR_ON` -> `SQE` / `SET_CP_POOL_SIZE` / `a740_zap`) and connect the open-source WDDM + ARM64 Mesa Freedreno/Turnip stack.
 

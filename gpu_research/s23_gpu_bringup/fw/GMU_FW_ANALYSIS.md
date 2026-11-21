@@ -10,24 +10,23 @@
 
 Verified directly from S23's stock graphics kernel driver (`/home/mahan/s23/src/vendor/qcom/opensource/graphics-kernel/adreno-gpulist.h`, L2073–2105):
 
-| Role | S23 Stock Filename (`adreno-gpulist.h`) | Upstream Linux / Freedreno Name | On-Disk Status (100% Offline Audit) |
+| Role | S23 Stock Filename (`adreno-gpulist.h`) | Upstream Linux / Freedreno Name | Verified On-Disk & Live Status (Lineage Recovery Pulled) |
 |---|---|---|---|
-| **GMU Cortex-M3 Firmware** | **`gmu_gen70200.bin`** (`GMU_VERSION(4, 1, 0)`) | `a740_gmu.bin` | **Not yet dumped to host PC** (`super.img`/`vendor.img` not on PC; `pull_boot24_and_wifi_fw.py` previously pulled only QCA6490 Wi-Fi/BT files). |
-| **CP SQE Microcode** | **`a740_sqe.fw`** | `a740_sqe.fw` / `gen70200_sqe.fw` | **Not yet dumped to host PC** (lives on phone `/vendor/firmware/a740_sqe.fw`). |
-| **TrustZone PAS ZAP Shader** | **`a740_zap.mbn`** | `a740_zap.mbn` | **Not yet dumped to host PC** (lives on phone `/vendor/firmware/a740_zap.mbn` or `/vendor/firmware_mnt/image/`). |
-| **RSCC Sequencer Ucode** | Embedded in `adreno_gen7_gmu.c` L191–195 (`20 B`) | `GEN7_2_0_RSCC_SEQ_MEM_0..4_DRV0` | **EXTRACTED & VERIFIED** -> `fw\s23_rsc_seq_ucode.bin` (**EXACT SHA-256 MATCH** with `G482RscSha`!). |
+| **GMU Cortex-M3 Firmware** | **`gmu_gen70200.bin`** (`GMU_VERSION(4, 1, 0)`) | `a740_gmu.bin` | **PULLED & EXACT MATCH** (`66,844 B`, `15` blocks, `DTCM_VER=0x40010009`, SHA-256 `1a2a419c39046d3141fc5fed5aa7f971de2db40cc7a1d89693c3e26fad64dd98` == `G191_STOCK_GMU_SHA256`) |
+| **CP SQE Microcode** | **`a740_sqe.fw`** | `a740_sqe.fw` / `gen70200_sqe.fw` | **PULLED & EXACT MATCH** (`76,724 B`, SHA-256 `96fee336424b139100fc60b5b45a907360e4b3936d7e1d00406b9bd80ca48473` == `G433_SQE_SHA256`) |
+| **TrustZone PAS ZAP Shader** | **`a740_zap.mbn`** / `.elf` / `.mdt`+`.b00..b02` | `a740_zap.mbn` | **PULLED** (`a740_zap.mbn` `12,088 B`, SHA-256 `362882eca2c5112b5aa1b8b56c2606947b7b73314070c9c514cf108bbffadfa8`; `a740_zap.elf` `5,168 B`, `3cbdf8d0ca6744c368170e8d248c409c3b93963e56fa1ef0d3951eae0ef5148b`; `.mdt` `4,044 B` + `.b00..b02`) |
+| **RSCC Sequencer Ucode** | Embedded in `adreno_gen7_gmu.c` L191–195 (`20 B`) | `GEN7_2_0_RSCC_SEQ_MEM_0..4_DRV0` | **EXTRACTED & EXACT MATCH** -> `fw\s23_rsc_seq_ucode.bin` (`20 B`, SHA-256 `20175df4f9aafab7f958205d71bf931a30a484bd6e94db348da5497a4e13ce90` == `G482RscSha`) |
 
 > **Important Note:** `C:\Users\Mahan\Documents\windows-on-android\device_firmware\firmware\` contains Galaxy A52 (`SM7125` / Adreno 618: `a618_gmu.bin`, `a630_sqe.fw`, etc.) and **MUST NOT** be used on S23.
 
-### One-Shot Live Operator Pull & Validation Commands (Next Time in Lineage Recovery)
-Once the operator next mounts `/tmp/vendor_ro` (same `lptools_new --super` pattern used in `wifi_research\pull_boot24_and_wifi_fw.py`):
+### Read-Only Lineage Recovery Extraction & Stage 5B Live Hardware Verification
+Pulled strictly read-only from `super/vendor` (`/dev/block/sda30`, `erofs`) via [`pull_s23_gpu_fw.py`](pull_s23_gpu_fw.py) into `gpu_research\s23_gpu_bringup\fw\s23_vendor_gpu_fw\` and verified with [`extract_and_verify_s23_gpu_fw.py`](extract_and_verify_s23_gpu_fw.py):
 ```powershell
-adb pull /tmp/vendor_ro/firmware/gmu_gen70200.bin gpu_research\s23_gpu_bringup\fw\gmu_gen70200.bin
-adb pull /tmp/vendor_ro/firmware/a740_sqe.fw      gpu_research\s23_gpu_bringup\fw\a740_sqe.fw
-adb pull /tmp/vendor_ro/firmware/a740_zap.mbn     gpu_research\s23_gpu_bringup\fw\a740_zap.mbn
-python gpu_research\s23_gpu_bringup\fw\extract_and_verify_s23_gpu_fw.py
+python gpu_research/s23_gpu_bringup/fw/pull_s23_gpu_fw.py
 ```
-`extract_and_verify_s23_gpu_fw.py` automatically parses every 16-byte `struct gmu_block_header` (`ITCM`, `ICACHE`, `DTCM`, metadata), prints the `GMU DTCM` version word (`0x10007FE0`), and diffs SHA-256 digests directly against `G1287-cold-aperture`.
+Live execution on Windows (`s23gpuprobe.sys v1.0.0.5`, `StageMask = 0x3B`, captured in `drivers\s23gpuprobe\s23gpuprobe_v5_s5b_live.log`):
+- Loaded `C:\Users\Public\gmu_gen70200.bin` (`66,844 B`), parsed all `15` blocks (`ITCM=1` [`476 B`], `ICACHE=1` [`66,064 B` @ `0x00004000`], `DTCM=2` [`40 B` + `24 B`], `META=11`).
+- Wrote and verified all `ITCM` and `DTCM` words against live GMU TCM hardware with **0 mismatches** (`ITCM/DTCM verified cleanly`), and safely gated CM3 reset release because Region 2 (`ICACHE` IOVA `0x00004000`) requires active `KGSL-SMMU` CB5 page tables (`OpenSmmuD0` + `OpenGpuStart`).
 
 ---
 
