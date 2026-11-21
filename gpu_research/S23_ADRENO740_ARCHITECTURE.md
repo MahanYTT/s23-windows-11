@@ -265,10 +265,64 @@ Tested live on the S23 (`StageMask = 0x1B` = `0x01 | 0x02 | 0x08 | 0x10`, captur
      - `a740_sqe.fw`: `76,724 B`, SHA-256 `96fee336424b139100fc60b5b45a907360e4b3936d7e1d00406b9bd80ca48473` (**EXACT MATCH** to `G433_SQE_SHA256`).
      - `s23_rsc_seq_ucode.bin`: `20 B`, SHA-256 `20175df4f9aafab7f958205d71bf931a30a484bd6e94db348da5497a4e13ce90` (**EXACT MATCH** to `G482RscSha`).
      - `a740_zap.mbn` (`12,088 B`, ELF magic, `362882eca2c5112b5aa1b8b56c2606947b7b73314070c9c514cf108bbffadfa8`), `a740_zap.elf` (`5,168 B`, `3cbdf8d0ca6744c368170e8d248c409c3b93963e56fa1ef0d3951eae0ef5148b`), `a740_zap.mdt` (`4,044 B`) + `a740_zap.b00..b02`.
-2. **Live Stage 5B Execution (`StageMask = 0x3B` -> restored to `0x01`, `drivers/s23gpuprobe/s23gpuprobe_v5_s5b_live.log`):**
+2. **Live Stage 5B ITCM/DTCM Verification (`s23gpuprobe.sys v1.0.0.5`, `StageMask = 0x3B` -> `0x01`, `drivers/s23gpuprobe/s23gpuprobe_v5_s5b_live.log`):**
    - Staged `gmu_gen70200.bin`, `a740_sqe.fw`, and `a740_zap.mbn` to `C:\Users\Public\` on the phone and executed `s23gpuprobe.sys v1.0.0.5` with `StageMask = 0x3B`.
-   - Stage `0x02` brought CX up cleanly from cold reset (`GPUCC_CX_GDSCR` `0x0022F801` -> `0xF822F800`, `PLL0`/`PLL1` locked `0xE0000005`).
-   - Stage `0x20` (`Stage 5B`) loaded `C:\Users\Public\gmu_gen70200.bin` (`66,844 B`), parsed all `15` blocks (`ITCM=1`, `ICACHE=1`, `DTCM=2`), wrote `ITCM` (`476 B`) and `DTCM` (`40 B + 24 B`) to live GMU TCM hardware and read back every 32-bit word with **0 mismatches** (`ITCM/DTCM verified cleanly`), and safely skipped CM3 reset release because `FW Region2(ICACHE) blk#12 addr=0x00004000 len=0x010210` requires active `KGSL-SMMU` CB5 page tables.
-3. **Next On-Device Step — ACPI + `KGSL-SMMU` CB5 + WDDM (`G1287`/`G1348`/`G779`) + Mesa (`G739`):**
-   - Integrate `s23_gpu_acpi.aml` (`MMU1` `OPEN0D01` + `GPU0` `OPEN0515`) and an `IORT` entry for `0x03DA0000` into a dedicated UEFI test build, then port `G1287-cold-aperture` `OpenSmmuD0` + `OpenGpuStart` (programming `KGSL-SMMU` CB5 for `0x00004000` ICACHE + `0x60000000` persistent + HFI/log IOVAs before releasing `GMU_CM3_SYSRESET` -> `GPUCC_GX_GDSCR` bit 31 `PWR_ON` -> `SQE` / `SET_CP_POOL_SIZE` / `a740_zap`) and connect the open-source WDDM + ARM64 Mesa Freedreno/Turnip stack.
+   - Stage `0x20` (`Stage 5B`) loaded `C:\Users\Public\gmu_gen70200.bin` (`66,844 B`), parsed all `15` blocks (`ITCM=1`, `ICACHE=1`, `DTCM=2`), wrote `ITCM` (`476 B`) and `DTCM` (`40 B + 24 B`) to live GMU TCM hardware and read back every 32-bit word with **0 mismatches**, and safely skipped CM3 reset release prior to `KGSL-SMMU` CB2 page table setup.
+
+### 5.4 Live Stage 5B Full `KGSL-SMMU` CB2 + GMU CM3 Boot + HFI Startup + `DCVS_VOTE` + `OOB_REQUEST` GX Wake (`s23gpuprobe.sys v1.0.0.6`)
+
+Tested live on the Galaxy S23 (`StageMask = 0x3B` -> restored to `0x01`, captured in `drivers/s23gpuprobe/s23gpuprobe_v6_s5b_live.log`):
+
+1. **Cold `KGSL-SMMU` (`0x03DA0000`) Stream Map & 89-Page Stage-1 Page Table (`CB2`, `SID = 5`, `ASID = 2`):**
+   - Verified cold SMR/S2CR slots `0..23`: `SMMU_ROUTES: valid_smr=0 cold_fault_default=1`.
+   - Allocated an 89-page (`364,544 B`) `MmNonCached` contiguous physical pool at `PA = 0x0009FFD69000` (`< 64 GB` 36-bit OAS, `BoundaryAddressMultiple = 0`):
+     - **Pages `0..5`:** 3-level AArch64 4K Stage-1 page tables (`L1` @ `+0x0000`, `L2_low` @ `+0x1000`, `L2_high` @ `+0x2000`, `L3_low0` @ `+0x3000`, `L3_low1` @ `+0x4000`, `L3_600` @ `+0x5000`).
+     - **Pages `6..88`:** 83 GMU data pages mapped with `leaf_attrs = 0xE03` (`nG=1, AF=1, SH=2 Outer Shareable, AttrIdx=0 Non-Cacheable, RWX Priv`):
+       - `0x00004000` (`17` pages, `68 KB` `ICACHE` Region 2 backing)
+       - `0x00100000` (`9` pages), `0x00200000` (`19` pages), `0x00300000` (`28` pages)
+       - `0x60000000` (`1` page), `0x60001000` (`1` page)
+       - `0x60002000` (`4` pages, `16 KB` `GMU_LOG` ring)
+       - `0x60006000` (`4` pages, `16 KB` `HFI` queue table + `CMDQ`/`MSGQ`/`DBGQ`)
+   - Armed `KGSL-SMMU` Context Bank 2 (`0x03DC2000`):
+     - `SMMU_sCR0(armed) (0x03DA0000) = 0x00ED0406`
+     - `CB2_SCTLR(armed) (0x03DC2000) = 0x00C00067`
+     - `CB2_TTBR0 = 0x00020009FFD69000` (`ASID = 2`)
+     - `SMR[0](armed) (0x03DA0800) = 0x80000005` (`VALID | SID=5`)
+     - `S2CR[0](armed) (0x03DA0C00) = 0x00000302` (`TRANS | PRIVCFG=3 | CBNDX=2`)
+     - `CB2_FSR(armed) (0x03DC2058) = 0x00000400`
+
+2. **Critical GMU Ownership Requirement for `GPUCC_PLL0 (0x03D90000)` & `GPUCC_GX_GDSCR (0x03D9905C)`:**
+   - The host CPU must **only** lock `gpu_cc_pll1` (`0x03D91000`, `440 MHz` -> `220 MHz` GMU CX clock) and must leave `gpu_cc_pll0` (`0x03D90000`) pre-configured in **standby** (`MODE = 0x00000100 / 0`, `OPMODE = 0`, `USER_CTL = 0`, `L = 0x4444001E`, `ALPHA = 0xBAAA`) and `GPUCC_GX_GDSCR (0x03D9905C)` with **`SW_COLLAPSE = 1` (`0x0022F801`)**.
+   - If the host CPU force-locks `GPUCC_PLL0` or clears `SW_COLLAPSE` on `GPUCC_GX_GDSCR` prior to GMU boot, `HFI[DCVS_VOTE]` (`id=30`) times out because GMU CM3 owns `GPUCC_PLL0` and the GX headswitch.
+
+3. **Live GMU CM3 Boot, PDC/RSCC Sequencer Load & HFI Startup + `DCVS_VOTE`:**
+   - Loaded all `15` blocks of `gmu_gen70200.bin` (`ITCM=1`, `ICACHE=1`, `DTCM=2`, `GMU_DTCM_VERSION = 0x40010009`) and released `GMU_CM3_SYSRESET (0x03D7E000) = 0`:
+     - **`GMU_CM3_FW_INIT_RES(post) (0x03D7E070) = 0x00000100`** (`GMU_CM3_FW_BUSY = 0`, `SMMU_sGFSR = 0`, `CB2_FSR = 0x00000400` — zero translation faults).
+   - Loaded `GMU_PDC` (`0x0B284520 = 0`, `0x0B284500 = 0x80000001`), `RSCC` (`0x03D50000`) PDC handshake registers, and S23's 20-byte `GEN7_2_1` RSCC sequencer ucode at `0x03D50550..0x03D50560`.
+   - Started HFI (`GMU_HFI_INIT = 1` -> **`GMU_HFI_CTRL_STATUS(post) (0x03D7E600) = 0x00000001`**) and completed all 5 HFI messages with `err = 0x00000000`:
+     - **`HFI[PERF_TBL id=4 seq=1] reply hdr=0x00010304 err=0x00000000`**
+     - **`HFI[BW_TBL id=3 seq=2] reply hdr=0x00110303 err=0x00000000`**
+     - **`HFI[CORE_START id=14 seq=3] reply hdr=0x0021030E err=0x00000000`**
+     - **`HFI[START id=10 seq=4] reply hdr=0x0031030A err=0x00000000`**
+     - **`HFI[DCVS_VOTE id=30 seq=5] reply hdr=0x0041031E err=0x00000000`**
+   - Post-`DCVS_VOTE` hardware verification:
+     - `HFI CMDQ r=232 w=232 | MSGQ r=20 w=20 | DBGQ r=0 w=0`
+     - GMU CM3 autonomously locked `GPUCC_PLL0` for the 124.8 MHz vote (`GPUCC_PLL0_MODE = 0xE0000005`, `OPMODE = 1`, `GPUCC_PLL0_L_VAL = 0x0044000D`), completed all 4 RSCC TCS votes (`RSCC_TCS0..3_DRV0_STATUS = 0x00000001`, `RSCC_SEQ_BUSY_DRV0 = 0x00000000`), and wrote `225` nonzero dwords (`GMU_GENERAL_9 = 0x0000003B`) into `GMU_LOG (0x60002000)`.
+
+4. **Live `OOB_REQUEST` (`oob_gpu`) -> GX Headswitch Power-On & Live Adreno 740 `KGSL` (`0x03D00000`) Telemetry:**
+   - Asserted `OOB_REQUEST (BIT 30)` on `GMU_H2G_SET (0x03D7E650)`:
+     - **`GMU_G2H_INTR_INFO(oob) (0x03D7E648) = 0x80000001`** (`OOB_ACK` bit 31 set, then W1C cleared)
+     - **`GMU_GFX_PWR_CLK_ST(oob) (0x03D7E340) = 0x00000000`** (transitioned from `0x00000003` -> `0x00000000`: GX GDSC power & GX clocks ON!)
+     - **`GPUCC_GX_GDSCR(5B) (0x03D9905C) = 0xF8222800`** (bit 31 `PWR_ON = 1`!)
+     - **`GPUCC_GX_CFG_GDSCR(5B) (0x03D99060) = 0x04070000`** (`POWER_UP_COMPLETE` bit 16 = `1`, `POWER_DOWN_COMPLETE` bit 15 = `0`)
+   - With `GpuGxAxiGateOpen()` and `(GMU_GFX_PWR_CLK_STATUS & 3) == 0` satisfied, live `0x03D00000` (`KGSL`) registers read cleanly without fault:
+     - `KGSL_RBBM_STATUS(5B) (0x03D00840) = 0x00000001`
+     - `KGSL_RBBM_STATUS3(5B) (0x03D0084C) = 0x00000000`
+     - `KGSL_GBIF_HALT(5B) (0x03D0F114) = 0x00000008`
+     - `KGSL_GBIF_HALT_ACK(5B) (0x03D0F118) = 0x00000003`
+     - `KGSL_CP_SQE_CNTL(5B) (0x03D02020) = 0x00000000`
+   - Clean teardown verified: released `OOB_ACK` (`BIT 31` on `GMU_H2G_SET`), asserted `GMU_CM3_SYSRESET(stopped) = 1`, fault-pinned and disabled `KGSL-SMMU` CB2 (`tlb_done=1 CM3_RST=1 CB2_SCTLR=00000000 TLBSTATUS=00000000`), and freed the 89-page pool.
+
+5. **Next On-Device Step — `KGSL-SMMU` CB0 + CP `SQE` (`a740_sqe.fw`) + TZ `a740_zap.mbn` + WDDM (`G779`) + Mesa (`G739`):**
+   - Integrate `s23_gpu_acpi.aml` (`MMU1` `OPEN0D01` + `GPU0` `OPEN0515`) into a dedicated UEFI test build, bring up `KGSL-SMMU` CB0 (`SID = 0/1`) + `SET_CP_POOL_SIZE` (`0x02000C1B`) + `PAS_ID = 13` (`a740_zap.mbn`) + `a740_sqe.fw` CP ringbuffer (`G433`/`G456`), and connect the open-source WDDM KMD (`G779`) + ARM64 Mesa Freedreno/Turnip (`G739`) stack.
 

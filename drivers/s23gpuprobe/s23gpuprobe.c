@@ -873,6 +873,34 @@ static int ProgramRcg(volatile uint8_t *base, uint32_t cmd_off, uint32_t cfg_val
     return ok;
 }
 
+static int ConfigureLucidOlePllStandby(volatile uint8_t *gpucc, uint32_t pll_off, uint32_t l_val, uint32_t alpha_val, const char *name) {
+    uint32_t mode = mmio_r32(gpucc, pll_off + PLL_OFF_MODE);
+    if (mode == 0xFFFFFFFFU) return 0;
+
+    /* Leave PLL configured in standby (MODE=0, OPMODE=0, USER_CTL=0) so GMU owns it */
+    mmio_w32(gpucc, pll_off + PLL_OFF_MODE,     0U);
+    mmio_w32(gpucc, pll_off + PLL_OFF_OPMODE,   0U);
+    mmio_w32(gpucc, pll_off + PLL_OFF_USER_CTL, 0U);
+    StallUs(2U);
+
+    mmio_w32(gpucc, pll_off + PLL_OFF_L_VAL,         0x44440000U | (l_val & 0xFFFFU));
+    mmio_w32(gpucc, pll_off + PLL_OFF_ALPHA_VAL,     alpha_val & 0xFFFFU);
+    mmio_w32(gpucc, pll_off + PLL_OFF_CONFIG_CTL,    0x20485699U);
+    mmio_w32(gpucc, pll_off + PLL_OFF_CONFIG_CTL_U,  0x00182261U);
+    mmio_w32(gpucc, pll_off + PLL_OFF_CONFIG_CTL_U1, 0x82AA299CU);
+    mmio_w32(gpucc, pll_off + PLL_OFF_USER_CTL_U,    0x00000005U);
+    mmio_w32(gpucc, pll_off + PLL_OFF_TEST_CTL_U,    0x00000003U);
+    mmio_w32(gpucc, pll_off + PLL_OFF_TEST_CTL_U1,   0x00009000U);
+    mmio_w32(gpucc, pll_off + PLL_OFF_TEST_CTL_U2,   0x00000034U);
+    dmb_sy();
+
+    LogS("  PLL "); LogS(name);
+    LogS(" standby-configured mode=0x"); LogHex(mmio_r32(gpucc, pll_off + PLL_OFF_MODE), 8);
+    LogS(" op=0x"); LogHex(mmio_r32(gpucc, pll_off + PLL_OFF_OPMODE), 2);
+    LogS(" user=0x"); LogHex(mmio_r32(gpucc, pll_off + PLL_OFF_USER_CTL), 8); LogNL();
+    return 1;
+}
+
 static int ProgramLucidOlePll(volatile uint8_t *gpucc, uint32_t pll_off, uint32_t l_val, uint32_t alpha_val, const char *name) {
     uint32_t mode = mmio_r32(gpucc, pll_off + PLL_OFF_MODE);
     uint32_t op   = mmio_r32(gpucc, pll_off + PLL_OFF_OPMODE);
@@ -1247,8 +1275,8 @@ static int RunStage2BringUp(void) {
     EnableBranch(g_gpucc, GPUCC_CX_FF_CBCR,      "gpu_cc_cx_ff_clk",      0, 0);
     EnableBranch(g_gpucc, GPUCC_MEMNOC_GFX_CBCR, "gpu_cc_memnoc_gfx_clk", 0, 0);
 
-    /* 7. Lock GPU_CC_PLL0 (0x03D90000, L=0x1E ALPHA=0xBAAA) & GPU_CC_PLL1 (0x03D91000, 440 MHz) */
-    ProgramLucidOlePll(g_gpucc, GPUCC_PLL0_BASE, 0x1EU, 0xBAAAU, "gpu_cc_pll0");
+    /* 7. Configure GPU_CC_PLL0 (standby for GMU ownership) & lock GPU_CC_PLL1 (440 MHz -> 220 MHz GMU CX) */
+    (void)ConfigureLucidOlePllStandby(g_gpucc, GPUCC_PLL0_BASE, 0x1EU, 0xBAAAU, "gpu_cc_pll0");
     int pll1_ok = ProgramLucidOlePll(g_gpucc, GPUCC_PLL1_BASE, 0x16U, 0xEAAAU, "gpu_cc_pll1");
 
     /* 8. GMU RCG (220 MHz = PLL1/2: src=3, hid=3, HW_CLK_CTRL) & GMU CX branches */
@@ -1261,24 +1289,17 @@ static int RunStage2BringUp(void) {
     EnableBranch(g_gpucc, GPUCC_CXO_CBCR,     "gpu_cc_cxo_clk",     0, 0);
     EnableBranch(g_gpucc, GPUCC_CX_GMU_CBCR,  "gpu_cc_cx_gmu_clk",  0, 0);
 
-    /* 9. GX GDSC bring-up (requires gfx.lvl rail powered) */
-    if (gfx_voted || g_arc_gfx.addr != 0U) {
+    /* 9. Preserve GMU exclusive control over GX GDSC (SW_COLLAPSE=1 on GPUCC_GX_GDSCR) */
+    (void)gfx_voted;
+    {
         uint32_t gx_gds = mmio_r32(g_gpucc, GPUCC_GX_GDSCR);
         if (gx_gds != 0xFFFFFFFFU) {
-            if (gx_gds & 1U) {
-                mmio_w32(g_gpucc, GPUCC_GX_GDSCR, gx_gds & ~1U);
-                StallUs(5U);
+            if ((gx_gds & 1U) == 0U) {
+                mmio_w32(g_gpucc, GPUCC_GX_GDSCR, gx_gds | 1U);
+                (void)PollReg(g_gpucc, GPUCC_GX_CFG_GDSCR, (1U << 15), (1U << 15), 3000U);
             }
-            int gx_ok = PollReg(g_gpucc, GPUCC_GX_GDSCR, 0x80000000U, 0x80000000U, 3000U);
             LogReg("GPUCC_GX_GDSCR_AFTER",     0x03D9905CU, mmio_r32(g_gpucc, GPUCC_GX_GDSCR));
             LogReg("GPUCC_GX_CFG_GDSCR_AFTER", 0x03D99060U, mmio_r32(g_gpucc, GPUCC_GX_CFG_GDSCR));
-            if (gx_ok) {
-                EnableBranch(g_gpucc, GPUCC_GX_GMU_CBCR,   "gpu_cc_gx_gmu_clk",   0, 0);
-                EnableBranch(g_gpucc, GPUCC_GX_FF_CBCR,    "gpu_cc_gx_ff_clk",    0, 0);
-                EnableBranch(g_gpucc, GPUCC_GX_GFX3D_CBCR, "gpu_cc_gx_gfx3d_clk", 0, 0);
-            } else {
-                LogS("  [WARN] GPUCC_GX_GDSCR did not assert PWR_ON (bit 31); skipping GX branches."); LogNL();
-            }
         }
     }
 
@@ -1659,16 +1680,49 @@ static void RunStage5AScmAndSmmu(uint32_t mask) {
     LogReg("SMMU_sIDR2",  0x03DA0028U, mmio_r32(smmu, 0x0028U));
     LogReg("SMMU_sIDR7",  0x03DA003CU, mmio_r32(smmu, 0x003CU));
     LogReg("SMMU_sGFSR",  0x03DA0048U, mmio_r32(smmu, 0x0048U));
+
+    uint32_t scr0_scan = mmio_r32(smmu, 0x0000U);
+    uint32_t valid_smr = 0U;
+    int cold_fault_default = ((scr0_scan & (1U << 10)) != 0U) ? 1 : 0;
+    for (uint32_t i = 0U; i < 24U; i++) {
+        uint32_t smr  = mmio_r32(smmu, 0x0800U + 4U * i);
+        uint32_t s2cr = mmio_r32(smmu, 0x0C00U + 4U * i);
+        if (smr & 0x80000000U) valid_smr++;
+        if (smr != 0U || s2cr != 0x00020000U) {
+            cold_fault_default = 0;
+            LogS("  SMMU_SLOT["); LogDec((int64_t)i);
+            LogS("]: SMR=0x"); LogHex(smr, 8);
+            LogS(" S2CR=0x"); LogHex(s2cr, 8); LogNL();
+        }
+    }
+    LogS("  SMMU_ROUTES: valid_smr="); LogDec((int64_t)valid_smr);
+    LogS(" cold_fault_default="); LogDec((int64_t)cold_fault_default); LogNL();
+
     MmUnmapIoSpace((PVOID)smmu, SZ_KGSL_SMMU);
 }
 
 /* ============================================================================
- * Stage 0x20 (Stage 5B): Opt-In GMU CM3 Firmware Load, PDC/RSCC, HFI & OOB
+ * Stage 0x20 (Stage 5B): Opt-In KGSL-SMMU CB2 (SID 5) + GMU CM3 + HFI + OOB
  * ============================================================================ */
 static uint8_t g_gmu_fw_buf[131072];
 
 static uint32_t ReadLe32U(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static inline void mmio_w64(volatile uint8_t *base, uint32_t off, uint64_t v) {
+    dmb_sy();
+    *(volatile uint64_t *)(base + off) = v;
+    dmb_sy();
+}
+
+static int PollMmioBit0Clear(volatile uint8_t *base, uint32_t off, uint32_t max_us) {
+    for (uint32_t t = 0U; t <= max_us; t += 5U) {
+        uint32_t v = mmio_r32(base, off);
+        if (v != 0xFFFFFFFFU && (v & 1U) == 0U) return 1;
+        StallUs(5U);
+    }
+    return 0;
 }
 
 static int ReadGmuFwFile(uint32_t *out_len) {
@@ -1708,8 +1762,230 @@ static void ZeroBuf32(volatile uint32_t *p, uint32_t words) {
     for (uint32_t i = 0; i < words; i++) p[i] = 0U;
 }
 
+static int HfiSendAndWaitReply(
+    volatile uint8_t *gmu,
+    volatile uint32_t *hfi_va,
+    uint32_t seq,
+    uint32_t msg_id,
+    const uint32_t *payload,
+    uint32_t words,
+    const char *label)
+{
+    volatile uint32_t *qh0   = hfi_va + 6U;
+    volatile uint32_t *qh1   = hfi_va + 6U + 12U;
+    volatile uint32_t *data0 = hfi_va + 1024U;
+    volatile uint32_t *data1 = hfi_va + 2048U;
+
+    dmb_sy();
+    uint32_t read0  = qh0[10];
+    uint32_t write0 = qh0[11];
+    dmb_sy();
+
+    if (read0 >= 1024U || write0 >= 1024U || (read0 & 3U) || (write0 & 3U)) {
+        LogS("  [ERR] HFI "); LogS(label); LogS(" bad CMDQ indices"); LogNL();
+        return 0;
+    }
+    uint32_t count  = words + 1U;
+    uint32_t padded = (count + 3U) & ~3U;
+    if (((read0 - write0 - 1U) & 1023U) < padded) {
+        LogS("  [ERR] HFI "); LogS(label); LogS(" no CMDQ space"); LogNL();
+        return 0;
+    }
+
+    uint32_t hdr = (seq << 20) | (count << 8) | (msg_id & 0xFFU);
+    data0[write0] = hdr;
+    for (uint32_t i = 0U; i < words; i++) {
+        data0[(write0 + 1U + i) & 1023U] = payload[i];
+    }
+    for (uint32_t i = count; i < padded; i++) {
+        data0[(write0 + i) & 1023U] = 0xFAFAFAFAU;
+    }
+    dmb_sy();
+    qh0[11] = (write0 + padded) & 1023U;
+    dmb_sy();
+    mmio_w32(gmu, GMU_H2G_SET, 1U);
+
+    for (uint32_t poll = 0U; poll < 4000U; poll++) {
+        dmb_sy();
+        uint32_t r1 = qh1[10];
+        uint32_t w1 = qh1[11];
+        dmb_sy();
+        if (r1 >= 1024U || w1 >= 1024U || (r1 & 3U) || (w1 & 3U)) {
+            LogS("  [ERR] HFI "); LogS(label); LogS(" corrupt MSGQ indices"); LogNL();
+            return 0;
+        }
+        if (r1 == w1) {
+            qh1[8] = 1U;
+            dmb_sy();
+            StallUs(250U);
+            continue;
+        }
+
+        uint32_t rhdr = data1[r1];
+        uint32_t rcnt = (rhdr >> 8) & 0xFFU;
+        uint32_t rpad = (rcnt + 3U) & ~3U;
+        if (rcnt < 3U || rcnt > 19U || rpad > ((w1 - r1) & 1023U)) {
+            LogS("  [ERR] HFI "); LogS(label); LogS(" bad MSGQ packet hdr=0x");
+            LogHex(rhdr, 8); LogNL();
+            return 0;
+        }
+
+        uint32_t pkt[19];
+        for (uint32_t i = 0U; i < rcnt; i++) {
+            pkt[i] = data1[(r1 + i) & 1023U];
+        }
+        dmb_sy();
+        qh1[10] = (r1 + rpad) & 1023U;
+        dmb_sy();
+
+        uint32_t rid   = rhdr & 0xFFU;
+        uint32_t rtype = (rhdr >> 16) & 0xFU;
+        if (rid == 100U) {
+            LogS("  [ERR] HFI async error msg "); LogS(label);
+            LogS(" code=0x"); LogHex(pkt[2], 8); LogNL();
+            return 0;
+        }
+        if (rtype != 1U) {
+            LogS("  [ERR] HFI unexpected pkt type="); LogDec((int64_t)rtype); LogNL();
+            return 0;
+        }
+        if ((pkt[1] >> 20) != seq) {
+            continue;
+        }
+        if ((rid != 126U && rid != msg_id) || pkt[1] != hdr) {
+            LogS("  [ERR] HFI reply mismatch rid="); LogDec((int64_t)rid);
+            LogS(" echo=0x"); LogHex(pkt[1], 8); LogNL();
+            return 0;
+        }
+        LogS("  HFI["); LogS(label);
+        LogS(" id="); LogDec((int64_t)msg_id);
+        LogS(" seq="); LogDec((int64_t)seq);
+        LogS("] reply hdr=0x"); LogHex(rhdr, 8);
+        LogS(" err=0x"); LogHex(pkt[2], 8); LogNL();
+        return (pkt[2] == 0U) ? 1 : 0;
+    }
+
+    LogS("  [WARN] HFI "); LogS(label); LogS(" reply timeout."); LogNL();
+    return 0;
+}
+
+static void DumpGmuHfiAndLogState(
+    volatile uint8_t *gmu,
+    volatile uint8_t *rscc,
+    volatile uint8_t *pdc,
+    volatile uint8_t *smmu,
+    volatile uint32_t *hfi_va,
+    volatile uint32_t *log_va,
+    const char *tag)
+{
+    LogS("--- GMU/HFI/RSCC Telemetry ["); LogS(tag); LogS("] ---"); LogNL();
+    if (hfi_va) {
+        dmb_sy();
+        volatile uint32_t *qh0   = hfi_va + 6U;
+        volatile uint32_t *qh1   = hfi_va + 6U + 12U;
+        volatile uint32_t *qh2   = hfi_va + 6U + 24U;
+        volatile uint32_t *data2 = hfi_va + 3072U;
+        uint32_t r0 = qh0[10], w0 = qh0[11];
+        uint32_t r1 = qh1[10], w1 = qh1[11];
+        uint32_t r2 = qh2[10], w2 = qh2[11];
+        LogS("  HFI CMDQ r="); LogDec((int64_t)r0); LogS(" w="); LogDec((int64_t)w0);
+        LogS(" | MSGQ r="); LogDec((int64_t)r1); LogS(" w="); LogDec((int64_t)w1);
+        LogS(" | DBGQ r="); LogDec((int64_t)r2); LogS(" w="); LogDec((int64_t)w2); LogNL();
+        if (r2 != w2 && r2 < 1024U && w2 < 1024U) {
+            uint32_t avail = (w2 - r2) & 1023U;
+            uint32_t dump_n = (avail > 16U) ? 16U : avail;
+            LogS("  HFI DBGQ["); LogDec((int64_t)dump_n); LogS("]:");
+            for (uint32_t i = 0U; i < dump_n; i++) {
+                LogS(" 0x"); LogHex(data2[(r2 + i) & 1023U], 8);
+            }
+            LogNL();
+        }
+    }
+
+    if (gmu) {
+        LogReg("GMU_GENERAL_8",           0x03D7E734U, mmio_r32(gmu, GMU_GENERAL_8));
+        LogReg("GMU_GENERAL_9",           0x03D7E738U, mmio_r32(gmu, GMU_GENERAL_9));
+    }
+
+    if (log_va) {
+        dmb_sy();
+        uint32_t nonzero = 0U;
+        for (uint32_t i = 0U; i < 4096U; i++) {
+            if (log_va[i] != 0U) nonzero++;
+        }
+        LogS("  GMU_LOG(0x60002000) nonzero_dwords="); LogDec((int64_t)nonzero); LogNL();
+        uint32_t printed = 0U;
+        for (uint32_t i = 0U; i < 4096U && printed < 32U; i++) {
+            uint32_t v = log_va[i];
+            if (v != 0U) {
+                LogS("    LOG[0x"); LogHex(i, 4); LogS("]=0x"); LogHex(v, 8); LogNL();
+                printed++;
+            }
+        }
+    }
+
+    if (gmu) {
+        LogReg("GMU_CM3_FW_INIT_RESULT",  0x03D7E070U, mmio_r32(gmu, GMU_CM3_FW_INIT_RESULT));
+        LogReg("GMU_CM3_FW_BUSY",         0x03D7E068U, mmio_r32(gmu, GMU_CM3_FW_BUSY));
+        LogReg("GMU_CM3_CFG",             0x03D7E0B4U, mmio_r32(gmu, GMU_CM3_CFG));
+        LogReg("GMU_GFX_PWR_CLK_STATUS",  0x03D7E340U, mmio_r32(gmu, GMU_GFX_PWR_CLK_STATUS));
+        LogReg("GMU_RPMH_POWER_STATE",    0x03D7E3B0U, mmio_r32(gmu, GMU_RPMH_POWER_STATE));
+        LogReg("GMU_G2H_INTR_INFO",       0x03D7E648U, mmio_r32(gmu, GMU_G2H_INTR_INFO));
+        LogReg("GMU_AO_HOST_INTR_STATUS", 0x03D8EC14U, mmio_r32(gmu, GMU_AO_HOST_INTR_STATUS));
+        LogReg("GMU_AHB_FENCE_STATUS",    0x03D8EC4CU, mmio_r32(gmu, GMU_AO_AHB_FENCE_STATUS));
+    }
+
+    if (rscc) {
+        LogReg("RSCC_RSC_STATUS0_DRV0",   0x03D50010U, mmio_r32(rscc, RSCC_RSC_STATUS0_DRV0));
+        LogReg("RSCC_SEQ_BUSY_DRV0",      0x03D50404U, mmio_r32(rscc, RSCC_SEQ_BUSY_DRV0));
+        LogReg("RSCC_TCS0_DRV0_STATUS",   0x03D50D28U, mmio_r32(rscc, RSCC_TCS0_DRV0_STATUS));
+        LogReg("RSCC_TCS1_DRV0_STATUS",   0x03D50FC8U, mmio_r32(rscc, RSCC_TCS1_DRV0_STATUS));
+        LogReg("RSCC_TCS2_DRV0_STATUS",   0x03D51268U, mmio_r32(rscc, RSCC_TCS2_DRV0_STATUS));
+        LogReg("RSCC_TCS3_DRV0_STATUS",   0x03D51508U, mmio_r32(rscc, RSCC_TCS3_DRV0_STATUS));
+    }
+
+    if (pdc) {
+        LogReg("PDC_GPU_ENABLE_PDC",      0x0B284500U, mmio_r32(pdc, PDC_GPU_ENABLE_PDC));
+        LogReg("PDC_GPU_STATUS_1024",     0x0B281024U, mmio_r32(pdc, PDC_GPU_STATUS_1024));
+    }
+
+    if (g_gpucc) {
+        LogReg("GPUCC_PLL0_MODE",         0x03D90000U, mmio_r32(g_gpucc, GPUCC_PLL0_BASE + PLL_OFF_MODE));
+        LogReg("GPUCC_PLL0_OPMODE",       0x03D90004U, mmio_r32(g_gpucc, GPUCC_PLL0_BASE + PLL_OFF_OPMODE));
+        LogReg("GPUCC_PLL0_L_VAL",        0x03D90010U, mmio_r32(g_gpucc, GPUCC_PLL0_BASE + PLL_OFF_L_VAL));
+        LogReg("GPUCC_GX_GDSCR",          0x03D9905CU, mmio_r32(g_gpucc, GPUCC_GX_GDSCR));
+        LogReg("GPUCC_GX_CFG_GDSCR",      0x03D99060U, mmio_r32(g_gpucc, GPUCC_GX_CFG_GDSCR));
+    }
+
+    if (smmu) {
+        LogReg("SMMU_sGFSR",              0x03DA0048U, mmio_r32(smmu, 0x0048U));
+        LogReg("CB2_FSR",                 0x03DC2058U, mmio_r32(smmu, 0x22058U));
+        LogReg("CB2_FAR_LO",              0x03DC2060U, mmio_r32(smmu, 0x22060U));
+        LogReg("CB2_FAR_HI",              0x03DC2064U, mmio_r32(smmu, 0x22064U));
+    }
+}
+
+typedef struct {
+    uint32_t iova;
+    uint32_t pages;
+    uint32_t data_page_off;
+} GMU_EXTENT_SPEC;
+
+static const GMU_EXTENT_SPEC g_gmu_extents[8] = {
+    { 0x00004000U, 17U,  0U }, /* ICACHE  0x11000 B (data +0x00000) */
+    { 0x00100000U,  9U, 17U }, /* PREALLOC 0x09000 B (data +0x11000) */
+    { 0x00200000U, 19U, 26U }, /* PREALLOC 0x13000 B (data +0x1A000) */
+    { 0x00300000U, 28U, 45U }, /* PREALLOC 0x1C000 B (data +0x2D000) */
+    { 0x60000000U,  1U, 73U }, /* PERSIST  0x01000 B (data +0x49000) */
+    { 0x60001000U,  1U, 74U }, /* PERSIST  0x01000 B (data +0x4A000) */
+    { 0x60002000U,  4U, 75U }, /* LOG      0x04000 B (data +0x4B000) */
+    { 0x60006000U,  4U, 79U }, /* HFI      0x04000 B (data +0x4F000) */
+};
+
+static uint32_t g_hfi_msg_buf[160];
+
 static void RunStage5BGmuBoot(void) {
-    LogS("=== STAGE 0x20 (Stage 5B): Opt-In GMU CM3 FW Load + PDC/RSCC + HFI + OOB ==="); LogNL();
+    LogS("=== STAGE 0x20 (Stage 5B): Opt-In KGSL-SMMU CB2 + GMU CM3 + HFI + OOB ==="); LogNL();
 
     uint32_t fw_len = 0;
     if (!ReadGmuFwFile(&fw_len)) {
@@ -1743,12 +2019,37 @@ static void RunStage5BGmuBoot(void) {
     volatile uint8_t *pdc = (volatile uint8_t *)MmMapIoSpace(pa, SZ_GMU_PDC, MmNonCached);
     pa.QuadPart = (int64_t)PA_CX_MISC;
     volatile uint8_t *cx_misc = (volatile uint8_t *)MmMapIoSpace(pa, SZ_CX_MISC, MmNonCached);
-    if (!rscc || !pdc || !cx_misc) {
-        LogS("  [ERR] Failed mapping RSCC/PDC/CX_MISC."); LogNL();
+    pa.QuadPart = (int64_t)PA_KGSL_SMMU;
+    volatile uint8_t *smmu = (volatile uint8_t *)MmMapIoSpace(pa, SZ_KGSL_SMMU, MmNonCached);
+    if (!rscc || !pdc || !cx_misc || !smmu) {
+        LogS("  [ERR] Failed mapping RSCC/PDC/CX_MISC/KGSL-SMMU."); LogNL();
+        if (smmu)    MmUnmapIoSpace((PVOID)smmu, SZ_KGSL_SMMU);
         if (cx_misc) MmUnmapIoSpace((PVOID)cx_misc, SZ_CX_MISC);
         if (pdc)     MmUnmapIoSpace((PVOID)pdc, SZ_GMU_PDC);
         if (rscc)    MmUnmapIoSpace((PVOID)rscc, SZ_RSCC);
         return;
+    }
+
+    uint32_t smmu_cbcr = g_gpucc ? mmio_r32(g_gpucc, GPUCC_HLOS1_VOTE_SMMU_CBCR) : 0xFFFFFFFFU;
+    if (smmu_cbcr == 0xFFFFFFFFU || (smmu_cbcr & 0x80000000U) != 0U || (smmu_cbcr & 1U) == 0U) {
+        LogS("  [SKIP] GPUCC_HLOS1_SMMU closed (0x"); LogHex(smmu_cbcr, 8); LogS("); aborting Stage 5B."); LogNL();
+        goto cleanup_maps;
+    }
+
+    uint32_t sid0 = mmio_r32(smmu, 0x0020U);
+    uint32_t sid1 = mmio_r32(smmu, 0x0024U);
+    uint32_t sid2 = mmio_r32(smmu, 0x0028U);
+    if (sid0 != 0x4C017E18U || sid1 != 0x40000016U || sid2 != 0x00005511U) {
+        LogS("  [SKIP] SMMU IDR mismatch."); LogNL();
+        goto cleanup_maps;
+    }
+    if (mmio_r32(smmu, 0x22000U) & 1U) {
+        LogS("  [SKIP] KGSL-SMMU CB2 SCTLR already active."); LogNL();
+        goto cleanup_maps;
+    }
+    if (mmio_r32(smmu, 0x0800U) & 0x80000000U) {
+        LogS("  [SKIP] KGSL-SMMU SMR[0] already valid (0x"); LogHex(mmio_r32(smmu, 0x0800U), 8); LogS(")."); LogNL();
+        goto cleanup_maps;
     }
 
     uint32_t rsc_busy = mmio_r32(rscc, RSCC_SEQ_BUSY_DRV0);
@@ -1757,108 +2058,206 @@ static void RunStage5BGmuBoot(void) {
         goto cleanup_maps;
     }
 
-    /* Inspect FW blocks and validate ITCM / DTCM / ICACHE placement */
+    /* Allocate 89-page (<64GB, 36-bit OAS) MmNonCached pool: Pages 0..5 PT, Pages 6..88 GMU VA */
+    const uint32_t kPoolPages = 89U;
+    PHYSICAL_ADDRESS lo, hi, bound;
+    lo.QuadPart = 0LL;
+    hi.QuadPart = 0x0000000FFFFFFFFFLL;
+    bound.QuadPart = 0LL;
+    volatile uint32_t *pool_va = (volatile uint32_t *)MmAllocateContiguousMemorySpecifyCache(
+        kPoolPages * 4096U, lo, hi, bound, MmNonCached);
+    if (!pool_va) {
+        LogS("  [ERR] Failed allocating 89-page (<64GB) contiguous GMU pool."); LogNL();
+        goto cleanup_maps;
+    }
+    uint64_t pool_pa = (uint64_t)MmGetPhysicalAddress((PVOID)pool_va).QuadPart;
+    if ((pool_pa & 0xFFFULL) != 0ULL || pool_pa + (uint64_t)kPoolPages * 4096ULL > (1ULL << 36)) {
+        LogS("  [ERR] GMU pool PA out of 36-bit OAS or unaligned: 0x"); LogHex(pool_pa, 16); LogNL();
+        MmFreeContiguousMemorySpecifyCache((PVOID)pool_va, kPoolPages * 4096U, MmNonCached);
+        goto cleanup_maps;
+    }
+    ZeroBuf32(pool_va, kPoolPages * 1024U);
+
+    volatile uint64_t *pt_l1      = (volatile uint64_t *)((volatile uint8_t *)pool_va + 0x0000U);
+    volatile uint64_t *pt_l2_low  = (volatile uint64_t *)((volatile uint8_t *)pool_va + 0x1000U);
+    volatile uint64_t *pt_l2_high = (volatile uint64_t *)((volatile uint8_t *)pool_va + 0x2000U);
+    volatile uint64_t *pt_l3_low0 = (volatile uint64_t *)((volatile uint8_t *)pool_va + 0x3000U);
+    volatile uint64_t *pt_l3_low1 = (volatile uint64_t *)((volatile uint8_t *)pool_va + 0x4000U);
+    volatile uint64_t *pt_l3_600  = (volatile uint64_t *)((volatile uint8_t *)pool_va + 0x5000U);
+
+    pt_l1[0]       = (pool_pa + 0x1000ULL) | 3ULL;
+    pt_l1[1]       = (pool_pa + 0x2000ULL) | 3ULL;
+    pt_l2_low[0]   = (pool_pa + 0x3000ULL) | 3ULL;
+    pt_l2_low[1]   = (pool_pa + 0x4000ULL) | 3ULL;
+    pt_l2_high[256]= (pool_pa + 0x5000ULL) | 3ULL;
+
+    const uint64_t leaf_attrs = 0x0000000000000E03ULL; /* nG=1 AF=1 SH=2(OS) AttrIdx=0(NC) RWX Priv */
+    for (uint32_t e = 0U; e < 8U; e++) {
+        uint32_t base_iova = g_gmu_extents[e].iova;
+        uint32_t pages     = g_gmu_extents[e].pages;
+        uint32_t dpo       = g_gmu_extents[e].data_page_off;
+        for (uint32_t p = 0U; p < pages; p++) {
+            uint64_t va = (uint64_t)base_iova + (uint64_t)p * 4096ULL;
+            uint64_t leaf_pa = pool_pa + (6ULL + (uint64_t)(dpo + p)) * 4096ULL;
+            uint32_t l3_idx = (uint32_t)((va >> 12) & 0x1FFU);
+            volatile uint64_t *l3_tbl = NULL;
+            if ((va >> 21) == 0ULL)      l3_tbl = pt_l3_low0;
+            else if ((va >> 21) == 1ULL) l3_tbl = pt_l3_low1;
+            else                         l3_tbl = pt_l3_600;
+            l3_tbl[l3_idx] = leaf_pa | leaf_attrs;
+        }
+    }
+    dmb_sy();
+
+    volatile uint8_t *data_va = (volatile uint8_t *)pool_va + 0x6000U;
+    volatile uint32_t *log_va = (volatile uint32_t *)(data_va + (75U * 4096U)); /* 0x60002000 */
+    volatile uint32_t *hfi_va = (volatile uint32_t *)(data_va + (79U * 4096U)); /* 0x60006000 */
+
+    LogS("  Allocated 89p GMU pool @ PA=0x"); LogHex(pool_pa, 12);
+    LogS(" TTBR0=0x"); LogHex(pool_pa | (2ULL << 48), 16); LogNL();
+
+    int smmu_active = 0;
+    int oob_requested = 0;
+
+    /* Load & verify all 15 GMU FW blocks: ITCM, DTCM, and Region 2 (ICACHE backing) */
     uint32_t off = 0, blk_idx = 0, itcm_blks = 0, dtcm_blks = 0, icache_blks = 0;
     while (off + 16U <= fw_len) {
-        uint32_t addr  = ReadLe32U(g_gmu_fw_buf + off);
-        uint32_t blen  = ReadLe32U(g_gmu_fw_buf + off + 4U);
-        uint32_t btype = ReadLe32U(g_gmu_fw_buf + off + 8U);
+        uint32_t addr = ReadLe32U(g_gmu_fw_buf + off);
+        uint32_t blen = ReadLe32U(g_gmu_fw_buf + off + 4U);
         off += 16U;
         if (blen > fw_len - off || (addr & 3U) || (blen & 3U)) {
             LogS("  [ERR] Invalid GMU block header at #"); LogDec((int64_t)blk_idx); LogNL();
-            goto cleanup_maps;
+            goto cleanup_pool;
         }
         if (blen > 0U) {
             if (addr + blen <= 0x00004000U) {
                 itcm_blks++;
                 for (uint32_t w = 0; w < blen; w += 4U) {
-                    uint32_t want = ReadLe32U(g_gmu_fw_buf + off + w);
-                    mmio_w32(g_gmu, GMU_ITCM_OFF + addr + w, want);
+                    mmio_w32(g_gmu, GMU_ITCM_OFF + addr + w, ReadLe32U(g_gmu_fw_buf + off + w));
                 }
                 for (uint32_t w = 0; w < blen; w += 4U) {
-                    uint32_t want = ReadLe32U(g_gmu_fw_buf + off + w);
-                    uint32_t got  = mmio_r32(g_gmu, GMU_ITCM_OFF + addr + w);
-                    if (got != want) {
+                    if (mmio_r32(g_gmu, GMU_ITCM_OFF + addr + w) != ReadLe32U(g_gmu_fw_buf + off + w)) {
                         LogS("  [ERR] ITCM verify mismatch at 0x"); LogHex(addr + w, 4); LogNL();
-                        goto cleanup_maps;
+                        goto cleanup_pool;
                     }
                 }
             } else if (addr >= 0x10004000U && (addr - 0x10004000U) + blen <= 0x00004000U) {
                 dtcm_blks++;
                 uint32_t dbase = addr - 0x10004000U;
                 for (uint32_t w = 0; w < blen; w += 4U) {
-                    uint32_t want = ReadLe32U(g_gmu_fw_buf + off + w);
-                    mmio_w32(g_gmu, GMU_DTCM_OFF + dbase + w, want);
+                    mmio_w32(g_gmu, GMU_DTCM_OFF + dbase + w, ReadLe32U(g_gmu_fw_buf + off + w));
                 }
                 for (uint32_t w = 0; w < blen; w += 4U) {
-                    uint32_t want = ReadLe32U(g_gmu_fw_buf + off + w);
-                    uint32_t got  = mmio_r32(g_gmu, GMU_DTCM_OFF + dbase + w);
-                    if (got != want) {
+                    if (mmio_r32(g_gmu, GMU_DTCM_OFF + dbase + w) != ReadLe32U(g_gmu_fw_buf + off + w)) {
                         LogS("  [ERR] DTCM verify mismatch at 0x"); LogHex(dbase + w, 4); LogNL();
-                        goto cleanup_maps;
+                        goto cleanup_pool;
                     }
                 }
-            } else if (addr >= 0x00004000U && addr < 0x10004000U) {
+            } else if (addr >= 0x00004000U && addr + blen <= 0x00015000U) {
                 icache_blks++;
-                LogS("  FW Region2(ICACHE) blk#"); LogDec((int64_t)blk_idx);
-                LogS(" addr=0x"); LogHex(addr, 8); LogS(" len=0x"); LogHex(blen, 6);
-                LogS(" type="); LogDec((int64_t)btype); LogNL();
+                uint32_t cbase = addr - 0x00004000U;
+                volatile uint32_t *dst32 = (volatile uint32_t *)(data_va + cbase);
+                for (uint32_t w = 0; w < blen; w += 4U) {
+                    dst32[w >> 2] = ReadLe32U(g_gmu_fw_buf + off + w);
+                }
+                dmb_sy();
+                for (uint32_t w = 0; w < blen; w += 4U) {
+                    if (dst32[w >> 2] != ReadLe32U(g_gmu_fw_buf + off + w)) {
+                        LogS("  [ERR] ICACHE DRAM verify mismatch at 0x"); LogHex(addr + w, 6); LogNL();
+                        goto cleanup_pool;
+                    }
+                }
             } else {
                 LogS("  [ERR] Unmapped GMU block addr=0x"); LogHex(addr, 8); LogNL();
-                goto cleanup_maps;
+                goto cleanup_pool;
             }
         }
         off += blen;
         blk_idx++;
     }
-    LogS("  Parsed GMU FW blocks: total="); LogDec((int64_t)blk_idx);
+    dmb_sy();
+    LogS("  Loaded GMU FW: total="); LogDec((int64_t)blk_idx);
     LogS(" ITCM="); LogDec((int64_t)itcm_blks);
     LogS(" ICACHE="); LogDec((int64_t)icache_blks);
     LogS(" DTCM="); LogDec((int64_t)dtcm_blks); LogNL();
 
-    if (icache_blks > 0U) {
-        LogS("  [SKIP] GMU Region 2 (ICACHE IOVA) requires active KGSL-SMMU CB page tables before CM3 reset release; ITCM/DTCM verified cleanly."); LogNL();
-        goto cleanup_maps;
-    }
-
-    /* Allocate 16 KB HFI queue table + 16 KB log buffer below 4 GB */
-    PHYSICAL_ADDRESS lo, hi, bound;
-    lo.QuadPart = 0;
-    hi.QuadPart = 0x00000000FFFFF000LL;
-    bound.QuadPart = 0x1000LL;
-    volatile uint32_t *hfi_va = (volatile uint32_t *)MmAllocateContiguousMemorySpecifyCache(16384U, lo, hi, bound, MmNonCached);
-    volatile uint32_t *log_va = (volatile uint32_t *)MmAllocateContiguousMemorySpecifyCache(16384U, lo, hi, bound, MmNonCached);
-    if (!hfi_va || !log_va) {
-        LogS("  [ERR] Failed to allocate <4GB contiguous HFI/log DMA buffers."); LogNL();
-        goto cleanup_dma;
-    }
-    uint64_t hfi_pa = (uint64_t)MmGetPhysicalAddress((PVOID)hfi_va).QuadPart;
-    uint64_t log_pa = (uint64_t)MmGetPhysicalAddress((PVOID)log_va).QuadPart;
-    if ((hfi_pa & 0xFFFULL) || hfi_pa > 0xFFFFC000ULL || (log_pa & 0xFFFULL) || log_pa > 0xFFFFC000ULL) {
-        LogS("  [ERR] Contiguous PA invalid for 32-bit GMU IOVA."); LogNL();
-        goto cleanup_dma;
-    }
-
-    ZeroBuf32(hfi_va, 4096U);
-    ZeroBuf32(log_va, 4096U);
+    /* Initialize HFI Queue Table at 0x60006000 (hfi_va) */
     hfi_va[1] = 168U; hfi_va[2] = 6U; hfi_va[3] = 12U; hfi_va[4] = 3U; hfi_va[5] = 3U;
     for (uint32_t q = 0; q < 3U; q++) {
         volatile uint32_t *qh = hfi_va + 6U + 12U * q;
         qh[0] = 1U;
-        qh[1] = (uint32_t)hfi_pa + (q + 1U) * 4096U;
+        qh[1] = 0x60006000U + (q + 1U) * 4096U;
         qh[2] = 0xA00U | q;
         qh[3] = 1024U;
         qh[6] = 1U; qh[7] = 1U; qh[8] = 1U;
     }
     dmb_sy();
 
-    /* Mask & clear both G2H and AO interrupt banks before configuring */
+    /* Program KGSL-SMMU Context Bank 2 (Bank=2, Asid=2, Slot=0, SID=5, CB=0x22000) */
+    const uint32_t cb = 0x22000U;
+    uint32_t s2cr0_init = mmio_r32(smmu, 0x0C00U);
+    mmio_w32(smmu, 0x0C00U, (s2cr0_init & ~0x30000U) | 0x20000U);
+
+    uint32_t nsacr = mmio_r32(smmu, 0x0010U);
+    if (nsacr & (1U << 26)) {
+        mmio_w32(smmu, 0x0010U, nsacr & ~(1U << 26));
+    }
+    mmio_w32(smmu, 0x0070U, 0xFFFFFFFFU);
+    if (!PollMmioBit0Clear(smmu, 0x0074U, 1000U)) {
+        LogS("  [ERR] SMMU global TLBSYNC timeout."); LogNL();
+        goto teardown_smmu;
+    }
+    uint32_t nscr0 = mmio_r32(smmu, 0x0000U);
+    mmio_w32(smmu, 0x0000U, (nscr0 & ~0x00C0FC37U) | 0x00C00406U);
+
+    mmio_w32(smmu, cb + 0x000U, 0U);          /* CB2_SCTLR = 0 */
+    mmio_w32(smmu, cb + 0x004U, 0x0000032BU); /* CB2_ACTLR */
+    mmio_w32(smmu, cb + 0x610U, 2U);          /* CB2_TLBIASID */
+    mmio_w32(smmu, cb + 0x7F0U, 0xFFFFFFFFU); /* CB2_TLBSYNC */
+    if (!PollMmioBit0Clear(smmu, cb + 0x7F4U, 1000U)) {
+        LogS("  [ERR] SMMU CB2 pre-init TLBSYNC timeout."); LogNL();
+        goto teardown_smmu;
+    }
+
+    mmio_w32(smmu, 0x1808U, 1U);              /* CBA2R[2] = 64-bit */
+    mmio_w32(smmu, 0x1008U, 0x0001F300U);     /* CBAR[2] */
+    mmio_w32(smmu, cb + 0x010U, 0x00038071U); /* CB2_TCR2 */
+    mmio_w32(smmu, cb + 0x030U, 0x00803519U); /* CB2_TCR */
+    mmio_w64(smmu, cb + 0x020U, pool_pa | (2ULL << 48)); /* CB2_TTBR0 */
+    mmio_w64(smmu, cb + 0x028U, (2ULL << 48));           /* CB2_TTBR1 */
+    mmio_w32(smmu, cb + 0x038U, 0xF404FF44U); /* CB2_MAIR0 */
+    mmio_w32(smmu, cb + 0x03CU, 0x0000EFE4U); /* CB2_MAIR1 */
+    uint32_t fsr_pre = mmio_r32(smmu, cb + 0x058U);
+    mmio_w32(smmu, cb + 0x058U, fsr_pre & 0xC00001FEU);
+
+    mmio_w32(smmu, cb + 0x610U, 2U);
+    mmio_w32(smmu, cb + 0x7F0U, 0xFFFFFFFFU);
+    if (!PollMmioBit0Clear(smmu, cb + 0x7F4U, 1000U)) {
+        LogS("  [ERR] SMMU CB2 post-TTBR TLBSYNC timeout."); LogNL();
+        goto teardown_smmu;
+    }
+
+    mmio_w32(smmu, cb + 0x000U, 0x00C00067U); /* CB2_SCTLR enable */
+    mmio_w32(smmu, 0x0800U, 0x80000005U);     /* SMR[0]: VALID | SID=5 */
+    mmio_w32(smmu, 0x0C00U, 0x00000302U);     /* S2CR[0]: TRANS | PRIV=3 | CB=2 */
+    dmb_sy();
+    smmu_active = 1;
+
+    LogReg("SMMU_sCR0(armed)",   0x03DA0000U, mmio_r32(smmu, 0x0000U));
+    LogReg("CB2_SCTLR(armed)",   0x03DC2000U, mmio_r32(smmu, cb + 0x000U));
+    LogReg("CB2_TTBR0_LO",       0x03DC2020U, mmio_r32(smmu, cb + 0x020U));
+    LogReg("CB2_TTBR0_HI",       0x03DC2024U, mmio_r32(smmu, cb + 0x024U));
+    LogReg("SMR[0](armed)",      0x03DA0800U, mmio_r32(smmu, 0x0800U));
+    LogReg("S2CR[0](armed)",     0x03DA0C00U, mmio_r32(smmu, 0x0C00U));
+    LogReg("CB2_FSR(armed)",     0x03DC2058U, mmio_r32(smmu, cb + 0x058U));
+
+    /* Mask & clear both G2H and AO interrupt banks before configuring GMU core */
     mmio_w32(g_gmu, GMU_G2H_INTR_MASK, 0xFFFFFFFFU);
     mmio_w32(g_gmu, GMU_AO_HOST_INTR_MASK, 0x7FU);
     mmio_w32(g_gmu, GMU_G2H_INTR_CLEAR, 0xFFFFFFFFU);
     mmio_w32(g_gmu, GMU_AO_HOST_INTR_CLR, 0xFFFFFFFFU);
 
-    /* G482ConfigureCore preboot programming */
+    /* Preboot GMU programming */
     mmio_w32(g_gmu, GMU_RPMH_CTRL, 1U);
     mmio_w32(g_gmu, GMU_RPMH_HYST_CTRL, 1U);
     mmio_w32(cx_misc, CX_MISC_TCM_RET_CNTL, 1U);
@@ -1866,7 +2265,7 @@ static void RunStage5BGmuBoot(void) {
     mmio_w32(g_gmu, GMU_CM3_CFG, 0x4052U);
     mmio_w32(g_gmu, GMU_GENERAL_9, 0U);
     mmio_w32(g_gmu, GMU_GENERAL_10, 0x07020100U);
-    mmio_w32(g_gmu, GMU_GENERAL_8, ((uint32_t)log_pa & 0xFFFFF000U) | 3U);
+    mmio_w32(g_gmu, GMU_GENERAL_8, 0x60002003U); /* log IOVA 0x60002000, (16KB/4KB - 1)=3 */
     mmio_w32(g_gmu, GMU_SYS_BUS_CONFIG, 1U);
     mmio_w32(g_gmu, GMU_ICACHE_CONFIG, 1U);
     mmio_w32(g_gmu, GMU_DCACHE_CONFIG, 1U);
@@ -1874,12 +2273,24 @@ static void RunStage5BGmuBoot(void) {
     uint32_t fw_ver = mmio_r32(g_gmu, GMU_DTCM_VERSION_OFF);
     LogReg("GMU_DTCM_VERSION(pre)", 0x03D74FE0U, fw_ver);
 
+    /* Ensure GPUCC_PLL0 is standby-configured and GPUCC_GX_GDSCR has SW_COLLAPSE=1 for GMU ownership */
+    if (g_gpucc) {
+        (void)ConfigureLucidOlePllStandby(g_gpucc, GPUCC_PLL0_BASE, 0x1EU, 0xBAAAU, "gpu_cc_pll0(5B)");
+        uint32_t gx_pre = mmio_r32(g_gpucc, GPUCC_GX_GDSCR);
+        if (gx_pre != 0xFFFFFFFFU && (gx_pre & 1U) == 0U) {
+            mmio_w32(g_gpucc, GPUCC_GX_GDSCR, gx_pre | 1U);
+            (void)PollReg(g_gpucc, GPUCC_GX_CFG_GDSCR, (1U << 15), (1U << 15), 3000U);
+        }
+        LogReg("GPUCC_GX_GDSCR(pre-cm3)", 0x03D9905CU, mmio_r32(g_gpucc, GPUCC_GX_GDSCR));
+    }
+
     mmio_w32(g_gmu, GMU_CM3_FW_INIT_RESULT, 0U);
     mmio_w32(g_gmu, GMU_CM3_BOOT_CONFIG, 2U);
-    mmio_w32(g_gmu, GMU_HFI_QTBL_ADDR, (uint32_t)hfi_pa);
+    mmio_w32(g_gmu, GMU_HFI_QTBL_ADDR, 0x60006000U);
     mmio_w32(g_gmu, GMU_HFI_QTBL_INFO, 1U);
+    dmb_sy();
 
-    /* Release CM3 reset & poll FW ready (500 ms max) */
+    /* Release CM3 reset & poll FW_INIT_RESULT (500 ms max) */
     mmio_w32(g_gmu, GMU_CM3_SYSRESET, 0U);
     uint32_t rmask = (fw_ver <= 0x20010004U) ? 0xFFFFFFFFU : 0x1FFU;
     uint32_t rwant = (fw_ver <= 0x20010004U) ? 0xBABEFACEU : 0x100U;
@@ -1893,6 +2304,15 @@ static void RunStage5BGmuBoot(void) {
         SleepMs(1U);
     }
     LogReg("GMU_CM3_FW_INIT_RES(post)", 0x03D7E070U, mmio_r32(g_gmu, GMU_CM3_FW_INIT_RESULT));
+    LogReg("GMU_CM3_FW_BUSY(post)",     0x03D7E068U, mmio_r32(g_gmu, GMU_CM3_FW_BUSY));
+    LogReg("GMU_G2H_INTR_INFO(post)",   0x03D7E648U, mmio_r32(g_gmu, GMU_G2H_INTR_INFO));
+    LogReg("GMU_AO_HOST_INTR_ST(post)", 0x03D8EC14U, mmio_r32(g_gmu, GMU_AO_HOST_INTR_STATUS));
+    LogReg("SMMU_sGFSR(post)",          0x03DA0048U, mmio_r32(smmu, 0x0048U));
+    LogReg("CB2_FSR(post)",             0x03DC2058U, mmio_r32(smmu, cb + 0x058U));
+    LogReg("CB2_FAR_LO(post)",          0x03DC2060U, mmio_r32(smmu, cb + 0x060U));
+    LogReg("CB2_FAR_HI(post)",          0x03DC2064U, mmio_r32(smmu, cb + 0x064U));
+    LogReg("CB2_FSYNR0(post)",          0x03DC2068U, mmio_r32(smmu, cb + 0x068U));
+
     if (!fw_ok) {
         LogS("  [WARN] GMU CM3 FW_INIT_RESULT timed out."); LogNL();
         goto stop_cm3;
@@ -1933,49 +2353,168 @@ static void RunStage5BGmuBoot(void) {
         goto stop_cm3;
     }
 
-    /* Request OOB_REQUEST (BIT 30), wait OOB_ACK (BIT 31), clear ACK */
+    /* Submit 4 G196Policy HFI startup messages + HFI 30 DCVS vote */
+    static const uint32_t kGpuVotes[10] = {
+        0U, 3408385U, 3408385U, 3670530U, 3932675U,
+        4194820U, 5243653U, 8389382U, 9438215U, 12583944U
+    };
+    static const uint32_t kGpuKhz[10] = {
+        0U, 124800U, 220000U, 295000U, 348000U,
+        401000U, 475000U, 550000U, 615000U, 680000U
+    };
+    static const uint32_t kGmuVotes[3] = { 0U, 4194818U, 8389379U };
+    static const uint32_t kGmuKhz[3]   = { 0U, 220000U,  550000U };
+    static const uint32_t kDdrData[10][3] = {
+        { 1073741824U, 1073741824U, 1073741824U },
+        { 1610614770U, 1610614770U, 1610612744U },
+        { 1610615593U, 1610615593U, 1610612744U },
+        { 1610618520U, 1610618520U, 1610612744U },
+        { 1610619090U, 1610619090U, 1610612744U },
+        { 1610620518U, 1610620518U, 1610612744U },
+        { 1610622914U, 1610622914U, 1610612744U },
+        { 1610624592U, 1610624592U, 1610612744U },
+        { 1610626448U, 1610626448U, 1610612744U },
+        { 1610628450U, 1610628450U, 1610612744U },
+    };
+
+    for (uint32_t i = 0U; i < 58U; i++) g_hfi_msg_buf[i] = 0U;
+    g_hfi_msg_buf[0] = 10U;
+    g_hfi_msg_buf[1] = 3U;
+    for (uint32_t i = 0U; i < 10U; i++) {
+        g_hfi_msg_buf[2U + 3U * i] = kGpuVotes[i];
+        g_hfi_msg_buf[3U + 3U * i] = 0xFFFFFFFFU;
+        g_hfi_msg_buf[4U + 3U * i] = kGpuKhz[i];
+    }
+    for (uint32_t i = 0U; i < 3U; i++) {
+        g_hfi_msg_buf[50U + 2U * i] = kGmuVotes[i];
+        g_hfi_msg_buf[51U + 2U * i] = kGmuKhz[i];
+    }
+    if (!HfiSendAndWaitReply(g_gmu, hfi_va, 1U, 4U, g_hfi_msg_buf, 58U, "PERF_TBL")) {
+        DumpGmuHfiAndLogState(g_gmu, rscc, pdc, smmu, hfi_va, log_va, "startup_fail");
+        goto stop_cm3;
+    }
+
+    for (uint32_t i = 0U; i < 159U; i++) g_hfi_msg_buf[i] = 0U;
+    g_hfi_msg_buf[0] = 10U; g_hfi_msg_buf[1] = 1U; g_hfi_msg_buf[2] = 3U;
+    g_hfi_msg_buf[3] = 1U;  g_hfi_msg_buf[4] = 7U;
+    g_hfi_msg_buf[5] = 327736U;
+    g_hfi_msg_buf[11] = 1073741824U;
+    g_hfi_msg_buf[17] = 1610612737U;
+    g_hfi_msg_buf[23] = 327684U; g_hfi_msg_buf[24] = 327680U; g_hfi_msg_buf[25] = 327784U;
+    for (uint32_t i = 0U; i < 10U; i++) {
+        g_hfi_msg_buf[31U + 8U * i + 0U] = kDdrData[i][0];
+        g_hfi_msg_buf[31U + 8U * i + 1U] = kDdrData[i][1];
+        g_hfi_msg_buf[31U + 8U * i + 2U] = kDdrData[i][2];
+    }
+    if (!HfiSendAndWaitReply(g_gmu, hfi_va, 2U, 3U, g_hfi_msg_buf, 159U, "BW_TBL")) {
+        DumpGmuHfiAndLogState(g_gmu, rscc, pdc, smmu, hfi_va, log_va, "startup_fail");
+        goto stop_cm3;
+    }
+
+    g_hfi_msg_buf[0] = 0U;
+    if (!HfiSendAndWaitReply(g_gmu, hfi_va, 3U, 14U, g_hfi_msg_buf, 1U, "CORE_START")) {
+        DumpGmuHfiAndLogState(g_gmu, rscc, pdc, smmu, hfi_va, log_va, "startup_fail");
+        goto stop_cm3;
+    }
+    if (!HfiSendAndWaitReply(g_gmu, hfi_va, 4U, 10U, g_hfi_msg_buf, 0U, "START")) {
+        DumpGmuHfiAndLogState(g_gmu, rscc, pdc, smmu, hfi_va, log_va, "startup_fail");
+        goto stop_cm3;
+    }
+
+    g_hfi_msg_buf[0] = 1U; g_hfi_msg_buf[1] = 1U; g_hfi_msg_buf[2] = 1U;
+    int dcvs_ok = HfiSendAndWaitReply(g_gmu, hfi_va, 5U, 30U, g_hfi_msg_buf, 3U, "DCVS_VOTE");
+    DumpGmuHfiAndLogState(g_gmu, rscc, pdc, smmu, hfi_va, log_va, dcvs_ok ? "post_dcvs_ok" : "post_dcvs_timeout");
+    if (!dcvs_ok) {
+        uint32_t g2h_now = mmio_r32(g_gmu, GMU_G2H_INTR_INFO);
+        uint32_t ao_now  = mmio_r32(g_gmu, GMU_AO_HOST_INTR_STATUS);
+        if (((g2h_now & 0x100U) != 0U) || ((ao_now & 0x79U) != 0U)) {
+            LogS("  [WARN] CM3/AO fault detected after DCVS_VOTE timeout; skipping OOB_REQUEST."); LogNL();
+            goto stop_cm3;
+        }
+    }
+
+    /* Request OOB_REQUEST (BIT 30), wait OOB_ACK (BIT 31) up to 20 ms, clear ACK */
+    oob_requested = 1;
     mmio_w32(g_gmu, GMU_H2G_SET, 1U << 30);
     int oob_ok = 0;
-    for (uint32_t i = 0; i < 100U; i++) {
+    for (uint32_t i = 0; i < 200U; i++) {
         if (mmio_r32(g_gmu, GMU_G2H_INTR_INFO) & (1U << 31)) {
             oob_ok = 1;
             break;
         }
         StallUs(100U);
     }
-    LogReg("GMU_G2H_INTR_INFO(oob)", 0x03D7E648U, mmio_r32(g_gmu, GMU_G2H_INTR_INFO));
+    LogReg("GMU_G2H_INTR_INFO(oob)",   0x03D7E648U, mmio_r32(g_gmu, GMU_G2H_INTR_INFO));
     if (oob_ok) {
         mmio_w32(g_gmu, GMU_G2H_INTR_CLEAR, 1U << 31);
     }
+    uint32_t gfx_pwr_st = mmio_r32(g_gmu, GMU_GFX_PWR_CLK_STATUS);
+    LogReg("GMU_GFX_PWR_CLK_ST(oob)",  0x03D7E340U, gfx_pwr_st);
+    LogReg("GMU_RPMH_PWR_STATE(oob)",  0x03D7E3B0U, mmio_r32(g_gmu, GMU_RPMH_POWER_STATE));
+    if (g_gpucc) {
+        LogReg("GPUCC_PLL0_MODE(oob)",     0x03D90000U, mmio_r32(g_gpucc, GPUCC_PLL0_BASE + PLL_OFF_MODE));
+        LogReg("GPUCC_GX_GDSCR(5B)",       0x03D9905CU, mmio_r32(g_gpucc, GPUCC_GX_GDSCR));
+        LogReg("GPUCC_GX_CFG_GDSCR(5B)",   0x03D99060U, mmio_r32(g_gpucc, GPUCC_GX_CFG_GDSCR));
+    }
 
-    uint32_t gx_gds = mmio_r32(g_gpucc, GPUCC_GX_GDSCR);
-    LogReg("GPUCC_GX_GDSCR(5B)", 0x03D9905CU, gx_gds);
-    if ((gx_gds & 0x80000001U) == 0x80000000U && GpuGxAxiGateOpen(NULL, NULL)) {
+    if (GpuGxAxiGateOpen(NULL, NULL) && ((gfx_pwr_st & 3U) == 0U)) {
         if (!g_kgsl) {
             pa.QuadPart = (int64_t)PA_KGSL;
             g_kgsl = (volatile uint8_t *)MmMapIoSpace(pa, SZ_KGSL, MmNonCached);
         }
         if (g_kgsl) {
+            LogS("--- GX AXI GATE OPEN! Live Adreno 740 KGSL Telemetry ---"); LogNL();
             LogReg("KGSL_RBBM_STATUS(5B)",  0x03D00840U, mmio_r32(g_kgsl, KGSL_RBBM_STATUS));
             LogReg("KGSL_RBBM_STATUS3(5B)", 0x03D0084CU, mmio_r32(g_kgsl, KGSL_RBBM_STATUS3));
+            LogReg("KGSL_GBIF_HALT(5B)",    0x03D0F114U, mmio_r32(g_kgsl, KGSL_GBIF_HALT));
+            LogReg("KGSL_GBIF_HALT_ACK(5B)",0x03D0F118U, mmio_r32(g_kgsl, KGSL_GBIF_HALT_ACK));
+            LogReg("KGSL_CP_SQE_CNTL(5B)",  0x03D02020U, mmio_r32(g_kgsl, KGSL_CP_SQE_CNTL));
         }
     } else {
-        LogS("  [INFO] GPUCC_GX_GDSCR PWR_ON=0; skipping KGSL RBBM read."); LogNL();
+        LogS("  [INFO] GX gate/clock closed (PWR_CLK_ST=0x"); LogHex(gfx_pwr_st, 8);
+        LogS("); skipping 0x03D00000 KGSL RBBM read."); LogNL();
     }
 
-    /* Release OOB cleanly before stopping CM3 */
-    mmio_w32(g_gmu, GMU_H2G_SET, 1U << 31);
-
 stop_cm3:
+    if (oob_requested) {
+        mmio_w32(g_gmu, GMU_H2G_SET, 1U << 31);
+        StallUs(200U);
+    }
     mmio_w32(g_gmu, GMU_CM3_SYSRESET, 1U);
     (void)PollReg(g_gmu, GMU_CM3_SYSRESET, 1U, 1U, 1000U);
-    LogReg("GMU_CM3_SYSRESET(stopped)", 0x03D7E000U, mmio_r32(g_gmu, GMU_CM3_SYSRESET));
+    uint32_t rst_stopped = mmio_r32(g_gmu, GMU_CM3_SYSRESET);
+    LogReg("GMU_CM3_SYSRESET(stopped)", 0x03D7E000U, rst_stopped);
 
-cleanup_dma:
-    if (log_va) MmFreeContiguousMemorySpecifyCache((PVOID)log_va, 16384U, MmNonCached);
-    if (hfi_va) MmFreeContiguousMemorySpecifyCache((PVOID)hfi_va, 16384U, MmNonCached);
+teardown_smmu:
+    if (smmu_active) {
+        mmio_w32(smmu, 0x0C00U, 0x00020302U);
+        mmio_w32(smmu, cb + 0x000U, 0U);
+        mmio_w32(smmu, cb + 0x610U, 2U);
+        mmio_w32(smmu, cb + 0x7F0U, 0xFFFFFFFFU);
+        int tlb_done = PollMmioBit0Clear(smmu, cb + 0x7F4U, 1000U);
+        mmio_w32(smmu, 0x0800U, 0U);
+        mmio_w32(smmu, 0x0C00U, 0x00020000U);
+        dmb_sy();
+
+        uint32_t cm3_now = mmio_r32(g_gmu, GMU_CM3_SYSRESET);
+        uint32_t sctlr_now = mmio_r32(smmu, cb + 0x000U);
+        uint32_t tlb_st = mmio_r32(smmu, cb + 0x7F4U);
+        LogS("  SMMU teardown: tlb_done="); LogDec((int64_t)tlb_done);
+        LogS(" CM3_RST="); LogHex(cm3_now, 1);
+        LogS(" CB2_SCTLR="); LogHex(sctlr_now, 8);
+        LogS(" TLBSTATUS="); LogHex(tlb_st, 8); LogNL();
+
+        if (cm3_now != 1U || sctlr_now != 0U || (tlb_st & 1U) != 0U) {
+            LogS("  [WARN] Unsafe to free GMU pool (retained to avoid DMA-while-active)."); LogNL();
+            goto cleanup_maps;
+        }
+    }
+
+cleanup_pool:
+    MmFreeContiguousMemorySpecifyCache((PVOID)pool_va, kPoolPages * 4096U, MmNonCached);
 
 cleanup_maps:
+    if (smmu)    MmUnmapIoSpace((PVOID)smmu, SZ_KGSL_SMMU);
     if (cx_misc) MmUnmapIoSpace((PVOID)cx_misc, SZ_CX_MISC);
     if (pdc)     MmUnmapIoSpace((PVOID)pdc, SZ_GMU_PDC);
     if (rscc)    MmUnmapIoSpace((PVOID)rscc, SZ_RSCC);
@@ -1996,7 +2535,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 
     LogOpen();
     uint32_t mask = ReadStageMask();
-    LogS("=== s23gpuprobe.sys v1.0.0.5 started (StageMask=0x");
+    LogS("=== s23gpuprobe.sys v1.0.0.6 started (StageMask=0x");
     LogHex(mask, 2);
     LogS(") ===");
     LogNL();
@@ -2041,7 +2580,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         RunStage5BGmuBoot();
     }
 
-    LogS("=== s23gpuprobe.sys v1.0.0.5 completed cleanly ==="); LogNL();
+    LogS("=== s23gpuprobe.sys v1.0.0.6 completed cleanly ==="); LogNL();
 
     if (g_kgsl)     { MmUnmapIoSpace((PVOID)g_kgsl,     SZ_KGSL);          g_kgsl     = NULL; }
     if (g_gmu)      { MmUnmapIoSpace((PVOID)g_gmu,      SZ_GMU_CORE);      g_gmu      = NULL; }
