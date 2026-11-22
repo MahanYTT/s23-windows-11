@@ -131,6 +131,7 @@ ULONGLONG HwTimestamp(VOID);
 ULONG     HwCompletedFence(VOID);
 ULONG     HwLastSubmittedFence(VOID);
 ULONG     HwConsumeGpuBusyUs(ULONG MaxUs);
+VOID      HwRefundGpuBusyUs(ULONG Us);
 BOOLEAN   HwWaitFenceEx(ULONG Fence, ULONG TimeoutMs, BOOLEAN WedgeOnTimeout);
 BOOLEAN   HwWaitFence(ULONG Fence, ULONG TimeoutMs);
 NTSTATUS  HwSubmit(const ULONGLONG *IbIova, const ULONG *IbDwords, ULONG Count, PULONG Fence);

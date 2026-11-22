@@ -6,6 +6,7 @@
 typedef struct _ENG_ITEM {
     LIST_ENTRY Link;
     ULONG      Fence;
+    ULONG      HwFence;
     ULONG      Bytes;
     BOOLEAN    IsPaging;
     BOOLEAN    IsPreempt;
@@ -24,6 +25,7 @@ static volatile LONG     g_ScanKick = 0;
 static volatile LONG     g_AbortStall = 0;
 static volatile LONG     g_QueueDepth = 0;
 static ENG_ITEM          g_PreemptSlots[8];
+static ENG_ITEM          g_RenderSlots[32];
 
 static PUCHAR View(S23GPU_ALLOCATION *Al, ULONG Seg, ULONGLONG Addr, PMDL *Tmp)
 {
@@ -225,11 +227,37 @@ static VOID EngThread(PVOID Ctx)
             if (!it->IsPaging && it->Bytes == 0u &&
                 InterlockedCompareExchange(&g_AbortStall, 0, 0) == 0 &&
                 InterlockedCompareExchange(&g_QueueDepth, 0, 0) == 0) {
-                ULONG busyUs = HwConsumeGpuBusyUs(1400u);
-                if (busyUs >= 400u) {
-                    LARGE_INTEGER delay;
-                    delay.QuadPart = -(LONGLONG)busyUs * 10LL;
-                    (void)KeWaitForMultipleObjects(2, objs, WaitAny, Executive, KernelMode, FALSE, &delay, NULL);
+                BOOLEAN waitedLive = FALSE;
+                ULONG slice;
+                for (slice = 0;
+                     slice < 50u &&
+                     it->HwFence != 0u &&
+                     (LONG)(HwCompletedFence() - it->HwFence) < 0 &&
+                     InterlockedCompareExchange(&g_AbortStall, 0, 0) == 0 &&
+                     InterlockedCompareExchange(&g_QueueDepth, 0, 0) == 0;
+                     slice++) {
+                    LARGE_INTEGER sliceDelay;
+                    sliceDelay.QuadPart = -5000LL;
+                    waitedLive = TRUE;
+                    if (KeWaitForMultipleObjects(2, objs, WaitAny, Executive, KernelMode, FALSE, &sliceDelay, NULL) != STATUS_TIMEOUT) {
+                        break;
+                    }
+                }
+                if (waitedLive) {
+                    (void)HwConsumeGpuBusyUs(80000u);
+                } else {
+                    ULONG busyUs = HwConsumeGpuBusyUs(25000u);
+                    if (busyUs >= 300u) {
+                        ULONGLONG t0 = KeQueryInterruptTime();
+                        LARGE_INTEGER delay;
+                        delay.QuadPart = -(LONGLONG)busyUs * 10LL;
+                        if (KeWaitForMultipleObjects(2, objs, WaitAny, Executive, KernelMode, FALSE, &delay, NULL) == STATUS_WAIT_0) {
+                            ULONG elapsedUs = (ULONG)((KeQueryInterruptTime() - t0) / 10ULL);
+                            if (elapsedUs + 200u < busyUs && InterlockedCompareExchange(&g_AbortStall, 0, 0) == 0) {
+                                HwRefundGpuBusyUs(busyUs - elapsedUs);
+                            }
+                        }
+                    }
                 }
             } else if (it->IsPaging && InterlockedCompareExchange(&g_QueueDepth, 0, 0) == 0) {
                 InterlockedExchange(&g_AbortStall, 0);
@@ -271,6 +299,7 @@ NTSTATUS EngStart(S23GPU_FENCE_DONE Done, PVOID Ctx)
     g_AbortStall = 0;
     g_QueueDepth = 0;
     RtlZeroMemory(g_PreemptSlots, sizeof(g_PreemptSlots));
+    RtlZeroMemory(g_RenderSlots, sizeof(g_RenderSlots));
     st = PsCreateSystemThread(&th, THREAD_ALL_ACCESS, NULL, NULL, NULL, EngThread, NULL);
     if (!NT_SUCCESS(st)) {
         return st;
@@ -307,11 +336,39 @@ VOID EngStop(VOID)
 
 NTSTATUS EngSubmit(const VOID *Cmds, ULONG Bytes, ULONG Fence, BOOLEAN IsPaging)
 {
-    ENG_ITEM *it;
+    ENG_ITEM *it = NULL;
     KIRQL irql;
+    ULONG hwFence = (!IsPaging && Bytes == 0u) ? HwLastSubmittedFence() : 0u;
 
     if (g_Thread == NULL) {
         return STATUS_DEVICE_NOT_READY;
+    }
+    if (IsPaging) {
+        InterlockedExchange(&g_AbortStall, 1);
+    }
+    if (Bytes == 0u) {
+        ULONG i;
+        KeAcquireSpinLock(&g_QueueLock, &irql);
+        for (i = 0; i < RTL_NUMBER_OF(g_RenderSlots); i++) {
+            if (!g_RenderSlots[i].IsStatic) {
+                it = &g_RenderSlots[i];
+                it->IsStatic = TRUE;
+                break;
+            }
+        }
+        if (it != NULL) {
+            it->Fence = Fence;
+            it->HwFence = hwFence;
+            it->Bytes = 0u;
+            it->IsPaging = IsPaging;
+            it->IsPreempt = FALSE;
+            InsertTailList(&g_Queue, &it->Link);
+            InterlockedIncrement(&g_QueueDepth);
+            KeReleaseSpinLock(&g_QueueLock, irql);
+            KeSetEvent(&g_Kick, IO_NO_INCREMENT, FALSE);
+            return STATUS_SUCCESS;
+        }
+        KeReleaseSpinLock(&g_QueueLock, irql);
     }
     it = (ENG_ITEM *)ExAllocatePool2(POOL_FLAG_NON_PAGED,
                                      FIELD_OFFSET(ENG_ITEM, Cmds) + (SIZE_T)Bytes + 1u,
@@ -320,15 +377,13 @@ NTSTATUS EngSubmit(const VOID *Cmds, ULONG Bytes, ULONG Fence, BOOLEAN IsPaging)
         return STATUS_NO_MEMORY;
     }
     it->Fence = Fence;
+    it->HwFence = hwFence;
     it->Bytes = Bytes;
     it->IsPaging = IsPaging;
     it->IsPreempt = FALSE;
     it->IsStatic = FALSE;
     if (Bytes != 0u && Cmds != NULL) {
         RtlCopyMemory(it->Cmds, Cmds, Bytes);
-    }
-    if (IsPaging) {
-        InterlockedExchange(&g_AbortStall, 1);
     }
     KeAcquireSpinLock(&g_QueueLock, &irql);
     InsertTailList(&g_Queue, &it->Link);

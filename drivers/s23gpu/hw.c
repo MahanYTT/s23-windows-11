@@ -945,7 +945,7 @@ static BOOLEAN BootPowerAndGmuLocked(PUCHAR fwBuf)
         if (CmdDbLookupArc("cx.lvl", &cx) && cx.Addr)   (void)RpmhWriteTcs0(cx.Addr, FindArcIdx(&cx, 0x100u));
         if (CmdDbLookupArc("mx.lvl", &mx) && mx.Addr)   (void)RpmhWriteTcs0(mx.Addr, FindArcIdx(&mx, 0x100u));
         if (CmdDbLookupArc("mxc.lvl", &mxc) && mxc.Addr)(void)RpmhWriteTcs0(mxc.Addr, FindArcIdx(&mxc, 0x100u));
-        if (CmdDbLookupArc("gfx.lvl", &gfx) && gfx.Addr)(void)RpmhWriteTcs0(gfx.Addr, FindArcIdx(&gfx, 0x034u));
+        if (CmdDbLookupArc("gfx.lvl", &gfx) && gfx.Addr)(void)RpmhWriteTcs0(gfx.Addr, FindArcIdx(&gfx, 0x0C0u));
         SleepMs(2u);
     }
 
@@ -1210,6 +1210,14 @@ static BOOLEAN BootPowerAndGmuLocked(PUCHAR fwBuf)
         if (!HfiSendWait(hfiVa, 4u, 10u, hfiMsg, 0u, "START")) return FALSE;
         hfiMsg[0] = 1u; hfiMsg[1] = 1u; hfiMsg[2] = 1u;
         if (!HfiSendWait(hfiVa, 5u, 30u, hfiMsg, 3u, "DCVS_VOTE")) return FALSE;
+        hfiMsg[0] = 1u; hfiMsg[1] = 9u; hfiMsg[2] = 9u;
+        if (!HfiSendWait(hfiVa, 6u, 30u, hfiMsg, 3u, "DCVS_VOTE_TURBO")) {
+            LogPrint("hw: DCVS_VOTE_TURBO(9,9) failed, keeping initial vote\n");
+        }
+        LogPrint("hw: GMU PLL0 mode=0x%08x L=0x%08x alpha=0x%08x\n",
+                 R32(g_Gpucc, GPUCC_PLL0_BASE + 0x00u),
+                 R32(g_Gpucc, GPUCC_PLL0_BASE + 0x04u),
+                 R32(g_Gpucc, GPUCC_PLL0_BASE + 0x08u));
     }
 
     W32(g_Gmu, GMU_H2G_SET, 1u << 30);
@@ -1775,6 +1783,14 @@ ULONG HwConsumeGpuBusyUs(ULONG MaxUs)
     }
 }
 
+VOID HwRefundGpuBusyUs(ULONG Us)
+{
+    if (Us == 0) return;
+    if (InterlockedAdd(&g_PendingGpuBusyUs, (LONG)Us) > 80000) {
+        InterlockedExchange(&g_PendingGpuBusyUs, 80000);
+    }
+}
+
 BOOLEAN HwWaitFenceEx(ULONG Fence, ULONG TimeoutMs, BOOLEAN WedgeOnTimeout)
 {
     ULONG waitedUs = 0;
@@ -1782,8 +1798,8 @@ BOOLEAN HwWaitFenceEx(ULONG Fence, ULONG TimeoutMs, BOOLEAN WedgeOnTimeout)
     for (ULONG us = 0; us < 3000u; us += 2u) {
         if ((LONG)(HwCompletedFence() - Fence) >= 0) {
             if (waitedUs > 0) {
-                if (InterlockedAdd(&g_PendingGpuBusyUs, (LONG)waitedUs) > 2400) {
-                    InterlockedExchange(&g_PendingGpuBusyUs, 2400);
+                if (InterlockedAdd(&g_PendingGpuBusyUs, (LONG)waitedUs) > 80000) {
+                    InterlockedExchange(&g_PendingGpuBusyUs, 80000);
                 }
             }
             return TRUE;
@@ -1798,8 +1814,8 @@ BOOLEAN HwWaitFenceEx(ULONG Fence, ULONG TimeoutMs, BOOLEAN WedgeOnTimeout)
         SleepMs(1u);
         waitedUs += 1000u;
         if ((LONG)(HwCompletedFence() - Fence) >= 0) {
-            if (InterlockedAdd(&g_PendingGpuBusyUs, (LONG)waitedUs) > 2400) {
-                InterlockedExchange(&g_PendingGpuBusyUs, 2400);
+            if (InterlockedAdd(&g_PendingGpuBusyUs, (LONG)waitedUs) > 80000) {
+                InterlockedExchange(&g_PendingGpuBusyUs, 80000);
             }
             return TRUE;
         }
@@ -1888,8 +1904,8 @@ NTSTATUS HwSubmit(const ULONGLONG *IbIova, const ULONG *IbDwords, ULONG Count, P
     {
         LONG estUs = (LONG)(150u + (totalDwords / 6u));
         if (estUs > 700) estUs = 700;
-        if (InterlockedAdd(&g_PendingGpuBusyUs, estUs) > 2400) {
-            InterlockedExchange(&g_PendingGpuBusyUs, 2400);
+        if (InterlockedAdd(&g_PendingGpuBusyUs, estUs) > 80000) {
+            InterlockedExchange(&g_PendingGpuBusyUs, 80000);
         }
     }
     *Fence = seq;

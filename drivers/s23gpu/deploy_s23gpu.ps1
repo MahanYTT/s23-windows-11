@@ -77,6 +77,10 @@ if (Test-Path (Join-Path $outX64Dir 'libgallium_wgl.dll')) {
 
 Write-Host '=== Configuring Adreno 740 UMD DWM-only, exact scissor & OpenGL 4.6 ICD ==='
 Invoke-S23PS @"
+& powercfg.exe /change standby-timeout-ac 0 | Out-Null
+& powercfg.exe /change standby-timeout-dc 0 | Out-Null
+& powercfg.exe /change monitor-timeout-ac 0 | Out-Null
+& powercfg.exe /change monitor-timeout-dc 0 | Out-Null
 New-Item -ItemType Directory -Force -Path 'C:\topaz','C:\ProgramData\topaz' | Out-Null
 & icacls.exe 'C:\topaz' /grant '*S-1-1-0:(OI)(CI)(RX)' '*S-1-15-2-1:(OI)(CI)(RX)' '*S-1-15-2-2:(OI)(CI)(RX)' | Out-Null
 & icacls.exe 'C:\ProgramData\topaz' /grant '*S-1-1-0:(OI)(CI)(RX)' '*S-1-15-2-1:(OI)(CI)(RX)' '*S-1-15-2-2:(OI)(CI)(RX)' | Out-Null

@@ -3,7 +3,7 @@ Signature="$WINDOWS NT$"
 Class=Display
 ClassGuid={4D36E968-E325-11CE-BFC1-08002BE10318}
 Provider=%Provider%
-DriverVer=11/22/2026,1.0.2.3
+DriverVer=11/22/2026,1.0.2.4
 CatalogFile=s23gpu.cat
 PnpLockdown=1
 
