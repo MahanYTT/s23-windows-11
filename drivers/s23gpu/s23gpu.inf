@@ -3,7 +3,7 @@ Signature="$WINDOWS NT$"
 Class=Display
 ClassGuid={4D36E968-E325-11CE-BFC1-08002BE10318}
 Provider=%Provider%
-DriverVer=04/01/2024,1.0.0.5
+DriverVer=04/01/2024,1.0.1.7
 CatalogFile=s23gpu.cat
 PnpLockdown=1
 
@@ -26,7 +26,7 @@ s23gpu_umd.dll=1
 %Desc%=S23Gpu_Inst,PCI\VEN_5143&DEV_0740
 
 [S23Gpu_Inst]
-FeatureScore=F8
+FeatureScore=EC
 CopyFiles=S23Gpu_Files,S23Gpu_Umd
 AddReg=S23Gpu_AddReg
 
@@ -43,7 +43,7 @@ HKR,,UserModeDriverGUID,0x00000000,"{7B3E2F10-5230-4740-A740-000000000001}"
 HKR,,HardwareInformation.ChipType,0x00000000,"Qualcomm Adreno 740 (GEN7_2_1)"
 HKR,,HardwareInformation.AdapterString,0x00000000,"Qualcomm Adreno 740 GPU (S23)"
 HKR,,HardwareInformation.DacType,0x00000000,"Integrated RAMDAC"
-HKR,,HardwareInformation.BiosString,0x00000000,"A740.4001.0009"
+HKR,,HardwareInformation.BiosString,0x00000000,"A740.4001.0017"
 
 [S23Gpu_Inst.Services]
 AddService=s23gpu,0x00000002,S23Gpu_Svc
@@ -59,5 +59,5 @@ ServiceBinary=%12%\s23gpu.sys
 [Strings]
 Provider="S23 Windows on ARM"
 Mfg="Qualcomm / S23 Bring-Up"
-Desc="Qualcomm Adreno 740 Render-Only GPU (S23)"
+Desc="Qualcomm Adreno 740 GPU (S23)"
 Disk="S23 Adreno 740 Driver Disk"

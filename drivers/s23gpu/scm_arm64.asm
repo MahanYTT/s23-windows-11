@@ -1,4 +1,4 @@
-; ARM64 SMCCC trampoline for Qualcomm SCM calls (armasm64.exe)
+; ARM64 SMCCC primitive (armasm64.exe)
 ; VOID S23SmcCall(ULONGLONG Regs[8])
 
     AREA    |.text|, CODE, READONLY, ALIGN=4

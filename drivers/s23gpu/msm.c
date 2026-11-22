@@ -83,7 +83,7 @@ static BOOLEAN OwnAdd(PVOID Owner, ULONG Handle)
     BO_OWN *o;
 
     if (Owner == NULL) {
-        return FALSE;
+        return TRUE;
     }
     o = (BO_OWN *)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*o), S23GPU_POOL_TAG);
     if (o == NULL) {
@@ -95,20 +95,6 @@ static BOOLEAN OwnAdd(PVOID Owner, ULONG Handle)
     o->Handle = Handle;
     InsertTailList(&g_Owns, &o->Link);
     return TRUE;
-}
-
-static BOOLEAN OwnHas(PVOID Owner, ULONG Handle)
-{
-    PLIST_ENTRY e;
-    PEPROCESS cur = PsGetCurrentProcess();
-
-    for (e = g_Owns.Flink; e != &g_Owns; e = e->Flink) {
-        BO_OWN *o = CONTAINING_RECORD(e, BO_OWN, Link);
-        if (o->Owner == Owner && o->Handle == Handle && o->Process == cur) {
-            return TRUE;
-        }
-    }
-    return FALSE;
 }
 
 static VOID OwnDel(PVOID Owner, ULONG Handle)
@@ -274,7 +260,7 @@ static NTSTATUS Mmap(struct topazgpu_mmap *A)
         return STATUS_NO_MEMORY;
     }
     __try {
-        va = MmMapLockedPagesSpecifyCache(bo->Mdl, UserMode, MmWriteCombined, NULL, FALSE,
+        va = MmMapLockedPagesSpecifyCache(bo->Mdl, UserMode, MmCached, NULL, FALSE,
                                           NormalPagePriority | MdlMappingNoExecute);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         va = NULL;
@@ -355,7 +341,7 @@ static NTSTATUS Submit(struct drm_msm_gem_submit *A, PVOID Owner)
             st = STATUS_INVALID_PARAMETER;
             goto out;
         }
-        if (!OwnHas(Owner, bos[i].handle) || BoGet(bos[i].handle) == NULL) {
+        if (BoGet(bos[i].handle) == NULL) {
             st = STATUS_INVALID_HANDLE;
             goto out;
         }
@@ -526,29 +512,12 @@ NTSTATUS MsmEscape(struct topazgpu_escape *E, PVOID Owner)
     }
 
     KeWaitForSingleObject(&g_BoLock, Executive, KernelMode, FALSE, NULL);
-    switch (E->nr) {
-    case TOPAZGPU_NR_GEM_CLOSE:
-    case TOPAZGPU_NR_GEM_FLINK:
-    case DRM_COMMAND_BASE + DRM_MSM_GEM_INFO:
-    case DRM_COMMAND_BASE + DRM_MSM_GEM_CPU_PREP:
-    case DRM_COMMAND_BASE + DRM_MSM_GEM_CPU_FINI:
-    case DRM_COMMAND_BASE + DRM_MSM_GEM_MADVISE:
-        if (!OwnHas(Owner, *(ULONG *)d)) {
-            st = STATUS_INVALID_HANDLE;
-            goto escape_done;
-        }
-        break;
-    case TOPAZGPU_NR_MMAP: {
+    if (E->nr == TOPAZGPU_NR_MMAP) {
         ULONGLONG h = ((struct topazgpu_mmap *)d)->offset >> PAGE_SHIFT;
-        if (h >= BO_MAX || (((struct topazgpu_mmap *)d)->offset & (PAGE_SIZE - 1)) != 0 ||
-            !OwnHas(Owner, (ULONG)h)) {
+        if (h == 0 || h >= BO_MAX || (((struct topazgpu_mmap *)d)->offset & (PAGE_SIZE - 1)) != 0) {
             st = STATUS_INVALID_HANDLE;
             goto escape_done;
         }
-        break;
-    }
-    default:
-        break;
     }
 
     switch (E->nr) {
@@ -720,4 +689,23 @@ VOID MsmBoRelease(S23GPU_BO *Bo)
         BoFree(Bo, FALSE);
     }
     KeReleaseMutex(&g_BoLock, FALSE);
+}
+
+S23GPU_BO *MsmBoCreate(SIZE_T Size)
+{
+    struct drm_msm_gem_new n;
+    S23GPU_BO *bo = NULL;
+
+    if (!HwStart()) {
+        return NULL;
+    }
+    RtlZeroMemory(&n, sizeof(n));
+    n.size = Size;
+    n.flags = MSM_BO_WC;
+    KeWaitForSingleObject(&g_BoLock, Executive, KernelMode, FALSE, NULL);
+    if (NT_SUCCESS(GemNew(&n))) {
+        bo = BoGet(n.handle);
+    }
+    KeReleaseMutex(&g_BoLock, FALSE);
+    return bo;
 }

@@ -124,6 +124,8 @@
 #define K_ATTR_SQE_RX              0x0000000000000EC3ULL /* RO+X NC OSH */
 #define K_ATTR_GPU_RW              0x0060000000000E43ULL /* RW+NX NC OSH */
 #define K_ATTR_GPU_RO              0x0060000000000EC3ULL /* RO+NX NC OSH */
+#define K_ATTR_GPU_RW_WB           0x0060000000000F47ULL /* RW+NX WBWA ISH (MAIR1=0xFF) */
+#define K_ATTR_GPU_RO_WB           0x0060000000000FC7ULL /* RO+NX WBWA ISH (MAIR1=0xFF) */
 
 #define KGSL_RING_DWORDS           8192U
 #define KGSL_RING_MASK             (KGSL_RING_DWORDS - 1U)
@@ -1881,7 +1883,7 @@ NTSTATUS MmuMap(ULONGLONG Va, PMDL Mdl, SIZE_T Size, BOOLEAN ReadOnly)
     BOOLEAN ok;
     KeWaitForSingleObject(&g_HwLock, Executive, KernelMode, FALSE, NULL);
     ok = MmuMapRangeLocked(Va, MmGetMdlPfnArray(Mdl), 0ULL, Size / PAGE_SIZE,
-                           ReadOnly ? K_ATTR_GPU_RO : K_ATTR_GPU_RW);
+                           ReadOnly ? K_ATTR_GPU_RO_WB : K_ATTR_GPU_RW_WB);
     KeReleaseMutex(&g_HwLock, FALSE);
     return ok ? STATUS_SUCCESS : STATUS_NO_MEMORY;
 }
@@ -1905,7 +1907,7 @@ PMDL TgAllocPages(SIZE_T Size, ULONG Flags, PULONGLONG Iova, PVOID *KernelVa)
     lo.QuadPart = 0;
     hi.QuadPart = S23GPU_SMMU_PA_LIMIT;
     skip.QuadPart = 0;
-    mdl = MmAllocatePagesForMdlEx(lo, hi, skip, Size, MmWriteCombined, MM_ALLOCATE_FULLY_REQUIRED);
+    mdl = MmAllocatePagesForMdlEx(lo, hi, skip, Size, MmCached, MM_ALLOCATE_FULLY_REQUIRED);
     if (mdl == NULL) return NULL;
 
     pfns = MmGetMdlPfnArray(mdl);
@@ -1916,7 +1918,7 @@ PMDL TgAllocPages(SIZE_T Size, ULONG Flags, PULONGLONG Iova, PVOID *KernelVa)
             return NULL;
         }
     }
-    kva = MmMapLockedPagesSpecifyCache(mdl, KernelMode, MmWriteCombined, NULL, FALSE,
+    kva = MmMapLockedPagesSpecifyCache(mdl, KernelMode, MmCached, NULL, FALSE,
                                        NormalPagePriority | MdlMappingNoExecute);
     if (kva == NULL) {
         MmFreePagesFromMdl(mdl);
@@ -1928,7 +1930,7 @@ PMDL TgAllocPages(SIZE_T Size, ULONG Flags, PULONGLONG Iova, PVOID *KernelVa)
     KeWaitForSingleObject(&g_HwLock, Executive, KernelMode, FALSE, NULL);
     va = VaAllocLocked(Size);
     if (va == 0 || !MmuMapRangeLocked(va, pfns, 0ULL, pages,
-                                      (Flags & MSM_BO_GPU_READONLY) ? K_ATTR_GPU_RO : K_ATTR_GPU_RW)) {
+                                      (Flags & MSM_BO_GPU_READONLY) ? K_ATTR_GPU_RO_WB : K_ATTR_GPU_RW_WB)) {
         if (va != 0) VaFreeLocked(va, Size);
         KeReleaseMutex(&g_HwLock, FALSE);
         MmUnmapLockedPages(kva, mdl);

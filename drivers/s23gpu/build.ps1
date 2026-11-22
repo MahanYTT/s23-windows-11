@@ -34,7 +34,7 @@ if ($LASTEXITCODE) { throw "armasm64 failed: $LASTEXITCODE" }
 Write-Host '=== Compiling WDDM KMD (ARM64) ==='
 $kmDefs = @('/D_ARM64_=1', '/DARM64=1', '/D_WIN64=1', '/DWINNT=1', '/D_WIN32_WINNT=0x0A00', '/DNTDDI_VERSION=0x0A000010', '/DPOOL_ZERO_DOWN_LEVEL_SUPPORT=1')
 $kmInc  = @("/I$wdkInc\km", "/I$wdkInc\km\crt", "/I$wdkInc\shared")
-$kmSrc  = @('log.c', 'eng.c', 'msm.c', 'hw.c', 'ddi.c') | ForEach-Object { Join-Path $dir $_ }
+$kmSrc  = @('log.c', 'eng.c', 'disp.c', 'msm.c', 'hw.c', 'ddi.c') | ForEach-Object { Join-Path $dir $_ }
 
 & $cl /nologo /c /kernel /Zl /GS /W3 /WX /Oi /O2 /Zi @kmDefs @kmInc "/Fo$outDir\" "/Fd$outDir\s23gpu.pdb" @kmSrc
 if ($LASTEXITCODE) { throw "cl.exe KMD failed: $LASTEXITCODE" }
@@ -68,6 +68,9 @@ if ($LASTEXITCODE) { throw "cl.exe d3d11_test failed: $LASTEXITCODE" }
 
 & $cl /nologo /MT /O2 /W3 @umInc (Join-Path $dir 's23gpu_opengl_test.c') "/Fo$outDir\s23gpu_opengl_test.obj" /link /MACHINE:ARM64 @umLibPaths opengl32.lib user32.lib gdi32.lib kernel32.lib "/OUT:$outDir\s23gpu_opengl_test.exe"
 if ($LASTEXITCODE) { throw "cl.exe opengl_test failed: $LASTEXITCODE" }
+
+& $cl /nologo /MT /O2 /W3 @umInc (Join-Path $dir 's23disp_only.c') "/Fo$outDir\s23disp_only.obj" /link /MACHINE:ARM64 @umLibPaths user32.lib wtsapi32.lib advapi32.lib kernel32.lib "/OUT:$outDir\s23disp_only.exe"
+if ($LASTEXITCODE) { throw "cl.exe s23disp_only failed: $LASTEXITCODE" }
 
 Write-Host "Using Mesa Freedreno UMD: $mesaUmd"
 Copy-Item $mesaUmd (Join-Path $outDir 's23gpu_umd.dll') -Force

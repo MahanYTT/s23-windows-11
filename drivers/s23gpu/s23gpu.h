@@ -1,9 +1,9 @@
 /*
- * s23gpu.h - Persistent ARM64 WDDM 1.3 Render-Only KMD for Samsung Galaxy S23 (Adreno 740)
+ * s23gpu.h - Persistent ARM64 WDDM 2.0 Full Display (1080x2340 @ 120Hz) + 3D KMD for S23 (Adreno 740)
  */
 #pragma once
 
-#define DXGKDDI_INTERFACE_VERSION DXGKDDI_INTERFACE_VERSION_WDDM1_3
+#define DXGKDDI_INTERFACE_VERSION DXGKDDI_INTERFACE_VERSION_WDDM2_0
 
 #include <ntddk.h>
 #include <ntstrsafe.h>
@@ -35,6 +35,10 @@
 #define S23GPU_VA_USER_START 0x02000000ULL   /* Above 3 MiB GMEM window */
 #define S23GPU_VA_USER_END   0xF0000000ULL   /* 3.71875 GiB user IOVA space */
 
+/* VidMM Aperture Segment ("GART") */
+#define S23GPU_APERTURE_BASE 0xC0000000ULL
+#define S23GPU_APERTURE_SIZE (1024ULL * 1024 * 1024)
+
 typedef struct _S23GPU_MAP {
     LIST_ENTRY Link;
     PEPROCESS  Process;
@@ -63,6 +67,7 @@ typedef struct _S23GPU_ALLOCATION {
     PMDL                  ApMdl;
     PMDL                  ApPartial;
     PVOID                 ApVa;
+    SIZE_T                ApBytes;
 } S23GPU_ALLOCATION;
 
 typedef struct _S23GPU_ADAPTER {
@@ -99,6 +104,10 @@ typedef struct _S23GPU_CMD {
     RECT               Rects[S23GPU_CMD_MAX_RECTS];
     SIZE_T             Bytes;
     ULONG              Color;
+    ULONG              SrcSeg;
+    ULONG              DstSeg;
+    ULONGLONG          SrcAddr;
+    ULONGLONG          DstAddr;
 } S23GPU_CMD;
 
 /* log.c */
@@ -133,19 +142,46 @@ PMDL      TgAllocPages(SIZE_T Size, ULONG Flags, PULONGLONG Iova, PVOID *KernelV
 VOID      TgFreePages(PMDL Mdl, PVOID KernelVa, SIZE_T Size, ULONGLONG Iova);
 
 /* msm.c */
-VOID     MsmInit(VOID);
-VOID     MsmCleanup(VOID);
-NTSTATUS MsmEscape(struct topazgpu_escape *Esc, PVOID Owner);
-VOID     MsmReleaseOwner(PVOID Owner);
-VOID     MsmResetLastOwner(VOID);
+VOID       MsmInit(VOID);
+VOID       MsmCleanup(VOID);
+NTSTATUS   MsmEscape(struct topazgpu_escape *Esc, PVOID Owner);
+VOID       MsmReleaseOwner(PVOID Owner);
+VOID       MsmResetLastOwner(VOID);
+S23GPU_BO *MsmBoCreate(SIZE_T Size);
 S23GPU_BO *MsmBoAcquire(ULONG Name);
 VOID       MsmBoRelease(S23GPU_BO *Bo);
 
 /* ddi.c */
 PUCHAR AllocPixels(S23GPU_ALLOCATION *Al);
+PVOID  GartMapVa(ULONGLONG Addr, SIZE_T Bytes, PMDL *Mdl);
+VOID   GartUnmapVa(PVOID Va, PMDL Mdl);
 
 /* eng.c */
 typedef VOID (*S23GPU_FENCE_DONE)(PVOID Ctx, ULONG Fence);
 NTSTATUS EngStart(S23GPU_FENCE_DONE Done, PVOID Ctx);
 VOID     EngStop(VOID);
 NTSTATUS EngSubmit(const VOID *Cmds, ULONG Bytes, ULONG Fence);
+VOID     EngKickScanout(VOID);
+
+/* disp.c */
+NTSTATUS DispStart(PDXGKRNL_INTERFACE Dxgk);
+VOID     DispStop(VOID);
+VOID     DispGetPostInfo(DXGK_DISPLAY_INFORMATION *Info);
+VOID     DispAllocDestroyed(S23GPU_ALLOCATION *Al);
+VOID     DispScanoutLock(VOID);
+VOID     DispScanoutUnlock(VOID);
+VOID     DispVsyncEnable(BOOLEAN Enable);
+VOID     DispPresentRects(S23GPU_ALLOCATION *Dst, const UCHAR *DstPixels, const RECT *Rects, ULONG Count);
+VOID     DispScanoutWork(VOID);
+VOID     DispSystemWrite(PVOID Src, UINT W, UINT H, UINT Stride, UINT X, UINT Y);
+NTSTATUS DispSetSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS *A);
+NTSTATUS DispSetVisibility(const DXGKARG_SETVIDPNSOURCEVISIBILITY *A);
+NTSTATUS DispCommitVidPn(PDXGKRNL_INTERFACE Dxgk, const DXGKARG_COMMITVIDPN *A);
+NTSTATUS DispEnumCofuncModality(PDXGKRNL_INTERFACE Dxgk, const DXGKARG_ENUMVIDPNCOFUNCMODALITY *A);
+NTSTATUS DispRecommendMonitorModes(const DXGKARG_RECOMMENDMONITORMODES *A);
+NTSTATUS DispQueryChildRelations(PDXGK_CHILD_DESCRIPTOR Rel, ULONG Size);
+NTSTATUS DispQueryChildStatus(PDXGK_CHILD_STATUS St);
+NTSTATUS DispQueryDeviceDescriptor(ULONG Uid, PDXGK_DEVICE_DESCRIPTOR Desc);
+NTSTATUS DispGetScanLine(DXGKARG_GETSCANLINE *A);
+NTSTATUS DispQueryInterface(PVOID Ctx, PQUERY_INTERFACE Qi);
+NTSTATUS DispUpdateActiveVidPnPresentPath(const DXGKARG_UPDATEACTIVEVIDPNPRESENTPATH *A);

@@ -54,7 +54,7 @@ int wmain(int argc, wchar_t **argv)
         SP_DEVINFO_DATA did;
         did.cbSize = sizeof(did);
         if (!SetupDiCreateDeviceInfoW(dis, L"DISPLAY", &GUID_DEVCLASS_DISPLAY,
-                                      L"Qualcomm Adreno 740 Render-Only GPU (S23)",
+                                      L"Qualcomm Adreno 740 GPU (S23)",
                                       NULL, DICD_GENERATE_ID, &did)) {
             wprintf(L"[ERR] SetupDiCreateDeviceInfoW err=%lu\n", GetLastError());
             SetupDiDestroyDeviceInfoList(dis);
