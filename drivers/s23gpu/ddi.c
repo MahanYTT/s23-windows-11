@@ -52,6 +52,7 @@ C_ASSERT(sizeof(S23_GPUVERSION) == 128);
 typedef struct _NOTIFY_CTX {
     S23GPU_ADAPTER *Adapter;
     ULONG           Fence;
+    BOOLEAN         IsPreempt;
 } NOTIFY_CTX;
 
 static S23GPU_ADAPTER *g_Adapter = NULL;
@@ -65,34 +66,59 @@ static BOOLEAN NotifyRoutine(PVOID Ctx)
     DXGKARGCB_NOTIFY_INTERRUPT_DATA d;
 
     RtlZeroMemory(&d, sizeof(d));
-    d.InterruptType = DXGK_INTERRUPT_DMA_COMPLETED;
-    d.DmaCompleted.SubmissionFenceId = n->Fence;
-    d.DmaCompleted.NodeOrdinal = 0;
-    d.DmaCompleted.EngineOrdinal = 0;
-    n->Adapter->Dxgk.DxgkCbNotifyInterrupt(n->Adapter->Dxgk.DeviceHandle, &d);
-    n->Adapter->LastCompletedFence = n->Fence;
-    n->Adapter->Dxgk.DxgkCbQueueDpc(n->Adapter->Dxgk.DeviceHandle);
+    if (n->IsPreempt) {
+        d.InterruptType = DXGK_INTERRUPT_DMA_PREEMPTED;
+        d.DmaPreempted.PreemptionFenceId = n->Fence;
+        d.DmaPreempted.NodeOrdinal = 0;
+        d.DmaPreempted.EngineOrdinal = 0;
+        d.DmaPreempted.LastCompletedFenceId = n->Adapter->LastCompletedFence;
+        n->Adapter->Dxgk.DxgkCbNotifyInterrupt(n->Adapter->Dxgk.DeviceHandle, &d);
+        n->Adapter->Dxgk.DxgkCbQueueDpc(n->Adapter->Dxgk.DeviceHandle);
+        return TRUE;
+    }
+    if (n->Fence != 0u) {
+        d.InterruptType = DXGK_INTERRUPT_DMA_COMPLETED;
+        d.DmaCompleted.SubmissionFenceId = n->Fence;
+        d.DmaCompleted.NodeOrdinal = 0;
+        d.DmaCompleted.EngineOrdinal = 0;
+        n->Adapter->Dxgk.DxgkCbNotifyInterrupt(n->Adapter->Dxgk.DeviceHandle, &d);
+        n->Adapter->LastCompletedFence = n->Fence;
+        n->Adapter->Dxgk.DxgkCbQueueDpc(n->Adapter->Dxgk.DeviceHandle);
+    }
     return TRUE;
 }
 
-static VOID CompleteFence(S23GPU_ADAPTER *A, ULONG Fence)
+static VOID CompleteFenceEx(S23GPU_ADAPTER *A, ULONG Fence, BOOLEAN IsPreempt)
 {
     NOTIFY_CTX n;
     BOOLEAN ret = FALSE;
     NTSTATUS st;
-    static ULONG errLog = 0;
+    static volatile LONG errLog = 0;
 
     n.Adapter = A;
     n.Fence = Fence;
+    n.IsPreempt = IsPreempt;
     st = A->Dxgk.DxgkCbSynchronizeExecution(A->Dxgk.DeviceHandle, NotifyRoutine, &n, 0, &ret);
-    if (!NT_SUCCESS(st) && ++errLog <= 10) {
-        LogPrint("CompleteFence %u: SynchronizeExecution -> %08x ret=%u\n", Fence, st, ret);
+    if (!NT_SUCCESS(st) && KeGetCurrentIrql() == PASSIVE_LEVEL &&
+        InterlockedIncrement(&errLog) <= 10) {
+        LogPrint("CompleteFence %u (preempt=%u): SynchronizeExecution -> %08x ret=%u\n",
+                 Fence, IsPreempt ? 1u : 0u, st, ret);
     }
 }
 
-static VOID FenceDone(PVOID Ctx, ULONG Fence)
+static VOID CompleteFence(S23GPU_ADAPTER *A, ULONG Fence)
 {
-    CompleteFence((S23GPU_ADAPTER *)Ctx, Fence);
+    CompleteFenceEx(A, Fence, FALSE);
+}
+
+static VOID PreemptFence(S23GPU_ADAPTER *A, ULONG Fence)
+{
+    CompleteFenceEx(A, Fence, TRUE);
+}
+
+static VOID FenceDone(PVOID Ctx, ULONG Fence, BOOLEAN IsPreempt)
+{
+    CompleteFenceEx((S23GPU_ADAPTER *)Ctx, Fence, IsPreempt);
 }
 
 static NTSTATUS TgAddDevice(const PDEVICE_OBJECT Pdo, PVOID *Ctx)
@@ -821,6 +847,12 @@ static NTSTATUS APIENTRY TgCloseAllocation(const HANDLE hDevice, const DXGKARG_C
 static NTSTATUS APIENTRY TgRender(const HANDLE hContext, DXGKARG_RENDER *A)
 {
     UNREFERENCED_PARAMETER(hContext);
+    if (A == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (A->pDmaBuffer == NULL || A->DmaSize < A->CommandLength) {
+        return STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER;
+    }
     A->pDmaBuffer = (PUCHAR)A->pDmaBuffer + A->CommandLength;
     return STATUS_SUCCESS;
 }
@@ -919,14 +951,20 @@ static NTSTATUS APIENTRY TgSubmitCommand(const HANDLE hAdapter, const DXGKARG_SU
     S23GPU_ADAPTER *a = (S23GPU_ADAPTER *)hAdapter;
     const UCHAR *cmds = NULL;
     ULONG bytes = 0;
+    BOOLEAN isPaging = (BOOLEAN)(A->Flags.Paging || A->Flags.ContextSwitch ||
+                                 A->Flags.NullRendering || A->Flags.Flip);
 
-    if (A->pDmaBufferPrivateData != NULL &&
-        A->DmaBufferPrivateDataSubmissionEndOffset > A->DmaBufferPrivateDataSubmissionStartOffset) {
+    if (!A->Flags.NullRendering &&
+        A->pDmaBufferPrivateData != NULL &&
+        A->DmaBufferPrivateDataSubmissionEndOffset > A->DmaBufferPrivateDataSubmissionStartOffset &&
+        A->DmaBufferPrivateDataSubmissionEndOffset <= A->DmaBufferPrivateDataSize) {
         cmds = (const UCHAR *)A->pDmaBufferPrivateData + A->DmaBufferPrivateDataSubmissionStartOffset;
         bytes = A->DmaBufferPrivateDataSubmissionEndOffset - A->DmaBufferPrivateDataSubmissionStartOffset;
     }
-    a->LastSubmittedFence = A->SubmissionFenceId;
-    if (!NT_SUCCESS(EngSubmit(cmds, bytes, A->SubmissionFenceId))) {
+    if (A->SubmissionFenceId != 0u) {
+        a->LastSubmittedFence = A->SubmissionFenceId;
+    }
+    if (!NT_SUCCESS(EngSubmit(cmds, bytes, A->SubmissionFenceId, isPaging))) {
         CompleteFence(a, A->SubmissionFenceId);
     }
     return STATUS_SUCCESS;
@@ -934,8 +972,11 @@ static NTSTATUS APIENTRY TgSubmitCommand(const HANDLE hAdapter, const DXGKARG_SU
 
 static NTSTATUS APIENTRY TgPreemptCommand(const HANDLE hAdapter, const DXGKARG_PREEMPTCOMMAND *A)
 {
-    UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(A);
+    S23GPU_ADAPTER *a = (S23GPU_ADAPTER *)hAdapter;
+
+    if (!NT_SUCCESS(EngPreempt(A->PreemptionFenceId))) {
+        PreemptFence(a, A->PreemptionFenceId);
+    }
     return STATUS_SUCCESS;
 }
 
@@ -1081,8 +1122,10 @@ static NTSTATUS APIENTRY TgQueryEngineStatus(const HANDLE hAdapter, DXGKARG_QUER
 
 static NTSTATUS APIENTRY TgResetEngine(const HANDLE hAdapter, DXGKARG_RESETENGINE *A)
 {
-    UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(A);
+    S23GPU_ADAPTER *a = (S23GPU_ADAPTER *)hAdapter;
+    if (A != NULL) {
+        A->LastAbortedFenceId = (a != NULL) ? a->LastCompletedFence : 0u;
+    }
     return STATUS_SUCCESS;
 }
 
@@ -1290,7 +1333,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     NTSTATUS st;
 
     LogOpen();
-    LogPrint("==== s23gpu.sys v1.0.1.9 WDDM 2.0 Full Display (1080x2340 @ 120Hz HW + 0.5ms TimerRes + RowDelta Scanout + Brightness + Night Light) + Adreno 740 KMD ====\n");
+    LogPrint("==== s23gpu.sys v1.0.2.1 WDDM 2.0 Full Display (1080x2340 @ 120Hz HW + 0.5ms TimerRes + RowDelta Scanout + Preempt/GPU Engine Util + Brightness + Night Light) + Adreno 740 KMD ====\n");
     MsmInit();
 
     RtlZeroMemory(&d, sizeof(d));

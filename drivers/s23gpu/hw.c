@@ -147,6 +147,8 @@ static BOOLEAN g_Cb0SafeFree = TRUE;
 static ULONG g_FaultCount = 0;
 static ULONG g_RingWptr = 0;
 static ULONG g_NextFence = 3;
+static volatile LONG g_LastSubmittedFence = 0;
+static volatile LONG g_PendingGpuBusyUs = 0;
 
 static volatile UCHAR * g_CmdDb = NULL;
 static volatile UCHAR * g_Rsc = NULL;
@@ -1755,19 +1757,52 @@ ULONG HwCompletedFence(VOID)
     return g_MemptrsVa[MEMPTRS_OFF_FENCE_BR];
 }
 
+ULONG HwLastSubmittedFence(VOID)
+{
+    return (ULONG)InterlockedCompareExchange(&g_LastSubmittedFence, 0, 0);
+}
+
+ULONG HwConsumeGpuBusyUs(ULONG MaxUs)
+{
+    for (;;) {
+        LONG cur = InterlockedCompareExchange(&g_PendingGpuBusyUs, 0, 0);
+        LONG take;
+        if (cur <= 0) return 0;
+        take = (cur > (LONG)MaxUs) ? (LONG)MaxUs : cur;
+        if (InterlockedCompareExchange(&g_PendingGpuBusyUs, cur - take, cur) == cur) {
+            return (ULONG)take;
+        }
+    }
+}
+
 BOOLEAN HwWaitFenceEx(ULONG Fence, ULONG TimeoutMs, BOOLEAN WedgeOnTimeout)
 {
+    ULONG waitedUs = 0;
     if (Fence == 0 || (LONG)(HwCompletedFence() - Fence) >= 0) return TRUE;
     for (ULONG us = 0; us < 3000u; us += 2u) {
-        if ((LONG)(HwCompletedFence() - Fence) >= 0) return TRUE;
+        if ((LONG)(HwCompletedFence() - Fence) >= 0) {
+            if (waitedUs > 0) {
+                if (InterlockedAdd(&g_PendingGpuBusyUs, (LONG)waitedUs) > 2400) {
+                    InterlockedExchange(&g_PendingGpuBusyUs, 2400);
+                }
+            }
+            return TRUE;
+        }
         StallUs(2u);
+        waitedUs += 2u;
     }
     if (TimeoutMs == 0) {
         return (LONG)(HwCompletedFence() - Fence) >= 0;
     }
     for (ULONG ms = 3u; ms < TimeoutMs; ms++) {
         SleepMs(1u);
-        if ((LONG)(HwCompletedFence() - Fence) >= 0) return TRUE;
+        waitedUs += 1000u;
+        if ((LONG)(HwCompletedFence() - Fence) >= 0) {
+            if (InterlockedAdd(&g_PendingGpuBusyUs, (LONG)waitedUs) > 2400) {
+                InterlockedExchange(&g_PendingGpuBusyUs, 2400);
+            }
+            return TRUE;
+        }
     }
     if (WedgeOnTimeout) {
         g_HwWedged = TRUE;
@@ -1792,7 +1827,7 @@ BOOLEAN HwWaitFence(ULONG Fence, ULONG TimeoutMs)
 
 NTSTATUS HwSubmit(const ULONGLONG *IbIova, const ULONG *IbDwords, ULONG Count, PULONG Fence)
 {
-    ULONG need = 37u + 4u * Count, wptr, seq;
+    ULONG need = 37u + 4u * Count, wptr, seq, totalDwords = 0;
     BOOLEAN space = FALSE;
 
     if (!g_HwReady || g_RingVa == NULL || g_Kgsl == NULL) return STATUS_DEVICE_NOT_READY;
@@ -1827,6 +1862,7 @@ NTSTATUS HwSubmit(const ULONGLONG *IbIova, const ULONG *IbDwords, ULONG Count, P
         RW((ULONG)IbIova[i]);
         RW((ULONG)(IbIova[i] >> 32));
         RW(IbDwords[i]);
+        totalDwords += IbDwords[i];
     }
     RW(Pm4Type4(0x0885u, 1u)); RW(seq);
     RW(Pm4Type7(0x17u, 1u)); RW(1u);          /* BR */
@@ -1848,6 +1884,14 @@ NTSTATUS HwSubmit(const ULONGLONG *IbIova, const ULONG *IbDwords, ULONG Count, P
     DmbSy();
     KgslW32(0x0807u, g_RingWptr);
     DmbSy();
+    InterlockedExchange(&g_LastSubmittedFence, (LONG)seq);
+    {
+        LONG estUs = (LONG)(150u + (totalDwords / 6u));
+        if (estUs > 700) estUs = 700;
+        if (InterlockedAdd(&g_PendingGpuBusyUs, estUs) > 2400) {
+            InterlockedExchange(&g_PendingGpuBusyUs, 2400);
+        }
+    }
     *Fence = seq;
     KeReleaseMutex(&g_HwLock, FALSE);
     return STATUS_SUCCESS;

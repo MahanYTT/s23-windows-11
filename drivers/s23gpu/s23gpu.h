@@ -129,6 +129,8 @@ BOOLEAN   HwRecover(VOID);
 ULONG     HwFaultCount(VOID);
 ULONGLONG HwTimestamp(VOID);
 ULONG     HwCompletedFence(VOID);
+ULONG     HwLastSubmittedFence(VOID);
+ULONG     HwConsumeGpuBusyUs(ULONG MaxUs);
 BOOLEAN   HwWaitFenceEx(ULONG Fence, ULONG TimeoutMs, BOOLEAN WedgeOnTimeout);
 BOOLEAN   HwWaitFence(ULONG Fence, ULONG TimeoutMs);
 NTSTATUS  HwSubmit(const ULONGLONG *IbIova, const ULONG *IbDwords, ULONG Count, PULONG Fence);
@@ -157,10 +159,11 @@ PVOID  GartMapVa(ULONGLONG Addr, SIZE_T Bytes, PMDL *Mdl);
 VOID   GartUnmapVa(PVOID Va, PMDL Mdl);
 
 /* eng.c */
-typedef VOID (*S23GPU_FENCE_DONE)(PVOID Ctx, ULONG Fence);
+typedef VOID (*S23GPU_FENCE_DONE)(PVOID Ctx, ULONG Fence, BOOLEAN IsPreempt);
 NTSTATUS EngStart(S23GPU_FENCE_DONE Done, PVOID Ctx);
 VOID     EngStop(VOID);
-NTSTATUS EngSubmit(const VOID *Cmds, ULONG Bytes, ULONG Fence);
+NTSTATUS EngSubmit(const VOID *Cmds, ULONG Bytes, ULONG Fence, BOOLEAN IsPaging);
+NTSTATUS EngPreempt(ULONG PreemptFence);
 VOID     EngKickScanout(VOID);
 
 /* disp.c */

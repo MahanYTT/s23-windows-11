@@ -776,7 +776,7 @@ VOID DispVsyncEnable(BOOLEAN Enable)
         if (Enable) {
             EXT_SET_PARAMETERS params;
             LONG hz = InterlockedCompareExchange(&g_TargetHz, 0, 0);
-            LONGLONG period100ns = (hz >= 100) ? 83333LL : 166667LL;
+            LONGLONG period100ns = (hz >= 100) ? 79500LL : 164500LL;
             ExInitializeSetTimerParameters(&params);
             params.NoWakeTolerance = 0;
             (void)ExSetTimer(g_VsyncTimer, -period100ns, period100ns, &params);

@@ -7,6 +7,9 @@ typedef struct _ENG_ITEM {
     LIST_ENTRY Link;
     ULONG      Fence;
     ULONG      Bytes;
+    BOOLEAN    IsPaging;
+    BOOLEAN    IsPreempt;
+    BOOLEAN    IsStatic;
     UCHAR      Cmds[1];
 } ENG_ITEM;
 
@@ -18,6 +21,9 @@ static PKTHREAD          g_Thread = NULL;
 static S23GPU_FENCE_DONE g_Done = NULL;
 static PVOID             g_DoneCtx = NULL;
 static volatile LONG     g_ScanKick = 0;
+static volatile LONG     g_AbortStall = 0;
+static volatile LONG     g_QueueDepth = 0;
+static ENG_ITEM          g_PreemptSlots[8];
 
 static PUCHAR View(S23GPU_ALLOCATION *Al, ULONG Seg, ULONGLONG Addr, PMDL *Tmp)
 {
@@ -191,14 +197,51 @@ static VOID EngThread(PVOID Ctx)
             KeAcquireSpinLock(&g_QueueLock, &irql);
             if (!IsListEmpty(&g_Queue)) {
                 it = CONTAINING_RECORD(RemoveHeadList(&g_Queue), ENG_ITEM, Link);
+                InterlockedDecrement(&g_QueueDepth);
             }
             KeReleaseSpinLock(&g_QueueLock, irql);
             if (it == NULL) {
                 break;
             }
+            if (it->IsPreempt) {
+                ULONG fence = it->Fence;
+                if (it->IsStatic) {
+                    KeAcquireSpinLock(&g_QueueLock, &irql);
+                    it->IsStatic = FALSE;
+                    if (IsListEmpty(&g_Queue)) {
+                        InterlockedExchange(&g_AbortStall, 0);
+                    }
+                    KeReleaseSpinLock(&g_QueueLock, irql);
+                } else {
+                    if (InterlockedCompareExchange(&g_QueueDepth, 0, 0) == 0) {
+                        InterlockedExchange(&g_AbortStall, 0);
+                    }
+                    ExFreePoolWithTag(it, S23GPU_POOL_TAG);
+                }
+                g_Done(g_DoneCtx, fence, TRUE);
+                continue;
+            }
             Execute(it);
-            g_Done(g_DoneCtx, it->Fence);
-            ExFreePoolWithTag(it, S23GPU_POOL_TAG);
+            if (!it->IsPaging && it->Bytes == 0u &&
+                InterlockedCompareExchange(&g_AbortStall, 0, 0) == 0 &&
+                InterlockedCompareExchange(&g_QueueDepth, 0, 0) == 0) {
+                ULONG busyUs = HwConsumeGpuBusyUs(1400u);
+                if (busyUs >= 400u) {
+                    LARGE_INTEGER delay;
+                    delay.QuadPart = -(LONGLONG)busyUs * 10LL;
+                    (void)KeWaitForMultipleObjects(2, objs, WaitAny, Executive, KernelMode, FALSE, &delay, NULL);
+                }
+            } else if (it->IsPaging && InterlockedCompareExchange(&g_QueueDepth, 0, 0) == 0) {
+                InterlockedExchange(&g_AbortStall, 0);
+            }
+            g_Done(g_DoneCtx, it->Fence, FALSE);
+            if (it->IsStatic) {
+                KeAcquireSpinLock(&g_QueueLock, &irql);
+                it->IsStatic = FALSE;
+                KeReleaseSpinLock(&g_QueueLock, irql);
+            } else {
+                ExFreePoolWithTag(it, S23GPU_POOL_TAG);
+            }
         }
         if (InterlockedExchange(&g_ScanKick, 0)) {
             DispScanoutWork();
@@ -225,6 +268,9 @@ NTSTATUS EngStart(S23GPU_FENCE_DONE Done, PVOID Ctx)
     g_Done = Done;
     g_DoneCtx = Ctx;
     g_ScanKick = 0;
+    g_AbortStall = 0;
+    g_QueueDepth = 0;
+    RtlZeroMemory(g_PreemptSlots, sizeof(g_PreemptSlots));
     st = PsCreateSystemThread(&th, THREAD_ALL_ACCESS, NULL, NULL, NULL, EngThread, NULL);
     if (!NT_SUCCESS(st)) {
         return st;
@@ -242,16 +288,24 @@ VOID EngStop(VOID)
     if (g_Thread == NULL) {
         return;
     }
+    InterlockedExchange(&g_AbortStall, 1);
     KeSetEvent(&g_Stop, IO_NO_INCREMENT, FALSE);
     KeWaitForSingleObject(g_Thread, Executive, KernelMode, FALSE, NULL);
     ObDereferenceObject(g_Thread);
     g_Thread = NULL;
     while (!IsListEmpty(&g_Queue)) {
-        ExFreePoolWithTag(CONTAINING_RECORD(RemoveHeadList(&g_Queue), ENG_ITEM, Link), S23GPU_POOL_TAG);
+        ENG_ITEM *it = CONTAINING_RECORD(RemoveHeadList(&g_Queue), ENG_ITEM, Link);
+        if (it->IsStatic) {
+            it->IsStatic = FALSE;
+        } else {
+            ExFreePoolWithTag(it, S23GPU_POOL_TAG);
+        }
     }
+    g_QueueDepth = 0;
+    g_AbortStall = 0;
 }
 
-NTSTATUS EngSubmit(const VOID *Cmds, ULONG Bytes, ULONG Fence)
+NTSTATUS EngSubmit(const VOID *Cmds, ULONG Bytes, ULONG Fence, BOOLEAN IsPaging)
 {
     ENG_ITEM *it;
     KIRQL irql;
@@ -267,11 +321,66 @@ NTSTATUS EngSubmit(const VOID *Cmds, ULONG Bytes, ULONG Fence)
     }
     it->Fence = Fence;
     it->Bytes = Bytes;
+    it->IsPaging = IsPaging;
+    it->IsPreempt = FALSE;
+    it->IsStatic = FALSE;
     if (Bytes != 0u && Cmds != NULL) {
         RtlCopyMemory(it->Cmds, Cmds, Bytes);
     }
+    if (IsPaging) {
+        InterlockedExchange(&g_AbortStall, 1);
+    }
     KeAcquireSpinLock(&g_QueueLock, &irql);
     InsertTailList(&g_Queue, &it->Link);
+    InterlockedIncrement(&g_QueueDepth);
+    KeReleaseSpinLock(&g_QueueLock, irql);
+    KeSetEvent(&g_Kick, IO_NO_INCREMENT, FALSE);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS EngPreempt(ULONG PreemptFence)
+{
+    ENG_ITEM *it = NULL;
+    KIRQL irql;
+    ULONG i;
+
+    if (g_Thread == NULL) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+    InterlockedExchange(&g_AbortStall, 1);
+    KeAcquireSpinLock(&g_QueueLock, &irql);
+    for (i = 0; i < RTL_NUMBER_OF(g_PreemptSlots); i++) {
+        if (!g_PreemptSlots[i].IsStatic) {
+            it = &g_PreemptSlots[i];
+            it->IsStatic = TRUE;
+            break;
+        }
+    }
+    if (it != NULL) {
+        it->Fence = PreemptFence;
+        it->Bytes = 0;
+        it->IsPaging = TRUE;
+        it->IsPreempt = TRUE;
+        InsertTailList(&g_Queue, &it->Link);
+        InterlockedIncrement(&g_QueueDepth);
+        KeReleaseSpinLock(&g_QueueLock, irql);
+        KeSetEvent(&g_Kick, IO_NO_INCREMENT, FALSE);
+        return STATUS_SUCCESS;
+    }
+    KeReleaseSpinLock(&g_QueueLock, irql);
+
+    it = (ENG_ITEM *)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*it), S23GPU_POOL_TAG);
+    if (it == NULL) {
+        return STATUS_NO_MEMORY;
+    }
+    it->Fence = PreemptFence;
+    it->Bytes = 0;
+    it->IsPaging = TRUE;
+    it->IsPreempt = TRUE;
+    it->IsStatic = FALSE;
+    KeAcquireSpinLock(&g_QueueLock, &irql);
+    InsertTailList(&g_Queue, &it->Link);
+    InterlockedIncrement(&g_QueueDepth);
     KeReleaseSpinLock(&g_QueueLock, irql);
     KeSetEvent(&g_Kick, IO_NO_INCREMENT, FALSE);
     return STATUS_SUCCESS;

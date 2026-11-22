@@ -50,14 +50,33 @@ if ($remoteUmdOut -notmatch $localUmdMd5) {
     Invoke-S23Link put (Join-Path $pkgDir 's23gpu_umd.dll') 'C:\s23gpu\s23gpu_umd.dll'
 }
 
-Write-Host '=== Configuring Adreno 740 UMD fast scissor & present defaults ==='
-Invoke-S23PS @'
-New-Item -ItemType Directory -Force -Path 'C:\ProgramData\topaz' | Out-Null
+Write-Host '=== Configuring Adreno 740 UMD DWM-only & 2x2 quad scissor defaults ==='
+Invoke-S23PS @"
+New-Item -ItemType Directory -Force -Path 'C:\topaz','C:\ProgramData\topaz' | Out-Null
 Remove-Item 'C:\ProgramData\topaz\umd.log.enable','C:\ProgramData\topaz\umd-*.log' -Force -ErrorAction SilentlyContinue
-Set-Content -Path 'C:\ProgramData\topaz\umd.env' -Value "TOPAZ_SCFIX=0`r`nTOPAZ_NOPRESENTWAIT=1`r`n" -Encoding ascii
-[Environment]::SetEnvironmentVariable('TOPAZ_SCFIX', '0', 'Machine')
-[Environment]::SetEnvironmentVariable('TOPAZ_NOPRESENTWAIT', '1', 'Machine')
-'@
+Set-Content -Path 'C:\topaz\umd.dwmonly' -Value '1' -Encoding ascii
+Set-Content -Path 'C:\ProgramData\topaz\umd.env' -Value "FD_MESA_DEBUG=sysmem`r`nTOPAZ_SCFIX=1`r`nTOPAZ_STRIPS=0`r`nTOPAZ_NOPRESENTWAIT=0`r`nTOPAZ_UPDFLUSH=0`r`nTOPAZ_UPDSYNC=1`r`nTOPAZ_SVSWZ=1`r`nTOPAZ_SVINFO=1`r`nTOPAZ_DEMOTE=1`r`n" -Encoding ascii
+[Environment]::SetEnvironmentVariable('TOPAZ_SCFIX', `$null, 'Machine')
+[Environment]::SetEnvironmentVariable('TOPAZ_NOPRESENTWAIT', `$null, 'Machine')
+if (Test-Path 'C:\Windows\System32\s23gpu_umd.dll') {
+    `$curUmd = (Get-FileHash 'C:\Windows\System32\s23gpu_umd.dll' -Algorithm MD5).Hash
+    if (`$curUmd -ne '$localUmdMd5') {
+        Get-ChildItem 'C:\Windows\System32\s23gpu_umd.dll.old*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        `$bak = "C:\Windows\System32\s23gpu_umd.dll.old." + [Guid]::NewGuid().ToString('N').Substring(0, 8)
+        Move-Item 'C:\Windows\System32\s23gpu_umd.dll' `$bak -Force
+        Copy-Item 'C:\s23gpu\s23gpu_umd.dll' 'C:\Windows\System32\s23gpu_umd.dll' -Force
+    }
+}
+if (Test-Path 'C:\Windows\System32\drivers\s23gpu.sys') {
+    `$curSys = (Get-FileHash 'C:\Windows\System32\drivers\s23gpu.sys' -Algorithm MD5).Hash
+    if (`$curSys -ne '$localSysMd5') {
+        Get-ChildItem 'C:\Windows\System32\drivers\s23gpu.sys.old*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        `$sbak = "C:\Windows\System32\drivers\s23gpu.sys.old." + [Guid]::NewGuid().ToString('N').Substring(0, 8)
+        Move-Item 'C:\Windows\System32\drivers\s23gpu.sys' `$sbak -Force -ErrorAction SilentlyContinue
+        Copy-Item 'C:\s23gpu\s23gpu.sys' 'C:\Windows\System32\drivers\s23gpu.sys' -Force
+    }
+}
+"@
 
 Write-Host '=== Installing driver ==='
 Invoke-S23Link exec -t 60 'C:\s23gpu\s23gpu_install.exe C:\s23gpu\s23gpu.inf'
@@ -65,6 +84,15 @@ Invoke-S23Link exec -t 60 'C:\s23gpu\s23gpu_install.exe C:\s23gpu\s23gpu.inf'
 Write-Host '=== Verifying System32 hash & PnP device ==='
 Invoke-S23PS @"
 `$sysMd5 = (Get-FileHash C:\Windows\System32\drivers\s23gpu.sys -Algorithm MD5).Hash
+if (`$sysMd5 -ne '$localSysMd5') {
+    Get-ChildItem 'C:\Windows\System32\drivers\s23gpu.sys.old*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    `$sbak = "C:\Windows\System32\drivers\s23gpu.sys.old." + [Guid]::NewGuid().ToString('N').Substring(0, 8)
+    Move-Item 'C:\Windows\System32\drivers\s23gpu.sys' `$sbak -Force -ErrorAction SilentlyContinue
+    Copy-Item 'C:\s23gpu\s23gpu.sys' 'C:\Windows\System32\drivers\s23gpu.sys' -Force
+    Disable-PnpDevice -InstanceId 'ROOT\DISPLAY\0000' -Confirm:`$false
+    Enable-PnpDevice -InstanceId 'ROOT\DISPLAY\0000' -Confirm:`$false
+    `$sysMd5 = (Get-FileHash C:\Windows\System32\drivers\s23gpu.sys -Algorithm MD5).Hash
+}
 `$d = Get-PnpDevice -InstanceId 'ROOT\DISPLAY\0000'
 `$p = Get-PnpDeviceProperty -InstanceId 'ROOT\DISPLAY\0000' -KeyName 'DEVPKEY_Device_ProblemCode'
 Write-Output ("SYS_MD5=" + `$sysMd5 + " (expected $localSysMd5)")

@@ -578,15 +578,11 @@ NTSTATUS MsmEscape(struct topazgpu_escape *E, PVOID Owner)
     case DRM_COMMAND_BASE + DRM_MSM_WAIT_FENCE: {
         const struct drm_msm_wait_fence *w = (const struct drm_msm_wait_fence *)d;
         ULONG waitMs = ComputeWaitMs(&w->timeout);
-        if (waitMs == 0u) {
-            st = ((LONG)(HwCompletedFence() - w->fence) >= 0) ? STATUS_SUCCESS : STATUS_TIMEOUT;
-        } else {
-            ULONG f = w->fence;
-            KeReleaseMutex(&g_BoLock, FALSE);
-            st = HwWaitFenceEx(f, waitMs, waitMs >= 5000u) ? STATUS_SUCCESS
-                 : (HwWedged() ? STATUS_DEVICE_HARDWARE_ERROR : STATUS_TIMEOUT);
-            KeWaitForSingleObject(&g_BoLock, Executive, KernelMode, FALSE, NULL);
-        }
+        ULONG f = w->fence;
+        KeReleaseMutex(&g_BoLock, FALSE);
+        st = HwWaitFenceEx(f, waitMs, waitMs >= 5000u) ? STATUS_SUCCESS
+             : (HwWedged() ? STATUS_DEVICE_HARDWARE_ERROR : STATUS_TIMEOUT);
+        KeWaitForSingleObject(&g_BoLock, Executive, KernelMode, FALSE, NULL);
         break;
     }
     case DRM_COMMAND_BASE + DRM_MSM_SUBMITQUEUE_NEW:

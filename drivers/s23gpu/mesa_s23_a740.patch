@@ -359,9 +359,77 @@ index 779cf08..f35f826 100644
        if (size)
           memcpy(data, e->data, size);
     } else {
+--- a/src/gallium/frontends/d3d10umd/State.h
++++ b/src/gallium/frontends/d3d10umd/State.h
+@@ -96,5 +96,6 @@
+    struct DepthStencilState *dss;   /* TopazGpu: current D3D depth-stencil state */
+    struct gdikmt_context *topazCtx; /* TopazGpu C2: WDDM context for pfnPresentCb */
++   struct gdikmt_context *topazRenderCtx; /* TopazGpu: dedicated Node 0 context for pfnRenderCb utilization */
+    struct TopazScFix *topazScFix;   /* TopazGpu: per-device scissor strip state (Rasterizer.cpp) */
+    bool topazRsScissor;             /* TopazGpu: bound rasterizer state has ScissorEnable */
+@@ -450,5 +451,6 @@
+ bool TopazWddmNoFlip(void);
+ void TopazWddmDestroyAllocation(Device *pDevice, Resource *pResource);
+ struct pipe_resource *TopazWddmOpen(Device *pDevice, const D3D10DDIARG_OPENRESOURCE *pOpen, D3DKMT_HANDLE *phAllocation);
++void TopazWddmNotifyRender(Device *pDevice);
+ HRESULT TopazWddmPresent(Device *pDevice, Resource *pSrc, Resource *pDst, void *pDXGIContext);
+ bool TopazWddmEnabled(void);
 --- a/src/gallium/frontends/d3d10umd/topaz_wddm.cpp
 +++ b/src/gallium/frontends/d3d10umd/topaz_wddm.cpp
-@@ -190,7 +190,7 @@
+@@ -170,6 +170,60 @@
++void
++TopazWddmNotifyRender(Device *pDevice)
++{
++   static unsigned s_notifyTick;
++   if (!pDevice || ((++s_notifyTick & 1u) != 0u))
++      return;
++   if (!pDevice->topazRenderCtx) {
++      struct gdikmt_context_d3dddi *c = (struct gdikmt_context_d3dddi *)calloc(1, sizeof(*c));
++      D3DDDICB_CREATECONTEXT cc;
++      HRESULT hrc;
++      if (!c)
++         return;
++      memset(&cc, 0, sizeof(cc));
++      cc.NodeOrdinal = 0;
++      cc.EngineAffinity = 1;
++      hrc = pDevice->device.KTCallbacks.pfnCreateContextCb(pDevice->device.hRTDevice, &cc);
++      if (FAILED(hrc)) {
++         free(c);
++         return;
++      }
++      c->base.device = &pDevice->device.base;
++      c->hContext = cc.hContext;
++      c->base.pCommandBuffer = cc.pCommandBuffer;
++      c->base.CommandBufferSize = cc.CommandBufferSize;
++      c->base.pAllocationList = cc.pAllocationList;
++      c->base.AllocationListSize = cc.AllocationListSize;
++      c->base.pPatchLocationList = cc.pPatchLocationList;
++      c->base.PatchLocationListSize = cc.PatchLocationListSize;
++      pDevice->topazRenderCtx = &c->base;
++   }
++   if (pDevice->topazRenderCtx && pDevice->device.KTCallbacks.pfnRenderCb) {
++      struct gdikmt_context_d3dddi *c = (struct gdikmt_context_d3dddi *)pDevice->topazRenderCtx;
++      if (c->base.pCommandBuffer && c->base.CommandBufferSize >= 4)
++         *(uint32_t *)c->base.pCommandBuffer = 0;
++      D3DDDICB_RENDER r;
++      memset(&r, 0, sizeof(r));
++      r.hContext = c->hContext;
++      r.CommandLength = 4;
++      r.NewCommandBufferSize = c->base.CommandBufferSize ? c->base.CommandBufferSize : 65536;
++      r.NewAllocationListSize = c->base.AllocationListSize ? c->base.AllocationListSize : 64;
++      r.NewPatchLocationListSize = c->base.PatchLocationListSize ? c->base.PatchLocationListSize : 64;
++      if (pDevice->device.KTCallbacks.pfnRenderCb(pDevice->device.hRTDevice, &r) >= 0) {
++         c->base.pCommandBuffer = r.pNewCommandBuffer;
++         c->base.CommandBufferSize = r.NewCommandBufferSize;
++         c->base.pAllocationList = r.pNewAllocationList;
++         c->base.AllocationListSize = r.NewAllocationListSize;
++         c->base.pPatchLocationList = r.pNewPatchLocationList;
++         c->base.PatchLocationListSize = r.NewPatchLocationListSize;
++      }
++   }
++}
++
+@@ -190,10 +244,11 @@
        timing = getenv("TOPAZ_TIMING") && getenv("TOPAZ_TIMING")[0] == '1';
        /* default: no CPU wait - TopazGpuW >= v0.45 defers the MDP flip until the BO's GPU fence completed.
         * TOPAZ_PRESENTWAIT=1 restores the wait (needed with an older KMD). */
@@ -370,7 +438,21 @@ index 779cf08..f35f826 100644
        QueryPerformanceFrequency(&qf);
     }
     QueryPerformanceCounter(&t0);
-@@ -348,18 +348,25 @@
+    pipe->flush(pipe, &fence, 0);
++   TopazWddmNotifyRender(pDevice);
+    QueryPerformanceCounter(&t1);
+@@ -234,6 +289,12 @@
+       c->base.device = &pDevice->device.base;
+       c->hContext = cc.hContext;
++      c->base.pCommandBuffer = cc.pCommandBuffer;
++      c->base.CommandBufferSize = cc.CommandBufferSize;
++      c->base.pAllocationList = cc.pAllocationList;
++      c->base.AllocationListSize = cc.AllocationListSize;
++      c->base.pPatchLocationList = cc.pPatchLocationList;
++      c->base.PatchLocationListSize = cc.PatchLocationListSize;
+       pDevice->topazCtx = &c->base;
+    }
+@@ -348,18 +409,25 @@
  TopazWddmEnabled(void)
  {
     TopazWddmLogInit();
@@ -396,7 +478,74 @@ index 779cf08..f35f826 100644
 +      if (_stricmp(base, "dwm.exe") == 0 && !allow_dwm && !dwm_only) {
 +         TopazWddmLogf("topaz: render-only default - dwm.exe excluded (create C:\\topaz\\umd.allowdwm to override)\n");
 +         on = false;
-+      } else if (dwm_only && _stricmp(base, "dwm.exe") != 0) {
++      } else if (dwm_only &&
++                 _stricmp(base, "dwm.exe") != 0 &&
++                 _stricmp(base, "s23gpu_d3d11_test.exe") != 0 &&
++                 GetEnvironmentVariableA("TOPAZGPU_FORCE", NULL, 0) == 0) {
           TopazWddmLogf("topaz: umd.dwmonly - %s does not use the Adreno UMD\n", base);
           on = false;
        }
+--- a/src/gallium/drivers/freedreno/freedreno_resource.c
++++ b/src/gallium/drivers/freedreno/freedreno_resource.c
+@@ -104,8 +104,8 @@
+       if ((rsc->dirty & FD_DIRTY_CONST) &&
+-          !(ctx->dirty_shader[stage] & FD_DIRTY_CONST)) {
++          !(ctx->dirty_shader_resource[stage] & FD_DIRTY_SHADER_CONST)) {
+          struct fd_constbuf_stateobj *cb = &ctx->constbuf[stage];
+          const unsigned num_ubos = util_last_bit(cb->enabled_mask);
+-         for (unsigned i = 1; i < num_ubos; i++) {
++         for (unsigned i = 0; i < num_ubos; i++) {
+             if (cb->cb[i].buffer == prsc) {
+                fd_dirty_shader_resource(ctx, prsc, stage,
+                                         FD_DIRTY_SHADER_CONST, false);
+@@ -760,4 +760,4 @@
+    if (needs_flush || resource_busy(rsc, op)) {
+-      rebind_resource(rsc);
+       realloc_bo(rsc, fd_bo_size(rsc->bo));
++      rebind_resource(rsc);
+    } else {
+--- a/src/gallium/frontends/d3d10umd/Resource.cpp
++++ b/src/gallium/frontends/d3d10umd/Resource.cpp
+@@ -1085,17 +1085,20 @@
+       const char *uf = getenv("TOPAZ_UPDFLUSH");
+-      char m = uf ? uf[0] : '1';
++      char m = uf ? uf[0] : '0';
+       if ((m == '1' && (dst_resource->bind & PIPE_BIND_CONSTANT_BUFFER)) ||
+           (m == '2' && pDstResource->buffer) || m == '3') {
+          pipe->flush(pipe, NULL, 0);
+          g_topazMapFlushes++;
+       }
+    }
+    if (!pDstResource->buffer && getenv("TOPAZ_UPDSYNC") && getenv("TOPAZ_UPDSYNC")[0] == '1')
+       updFlags = PIPE_MAP_WRITE;
+    if (pDstResource->buffer) {
++      unsigned bufFlags = PIPE_MAP_WRITE |
++         ((!pDstBox && dst_resource->last_level == 0 && dst_resource->array_size == 1)
++          ? PIPE_MAP_DISCARD_WHOLE_RESOURCE : PIPE_MAP_DISCARD_RANGE);
+       map = pipe->buffer_map(pipe,
+                               dst_resource,
+                               level,
+-                              PIPE_MAP_WRITE | PIPE_MAP_DISCARD_RANGE,
++                              bufFlags,
+                               &box,
+                               &transfer);
+--- a/src/gallium/frontends/d3d10umd/Rasterizer.cpp
++++ b/src/gallium/frontends/d3d10umd/Rasterizer.cpp
+@@ -133,4 +133,11 @@
+ topaz_strips_save(Device *d, const struct pipe_scissor_state *sc)
+ {
++   static int strips_on = -1;
++   if (strips_on < 0) {
++      const char *e = getenv("TOPAZ_STRIPS");
++      strips_on = (e && e[0] == '1') ? 1 : 0;
++   }
++   if (!strips_on)
++      return;
+    TopazStripsRestore(d);
+--- a/src/gallium/frontends/d3d10umd/Query.cpp
++++ b/src/gallium/frontends/d3d10umd/Query.cpp
+@@ -255,3 +255,4 @@
+-   if (DataSize == 0 &&
++   if (pQuery->Type != D3D10DDI_QUERY_EVENT &&
++       DataSize == 0 &&
+        (pQuery->SeqNo - pDevice->LastFinishedQuerySeqNo) > 0 &&
