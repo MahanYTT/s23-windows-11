@@ -6,7 +6,8 @@
  *         MAX77705 Charger    (@0x69, 8-bit)
  *
  * Pure WDM Battery Miniclass Driver (imports ntoskrnl.exe, battc.sys, wmilib.sys).
- * Strictly READ-ONLY I2C access to @0x36 and @0x69.
+ * MAX77705 Fast Charge Auto-Configuration (unlocked CNFG_06, 3000 mA CHGIN, 2500 mA CC, 4400 mV float, WDT disabled)
+ * + Fuel Gauge telemetry via QUPv3_I2C_HUB SE8 / gpio206/207.
  * Built with clang-18 --target=aarch64-pc-windows-msvc + lld-link.
  */
 
@@ -659,6 +660,79 @@ static int I2cRegRead16LE(volatile uint8_t *tlmm, uint32_t sda, uint32_t scl, ui
     return -1;
 }
 
+static int I2cRegWrite8(volatile uint8_t *tlmm, uint32_t sda, uint32_t scl, uint8_t addr7, uint8_t reg, uint8_t val) {
+    for (int tries = 0; tries < 3; tries++) {
+        I2cStart(tlmm, sda, scl);
+        if (!I2cWriteByte(tlmm, sda, scl, (uint8_t)(addr7 << 1))) { I2cStop(tlmm, sda, scl); KeStallExecutionProcessor(50); continue; }
+        if (!I2cWriteByte(tlmm, sda, scl, reg))                   { I2cStop(tlmm, sda, scl); KeStallExecutionProcessor(50); continue; }
+        if (!I2cWriteByte(tlmm, sda, scl, val))                   { I2cStop(tlmm, sda, scl); KeStallExecutionProcessor(50); continue; }
+        I2cStop(tlmm, sda, scl);
+        return 0;
+    }
+    return -1;
+}
+
+static void S23BattConfigureFastCharge(volatile uint8_t *tlmm, uint32_t sda, uint32_t scl, BOOLEAN onLine, uint8_t chgDtls01) {
+    if (!onLine) return;
+
+    /* Always kick the watchdog timer (CNFG_06 bit 0) and ensure write protection is unlocked (bits 3:2 = 0x03) */
+    (void)I2cRegWrite8(tlmm, sda, scl, MAX77705_CHG_ADDR, 0xBDu, 0x6Du);
+
+    uint8_t c00 = 0, c02 = 0, c06 = 0, c09 = 0, c12 = 0;
+    (void)I2cRegRead8(tlmm, sda, scl, MAX77705_CHG_ADDR, 0xB7u, &c00);
+    (void)I2cRegRead8(tlmm, sda, scl, MAX77705_CHG_ADDR, 0xB9u, &c02);
+    (void)I2cRegRead8(tlmm, sda, scl, MAX77705_CHG_ADDR, 0xBDu, &c06);
+    (void)I2cRegRead8(tlmm, sda, scl, MAX77705_CHG_ADDR, 0xC0u, &c09);
+    (void)I2cRegRead8(tlmm, sda, scl, MAX77705_CHG_ADDR, 0xC3u, &c12);
+
+    BOOLEAN abnormalOff = ((chgDtls01 & 0x0Fu) == 0x08u) || ((chgDtls01 & 0x0Fu) == 0x0Bu);
+    uint8_t chgprot = (c06 & 0x0Cu) >> 2;
+
+    if (abnormalOff || chgprot != 0x03u || c09 != 0xF7u || c02 != 0x32u || (c00 & 0x0Fu) != 0x05u || (c12 & 0x68u) != 0x68u) {
+        /* 1. Unlock charger write protection & kick WDT:
+         *    CNFG_06 (0xBD) CHGPROT=0x03 (0x0C), slowest LX slope (0x60), kick WDT (0x01) -> 0x6D */
+        (void)I2cRegWrite8(tlmm, sda, scl, MAX77705_CHG_ADDR, 0xBDu, 0x6Du);
+        KeStallExecutionProcessor(20000); /* 20 ms delay for unlock state machine */
+
+        /* 2. Select wired charging input (CHGINSEL=0x20, WCINSEL=0x40, VCHGIN=4.6V 0x08 -> 0x68):
+         *    CNFG_12 (0xC3) = 0x68 */
+        (void)I2cRegWrite8(tlmm, sda, scl, MAX77705_CHG_ADDR, 0xC3u, 0x68u);
+
+        /* 3. Toggle Charger OFF -> ON to clear 0x08 abnormal state:
+         *    CNFG_00 (0xB7) = 0x04 (Buck ON, Charger OFF, WDT disabled) */
+        (void)I2cRegWrite8(tlmm, sda, scl, MAX77705_CHG_ADDR, 0xB7u, 0x04u);
+        KeStallExecutionProcessor(20000); /* 20 ms delay */
+
+        /* 4. Set CNFG_04 (0xBB) = 0x18: Float voltage 4400 mV (4.40V, standard S23 spec) */
+        (void)I2cRegWrite8(tlmm, sda, scl, MAX77705_CHG_ADDR, 0xBBu, 0x18u);
+
+        /* 5. Set CNFG_01 (0xB8) = 0x38: Timer disabled, restart disabled, recycle enabled */
+        (void)I2cRegWrite8(tlmm, sda, scl, MAX77705_CHG_ADDR, 0xB8u, 0x38u);
+
+        /* 6. Set CNFG_02 (0xB9) = 0x32: Fast charge current 2500 mA (50 mA per step -> 50 = 0x32) */
+        (void)I2cRegWrite8(tlmm, sda, scl, MAX77705_CHG_ADDR, 0xB9u, 0x32u);
+
+        /* 7. Set CNFG_09 (0xC0) = 0xF7: CHGIN Input Current Limit 3000 mA (0x77) | CHG_EN (0x80) */
+        (void)I2cRegWrite8(tlmm, sda, scl, MAX77705_CHG_ADDR, 0xC0u, 0xF7u);
+
+        /* 8. Set CNFG_10 (0xC1) = 0x3F: WCIN Wireless Input Current Limit 1600 mA */
+        (void)I2cRegWrite8(tlmm, sda, scl, MAX77705_CHG_ADDR, 0xC1u, 0x3Fu);
+
+        /* 9. Set CNFG_00 (0xB7) = 0x05: Buck ON, Charger ON (WDT disabled) */
+        (void)I2cRegWrite8(tlmm, sda, scl, MAX77705_CHG_ADDR, 0xB7u, 0x05u);
+        KeStallExecutionProcessor(20000); /* 20 ms delay */
+
+        uint8_t p00 = 0, p02 = 0, p06 = 0, p09 = 0, p12 = 0;
+        (void)I2cRegRead8(tlmm, sda, scl, MAX77705_CHG_ADDR, 0xB7u, &p00);
+        (void)I2cRegRead8(tlmm, sda, scl, MAX77705_CHG_ADDR, 0xB9u, &p02);
+        (void)I2cRegRead8(tlmm, sda, scl, MAX77705_CHG_ADDR, 0xBDu, &p06);
+        (void)I2cRegRead8(tlmm, sda, scl, MAX77705_CHG_ADDR, 0xC0u, &p09);
+        (void)I2cRegRead8(tlmm, sda, scl, MAX77705_CHG_ADDR, 0xC3u, &p12);
+        S23LogHex4("MAX77705 CHG Pre-Fast  (B7, B9, C0, C3)", c00, c02, c09, c12);
+        S23LogHex4("MAX77705 CHG Post-Fast (B7, B9, C0, C3)", p00, p02, p09, p12);
+    }
+}
+
 /* =========================================================================
  * Device Extension & Battery State
  * ========================================================================= */
@@ -678,6 +752,48 @@ typedef struct _S23_BATT_STATE {
     LONG      AvgCurrentMa;
     ULONGLONG Seq;
 } S23_BATT_STATE;
+
+static void S23BattDumpStatus(const S23_BATT_STATE *s, uint8_t b2, uint8_t b3, uint8_t b4,
+                              uint8_t c00, uint8_t c02, uint8_t c06, uint8_t c09, uint8_t c12) {
+    char buf[512]; size_t p = 0;
+    AppendStr(buf, &p, sizeof(buf)-2, "BATT: soc=");
+    AppendSigned(buf, &p, sizeof(buf)-2, (int32_t)(s->SocX100 / 100u));
+    AppendStr(buf, &p, sizeof(buf)-2, ".");
+    AppendSigned(buf, &p, sizeof(buf)-2, (int32_t)((s->SocX100 % 100u) / 10u));
+    AppendStr(buf, &p, sizeof(buf)-2, "% v=");
+    AppendSigned(buf, &p, sizeof(buf)-2, (int32_t)s->VoltageMv);
+    AppendStr(buf, &p, sizeof(buf)-2, "mV i=");
+    AppendSigned(buf, &p, sizeof(buf)-2, s->CurrentMa);
+    AppendStr(buf, &p, sizeof(buf)-2, "mA rate=");
+    AppendSigned(buf, &p, sizeof(buf)-2, s->RateMw);
+    AppendStr(buf, &p, sizeof(buf)-2, "mW pwr=0x");
+    AppendHex(buf, &p, sizeof(buf)-2, s->PowerState, 2);
+    AppendStr(buf, &p, sizeof(buf)-2, " B2=");
+    AppendHex(buf, &p, sizeof(buf)-2, b2, 2);
+    AppendStr(buf, &p, sizeof(buf)-2, " B3=");
+    AppendHex(buf, &p, sizeof(buf)-2, b3, 2);
+    AppendStr(buf, &p, sizeof(buf)-2, " DTLS01=");
+    AppendHex(buf, &p, sizeof(buf)-2, b4, 2);
+    AppendStr(buf, &p, sizeof(buf)-2, " CNFG(00,02,06,09,12)=");
+    AppendHex(buf, &p, sizeof(buf)-2, c00, 2); AppendStr(buf, &p, sizeof(buf)-2, " ");
+    AppendHex(buf, &p, sizeof(buf)-2, c02, 2); AppendStr(buf, &p, sizeof(buf)-2, " ");
+    AppendHex(buf, &p, sizeof(buf)-2, c06, 2); AppendStr(buf, &p, sizeof(buf)-2, " ");
+    AppendHex(buf, &p, sizeof(buf)-2, c09, 2); AppendStr(buf, &p, sizeof(buf)-2, " ");
+    AppendHex(buf, &p, sizeof(buf)-2, c12, 2);
+    buf[p++] = '\r'; buf[p++] = '\n';
+
+    static const WCHAR pathBuf[] = L"\\??\\C:\\Users\\Public\\s23batt_status.txt";
+    UNICODE_STRING us; OBJECT_ATTRIBUTES oa; IO_STATUS_BLOCK iosb; LARGE_INTEGER off; HANDLE h = NULL;
+    off.QuadPart = 0;
+    RtlInitUnicodeString(&us, pathBuf);
+    MemZero(&oa, sizeof(oa)); oa.Length = sizeof(oa); oa.ObjectName = &us; oa.Attributes = OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE;
+    NTSTATUS st = ZwCreateFile(&h, FILE_WRITE_DATA | SYNCHRONIZE, &oa, &iosb, NULL, FILE_ATTRIBUTE_NORMAL,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN_IF, FILE_SYNCHRONOUS_IO_NONALERT | FILE_WRITE_THROUGH, NULL, 0);
+    if (NT_SUCCESS(st) && h) {
+        ZwWriteFile(h, NULL, NULL, NULL, &iosb, (PVOID)buf, (ULONG)p, &off, NULL);
+        ZwClose(h);
+    }
+}
 
 typedef struct _S23BATT_EXT {
     PDEVICE_OBJECT   Fdo;
@@ -775,6 +891,17 @@ static int S23BattReadHardware(PS23BATT_EXT ext, S23_BATT_STATE *out, BOOLEAN lo
     rc |= I2cRegRead8   (tlmm, TLMM_GPIO206, TLMM_GPIO207, MAX77705_CHG_ADDR, 0xB3u, &chgB3);
     rc |= I2cRegRead8   (tlmm, TLMM_GPIO206, TLMM_GPIO207, MAX77705_CHG_ADDR, 0xB4u, &chgB4);
 
+    BOOLEAN onLineNow = (chgB2 & 0x60u) != 0u;
+    if (onLineNow) {
+        S23BattConfigureFastCharge(tlmm, TLMM_GPIO206, TLMM_GPIO207, onLineNow, chgB4);
+    }
+    uint8_t c00 = 0, c02 = 0, c06 = 0, c09 = 0, c12 = 0;
+    (void)I2cRegRead8(tlmm, TLMM_GPIO206, TLMM_GPIO207, MAX77705_CHG_ADDR, 0xB7u, &c00);
+    (void)I2cRegRead8(tlmm, TLMM_GPIO206, TLMM_GPIO207, MAX77705_CHG_ADDR, 0xB9u, &c02);
+    (void)I2cRegRead8(tlmm, TLMM_GPIO206, TLMM_GPIO207, MAX77705_CHG_ADDR, 0xBDu, &c06);
+    (void)I2cRegRead8(tlmm, TLMM_GPIO206, TLMM_GPIO207, MAX77705_CHG_ADDR, 0xC0u, &c09);
+    (void)I2cRegRead8(tlmm, TLMM_GPIO206, TLMM_GPIO207, MAX77705_CHG_ADDR, 0xC3u, &c12);
+
     Wr32(tlmm, TLMM_GPIO206, orig206);
     Wr32(tlmm, TLMM_GPIO207, orig207);
     seq = ++ext->NextSampleSeq;
@@ -859,6 +986,8 @@ static int S23BattReadHardware(PS23BATT_EXT ext, S23_BATT_STATE *out, BOOLEAN lo
     out->CurrentMa         = currMa;
     out->AvgCurrentMa      = avgCurrMa;
     out->Seq               = seq;
+
+    S23BattDumpStatus(out, chgB2, chgB3, chgB4, c00, c02, c06, c09, c12);
 
     if (logRaw) {
         char buf[256]; size_t p = 0;
@@ -1510,7 +1639,7 @@ volatile ULONG gRelocTouch = 1u;
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
     (void)RegistryPath;
-    S23LogStr("=== s23batt.sys v1.0.0.1 DriverEntry ===");
+    S23LogStr("=== s23batt.sys v1.0.0.2 DriverEntry ===");
     S23LogHex4("RelocCheck", (uint32_t)((uintptr_t)gRelocAnchors[0] & 0xFFFFFFFFu),
                (uint32_t)((uintptr_t)gRelocAnchors[1] & 0xFFFFFFFFu), gRelocTouch, 0);
 

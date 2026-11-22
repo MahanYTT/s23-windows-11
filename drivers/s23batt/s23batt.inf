@@ -4,7 +4,7 @@ Signature   = "$WINDOWS NT$"
 Class       = Battery
 ClassGuid   = {72631e54-78a4-11d0-bcf7-00aa00b7b32a}
 Provider    = %ProviderName%
-DriverVer   = 01/15/2024,1.0.0.1
+DriverVer   = 11/22/2026,1.0.0.2
 CatalogFile = s23batt.cat
 PnpLockdown = 1
 

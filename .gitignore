@@ -1,4 +1,5 @@
 # OS, scratch & Python artifacts
+.vs/
 GPU_FIRMWARE_PROMPT.md
 nul
 parf

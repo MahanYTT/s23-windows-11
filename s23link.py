@@ -270,7 +270,7 @@ class TcpTransport:
 class Link:
     def __init__(self, tcp=None, wait=0, usbdk=None):
         if usbdk is None:
-            usbdk = not os.environ.get('RM9_WINUSB')      # WinUSB cannot start on this device (0xC0000182): UsbDk is the default
+            usbdk = bool(os.environ.get('RM9_USBDK')) and not os.environ.get('RM9_WINUSB')
         end = time.time() + wait
         while True:
             try:
@@ -280,7 +280,10 @@ class Link:
                     try:
                         self.t = TcpTransport(DAEMON_PORT)       # `rm9link.py serve` keeps the USB redirect open (every open/close of UsbDk resets the device)
                     except OSError:
-                        self.t = UsbdkTransport() if usbdk else WinUsbTransport()
+                        try:
+                            self.t = UsbdkTransport() if usbdk else WinUsbTransport()
+                        except (FileNotFoundError, OSError):
+                            self.t = WinUsbTransport()
                 break
             except (RemoteError, OSError):
                 if time.time() >= end:
