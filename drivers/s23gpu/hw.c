@@ -1753,26 +1753,39 @@ ULONG HwCompletedFence(VOID)
     return g_MemptrsVa[MEMPTRS_OFF_FENCE_BR];
 }
 
-BOOLEAN HwWaitFence(ULONG Fence, ULONG TimeoutMs)
+BOOLEAN HwWaitFenceEx(ULONG Fence, ULONG TimeoutMs, BOOLEAN WedgeOnTimeout)
 {
     if (Fence == 0 || (LONG)(HwCompletedFence() - Fence) >= 0) return TRUE;
     for (ULONG us = 0; us < 250u; us += 5u) {
         if ((LONG)(HwCompletedFence() - Fence) >= 0) return TRUE;
         StallUs(5u);
     }
+    if (TimeoutMs == 0) {
+        return (LONG)(HwCompletedFence() - Fence) >= 0;
+    }
     for (ULONG ms = 0; ms < TimeoutMs; ms++) {
         SleepMs(1u);
         if ((LONG)(HwCompletedFence() - Fence) >= 0) return TRUE;
     }
-    g_HwWedged = TRUE;
-    g_FaultCount++;
-    if (g_Kgsl != NULL && g_Smmu != NULL) {
-        LogPrint("hw: WAIT_FENCE(%u) TIMEOUT! done=%u rptr=%x wptr=%x status=%x fault=%x cb0_fsr=%x far=%x:%x\n",
-                 Fence, HwCompletedFence(), KgslR32(0x0806u), KgslR32(0x0807u), KgslR32(0x0210u),
-                 KgslR32(0x0821u), R32(g_Smmu, CB0_OFF + 0x58u),
-                 R32(g_Smmu, CB0_OFF + 0x64u), R32(g_Smmu, CB0_OFF + 0x60u));
+    if (WedgeOnTimeout) {
+        g_HwWedged = TRUE;
+        g_FaultCount++;
+        if (g_HwReady && g_Kgsl != NULL && g_Smmu != NULL) {
+            LogPrint("hw: WAIT_FENCE(%u) TIMEOUT (%ums)! done=%u rptr=%x wptr=%x status=%x int=%x cpint=%x sc5=%x sc6=%x sc7=%x ib1=%x:%x rem=%x fsr=%x far=%x:%x\n",
+                     Fence, TimeoutMs, HwCompletedFence(),
+                     KgslR32(0x0806u), KgslR32(0x0807u), KgslR32(0x0210u), KgslR32(0x0201u),
+                     KgslR32(0x0821u), KgslR32(0x0888u), KgslR32(0x0889u), KgslR32(0x088Au),
+                     KgslR32(0x0929u), KgslR32(0x0928u), KgslR32(0x092Au),
+                     R32(g_Smmu, CB0_OFF + 0x58u),
+                     R32(g_Smmu, CB0_OFF + 0x64u), R32(g_Smmu, CB0_OFF + 0x60u));
+        }
     }
     return FALSE;
+}
+
+BOOLEAN HwWaitFence(ULONG Fence, ULONG TimeoutMs)
+{
+    return HwWaitFenceEx(Fence, TimeoutMs, TRUE);
 }
 
 NTSTATUS HwSubmit(const ULONGLONG *IbIova, const ULONG *IbDwords, ULONG Count, PULONG Fence)

@@ -158,6 +158,11 @@ static NTSTATUS QueryAdapterInfoInner(const DXGKARG_QUERYADAPTERINFO *Q)
         c->SchedulingCaps.PreemptionAware = 1;
         c->GpuEngineTopology.NbAsymetricProcessingNodes = 1;
         c->SupportNonVGA = TRUE;
+        c->PresentationCaps.NoScreenToScreenBlt = 1;
+        c->PresentationCaps.NoOverlapScreenBlt = 1;
+        c->PresentationCaps.AlignmentShift = 2;
+        c->PresentationCaps.MaxTextureWidthShift = 2;
+        c->PresentationCaps.MaxTextureHeightShift = 2;
         return STATUS_SUCCESS;
     }
     case DXGKQAITYPE_QUERYSEGMENT3: {
@@ -170,7 +175,7 @@ static NTSTATUS QueryAdapterInfoInner(const DXGKARG_QUERYADAPTERINFO *Q)
         } else {
             DXGK_SEGMENTDESCRIPTOR3 *d = s->pSegmentDescriptor;
             RtlZeroMemory(&d[0], sizeof(d[0]));
-            s->PagingBufferPrivateDataSize = 16 * sizeof(S23GPU_CMD);
+            s->PagingBufferPrivateDataSize = 4 * sizeof(S23GPU_CMD);
             s->PagingBufferSegmentId = 1;
             s->PagingBufferSize = 16 * PAGE_SIZE;
             d[0].BaseAddress.QuadPart = 0xC0000000;
@@ -266,6 +271,68 @@ static NTSTATUS APIENTRY TgDestroyContext(const HANDLE hContext)
     return STATUS_SUCCESS;
 }
 
+PUCHAR AllocPixels(S23GPU_ALLOCATION *Al)
+{
+    if (Al == NULL) {
+        return NULL;
+    }
+    if (Al->Bo != NULL) {
+        return Al->Bo->KernelVa != NULL ? (PUCHAR)Al->Bo->KernelVa + Al->Desc.bo_offset : NULL;
+    }
+    return (PUCHAR)Al->ApVa;
+}
+
+static VOID AllocUnmapAperture(S23GPU_ALLOCATION *Al)
+{
+    if (Al == NULL || Al->ApVa == NULL) {
+        return;
+    }
+    MmUnmapLockedPages(Al->ApVa, Al->ApMdl);
+    if (Al->ApPartial != NULL) {
+        IoFreeMdl(Al->ApPartial);
+    }
+    Al->ApVa = NULL;
+    Al->ApMdl = NULL;
+    Al->ApPartial = NULL;
+}
+
+static VOID AllocMapAperture(S23GPU_ALLOCATION *Al, PMDL Mdl, ULONG MdlOffset, SIZE_T Pages)
+{
+    PMDL m = Mdl;
+    PVOID va;
+
+    if (Al == NULL || Mdl == NULL || Al->Bo != NULL || Pages == 0u) {
+        return;
+    }
+    AllocUnmapAperture(Al);
+    if (MdlOffset != 0u) {
+        PUCHAR baseVa = (PUCHAR)MmGetMdlVirtualAddress(Mdl) + (SIZE_T)MdlOffset * PAGE_SIZE;
+        m = IoAllocateMdl(baseVa, (ULONG)(Pages * PAGE_SIZE), FALSE, FALSE, NULL);
+        if (m == NULL) {
+            return;
+        }
+        IoBuildPartialMdl(Mdl, m, baseVa, (ULONG)(Pages * PAGE_SIZE));
+        Al->ApPartial = m;
+    }
+    va = MmMapLockedPagesSpecifyCache(m, KernelMode, MmCached, NULL, FALSE,
+                                      NormalPagePriority | MdlMappingNoExecute);
+    if (va == NULL) {
+        if (Al->ApPartial != NULL) {
+            IoFreeMdl(Al->ApPartial);
+            Al->ApPartial = NULL;
+        }
+        return;
+    }
+    Al->ApMdl = m;
+    Al->ApVa = va;
+}
+
+static const struct topazgpu_alloc *FindAllocDesc(const VOID *Priv, UINT Size)
+{
+    const struct topazgpu_alloc *d = (const struct topazgpu_alloc *)Priv;
+    return (d != NULL && Size >= sizeof(*d) && d->magic == TOPAZGPU_ALLOC_MAGIC) ? d : NULL;
+}
+
 static NTSTATUS APIENTRY TgCreateAllocation(const HANDLE hAdapter, DXGKARG_CREATEALLOCATION *A)
 {
     ULONG i;
@@ -273,14 +340,11 @@ static NTSTATUS APIENTRY TgCreateAllocation(const HANDLE hAdapter, DXGKARG_CREAT
     UNREFERENCED_PARAMETER(hAdapter);
     for (i = 0; i < A->NumAllocations; i++) {
         DXGK_ALLOCATIONINFO *ai = &A->pAllocationInfo[i];
-        const struct topazgpu_alloc *d = NULL;
+        const struct topazgpu_alloc *d = FindAllocDesc(ai->pPrivateDriverData, ai->PrivateDriverDataSize);
         S23GPU_ALLOCATION *al;
 
-        if (ai->pPrivateDriverData != NULL && ai->PrivateDriverDataSize >= sizeof(*d)) {
-            const struct topazgpu_alloc *cand = (const struct topazgpu_alloc *)ai->pPrivateDriverData;
-            if (cand->magic == TOPAZGPU_ALLOC_MAGIC) {
-                d = cand;
-            }
+        if (d == NULL) {
+            d = FindAllocDesc(A->pPrivateDriverData, A->PrivateDriverDataSize);
         }
         al = (S23GPU_ALLOCATION *)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*al), S23GPU_POOL_TAG);
         if (al == NULL) {
@@ -333,6 +397,7 @@ static NTSTATUS APIENTRY TgDestroyAllocation(const HANDLE hAdapter, const DXGKAR
     for (i = 0; i < A->NumAllocations; i++) {
         S23GPU_ALLOCATION *al = (S23GPU_ALLOCATION *)A->pAllocationList[i];
         if (al != NULL && InterlockedDecrement(&al->Refs) == 0) {
+            AllocUnmapAperture(al);
             MsmBoRelease(al->Bo);
             ExFreePoolWithTag(al, S23GPU_POOL_TAG);
         }
@@ -434,9 +499,69 @@ static NTSTATUS APIENTRY TgRender(const HANDLE hContext, DXGKARG_RENDER *A)
 
 static NTSTATUS APIENTRY TgPresent(const HANDLE hContext, DXGKARG_PRESENT *A)
 {
+    S23GPU_CMD *c = (S23GPU_CMD *)A->pDmaBufferPrivateData;
+    const DXGK_ALLOCATIONLIST *src = A->pAllocationList ? &A->pAllocationList[DXGK_PRESENT_SOURCE_INDEX] : NULL;
+    const DXGK_ALLOCATIONLIST *dst = A->pAllocationList ? &A->pAllocationList[DXGK_PRESENT_DESTINATION_INDEX] : NULL;
+    ULONG i;
+
     UNREFERENCED_PARAMETER(hContext);
-    UNREFERENCED_PARAMETER(A);
-    return STATUS_NOT_SUPPORTED;
+    if (A->Flags.Flip) {
+        return STATUS_SUCCESS;
+    }
+    if (!A->Flags.Blt && !A->Flags.ColorFill) {
+        return STATUS_SUCCESS;
+    }
+    if (A->DmaSize < 4u || A->DmaBufferPrivateDataSize < sizeof(S23GPU_CMD) || c == NULL || A->pDmaBuffer == NULL) {
+        return STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER;
+    }
+    RtlZeroMemory(c, sizeof(*c));
+    c->Op = S23GPU_CMD_NOP;
+    if (dst != NULL && dst->hDeviceSpecificAllocation != NULL) {
+        c->Op = A->Flags.Blt ? S23GPU_CMD_BLT : S23GPU_CMD_FILL;
+        c->Src = src ? (S23GPU_ALLOCATION *)src->hDeviceSpecificAllocation : NULL;
+        c->Dst = (S23GPU_ALLOCATION *)dst->hDeviceSpecificAllocation;
+        c->SrcRect = A->SrcRect;
+        c->DstRect = A->DstRect;
+        c->Color = A->Color;
+        if (A->SubRectCnt > 0u && A->SubRectCnt <= S23GPU_CMD_MAX_RECTS && A->pDstSubRects != NULL) {
+            c->NumRects = A->SubRectCnt;
+            for (i = 0; i < A->SubRectCnt; i++) {
+                c->Rects[i] = A->pDstSubRects[i];
+            }
+        } else if (A->SubRectCnt > S23GPU_CMD_MAX_RECTS && A->pDstSubRects != NULL) {
+            RECT b = A->pDstSubRects[0];
+            for (i = 1; i < A->SubRectCnt; i++) {
+                if (A->pDstSubRects[i].left < b.left)     b.left = A->pDstSubRects[i].left;
+                if (A->pDstSubRects[i].top < b.top)       b.top = A->pDstSubRects[i].top;
+                if (A->pDstSubRects[i].right > b.right)   b.right = A->pDstSubRects[i].right;
+                if (A->pDstSubRects[i].bottom > b.bottom) b.bottom = A->pDstSubRects[i].bottom;
+            }
+            c->NumRects = 1u;
+            c->Rects[0] = b;
+        }
+        if (c->Op == S23GPU_CMD_BLT && c->Src == NULL) {
+            c->Op = S23GPU_CMD_NOP;
+        }
+    }
+    if (c->Op != S23GPU_CMD_NOP && A->pPatchLocationListOut != NULL && A->PatchLocationListOutSize >= 2u) {
+        D3DDDI_PATCHLOCATIONLIST *pl = A->pPatchLocationListOut;
+        RtlZeroMemory(pl, 2u * sizeof(*pl));
+        pl[0].AllocationIndex = (c->Op == S23GPU_CMD_FILL) ? DXGK_PRESENT_DESTINATION_INDEX : DXGK_PRESENT_SOURCE_INDEX;
+        pl[0].SlotId = 1u;
+        pl[0].DriverId = 1u;
+        if (c->Op == S23GPU_CMD_FILL) {
+            A->pPatchLocationListOut = pl + 1;
+        } else {
+            pl[1].AllocationIndex = DXGK_PRESENT_DESTINATION_INDEX;
+            pl[1].SlotId = 2u;
+            pl[1].DriverId = 2u;
+            A->pPatchLocationListOut = pl + 2;
+        }
+    }
+    *(PULONG)A->pDmaBuffer = c->Op;
+    A->pDmaBuffer = (PUCHAR)A->pDmaBuffer + 4;
+    A->pDmaBufferPrivateData = c + 1;
+    return STATUS_SUCCESS;
 }
 
 static NTSTATUS APIENTRY TgPatch(const HANDLE hAdapter, const DXGKARG_PATCH *A)
@@ -470,8 +595,40 @@ static NTSTATUS APIENTRY TgPreemptCommand(const HANDLE hAdapter, const DXGKARG_P
 
 static NTSTATUS APIENTRY TgBuildPagingBuffer(const HANDLE hAdapter, DXGKARG_BUILDPAGINGBUFFER *A)
 {
+    S23GPU_CMD *c;
+
     UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(A);
+    switch (A->Operation) {
+    case DXGK_OPERATION_MAP_APERTURE_SEGMENT:
+        AllocMapAperture((S23GPU_ALLOCATION *)A->MapApertureSegment.hAllocation,
+                         A->MapApertureSegment.pMdl,
+                         A->MapApertureSegment.MdlOffset,
+                         A->MapApertureSegment.NumberOfPages);
+        break;
+    case DXGK_OPERATION_UNMAP_APERTURE_SEGMENT:
+        AllocUnmapAperture((S23GPU_ALLOCATION *)A->UnmapApertureSegment.hAllocation);
+        break;
+    case DXGK_OPERATION_FILL:
+        if (A->Fill.hAllocation == NULL) {
+            break;
+        }
+        if (A->DmaSize < 4u || A->DmaBufferPrivateDataSize < sizeof(S23GPU_CMD) ||
+            A->pDmaBuffer == NULL || A->pDmaBufferPrivateData == NULL) {
+            return STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER;
+        }
+        c = (S23GPU_CMD *)A->pDmaBufferPrivateData;
+        RtlZeroMemory(c, sizeof(*c));
+        c->Op = S23GPU_CMD_PG_FILL;
+        c->Dst = (S23GPU_ALLOCATION *)A->Fill.hAllocation;
+        c->Bytes = A->Fill.FillSize;
+        c->Color = A->Fill.FillPattern;
+        *(PULONG)A->pDmaBuffer = c->Op;
+        A->pDmaBuffer = (PUCHAR)A->pDmaBuffer + 4;
+        A->pDmaBufferPrivateData = c + 1;
+        break;
+    default:
+        break;
+    }
     return STATUS_SUCCESS;
 }
 

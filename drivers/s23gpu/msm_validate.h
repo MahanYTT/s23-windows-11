@@ -87,7 +87,7 @@ static __inline int MsmValidateSubmitCmd(const struct drm_msm_gem_submit_cmd *c,
     if ((c->type != MSM_SUBMIT_CMD_BUF &&
          c->type != MSM_SUBMIT_CMD_IB_TARGET_BUF &&
          c->type != MSM_SUBMIT_CMD_CTX_RESTORE_BUF) ||
-        c->nr_relocs || c->relocs) {
+        c->nr_relocs != 0u) {
         return -38;
     }
     if (c->pad || c->submit_idx >= nr_bos || !c->size || (c->size & 3u) ||

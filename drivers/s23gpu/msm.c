@@ -19,6 +19,12 @@ static S23GPU_BO *g_BoTable[BO_MAX];
 static ULONG      g_NextHandle = 1;
 static ULONG      g_BoCount = 0;
 static ULONGLONG  g_BoBytes = 0;
+static PVOID      g_LastSubmitOwner = NULL;
+
+VOID MsmResetLastOwner(VOID)
+{
+    g_LastSubmitOwner = NULL;
+}
 
 VOID MsmInit(VOID)
 {
@@ -29,6 +35,7 @@ VOID MsmInit(VOID)
     g_NextHandle = 1;
     g_BoCount = 0;
     g_BoBytes = 0;
+    g_LastSubmitOwner = NULL;
     HwInit();
 }
 
@@ -146,6 +153,9 @@ VOID MsmReleaseOwner(PVOID Owner)
         RemoveEntryList(&o->Link);
         ObDereferenceObject(o->Process);
         ExFreePoolWithTag(o, S23GPU_POOL_TAG);
+    }
+    if (g_LastSubmitOwner == Owner) {
+        g_LastSubmitOwner = NULL;
     }
     if (n != 0) {
         LogPrint("msm: device %p released (%u refs, %u freed, %u BOs / %llu KB left)\n",
@@ -314,6 +324,9 @@ static NTSTATUS Submit(struct drm_msm_gem_submit *A, PVOID Owner)
 
     validation = MsmValidateSubmit(&snapshot, MM_USER_PROBE_ADDRESS, &boBytes, &cmdBytes);
     if (validation != 0) {
+        LogPrint("msm: GEM_SUBMIT validate=%d flags=%x q=%u bos=%u cmds=%u in=%u out=%u\n",
+                 validation, snapshot.flags, snapshot.queueid, snapshot.nr_bos, snapshot.nr_cmds,
+                 snapshot.nr_in_syncobjs, snapshot.nr_out_syncobjs);
         return validation == -38 ? STATUS_NOT_SUPPORTED :
                validation == -14 ? STATUS_ACCESS_VIOLATION : STATUS_INVALID_PARAMETER;
     }
@@ -357,13 +370,17 @@ static NTSTATUS Submit(struct drm_msm_gem_submit *A, PVOID Owner)
         bo = BoGet(bos[cmds[i].submit_idx].handle);
         validation = MsmValidateSubmitCmd(&cmds[i], snapshot.nr_bos, bo->Size, bo->Iova);
         if (validation != 0) {
+            LogPrint("msm: GEM_SUBMIT cmd[%u] invalid val=%d type=%u relocs=%u sz=%u off=%u boSz=%llu\n",
+                     i, validation, cmds[i].type, cmds[i].nr_relocs, cmds[i].size,
+                     cmds[i].submit_offset, (ULONGLONG)bo->Size);
             st = validation == -38 ? STATUS_NOT_SUPPORTED : STATUS_INVALID_PARAMETER;
             goto out;
         }
         if (cmds[i].type == MSM_SUBMIT_CMD_IB_TARGET_BUF) {
             continue;
         }
-        if (cmds[i].type == MSM_SUBMIT_CMD_CTX_RESTORE_BUF && dev != NULL && dev->CtxRestoreDone) {
+        if (cmds[i].type == MSM_SUBMIT_CMD_CTX_RESTORE_BUF &&
+            Owner != NULL && Owner == g_LastSubmitOwner) {
             continue;
         }
         ib[n_ib] = bo->Iova + cmds[i].submit_offset;
@@ -372,16 +389,22 @@ static NTSTATUS Submit(struct drm_msm_gem_submit *A, PVOID Owner)
     }
 
     if (n_ib == 0) {
-        st = STATUS_INVALID_PARAMETER;
+        A->fence = HwCompletedFence();
+        A->fence_fd = -1;
+        st = STATUS_SUCCESS;
         goto out;
     }
-    if (HwWedged() && !HwRecover()) {
-        st = STATUS_DEVICE_HARDWARE_ERROR;
-        goto out;
+    if (HwWedged()) {
+        if (!HwRecover()) {
+            st = STATUS_DEVICE_HARDWARE_ERROR;
+            goto out;
+        }
+        g_LastSubmitOwner = NULL;
     }
 
     st = HwSubmit(ib, dw, n_ib, &fence);
     if (NT_SUCCESS(st)) {
+        g_LastSubmitOwner = Owner;
         if (dev != NULL) {
             dev->CtxRestoreDone = TRUE;
         }
@@ -427,6 +450,42 @@ static NTSTATUS GetParam(struct drm_msm_param *A)
         return STATUS_NOT_SUPPORTED;
     }
     return STATUS_SUCCESS;
+}
+
+static ULONG ComputeWaitMs(const struct drm_msm_timespec *Ts)
+{
+    LARGE_INTEGER freq, now;
+    LONGLONG nowSec, nowNsec, dSec, dNs;
+
+    /* Preserve synchronous wait when caller passes zero-initialized timespec (e.g. s23gpu_test) */
+    if (Ts->tv_sec == 0 && Ts->tv_nsec == 0) {
+        return 5000u;
+    }
+    if (Ts->tv_sec < 0) {
+        return 0u;
+    }
+    freq.QuadPart = 0;
+    now = KeQueryPerformanceCounter(&freq);
+    if (freq.QuadPart <= 0) {
+        return 5000u;
+    }
+    nowSec = now.QuadPart / freq.QuadPart;
+    nowNsec = ((now.QuadPart % freq.QuadPart) * 1000000000LL) / freq.QuadPart;
+    dSec = Ts->tv_sec - nowSec;
+    if (dSec > 10LL) {
+        return 5000u;
+    }
+    if (dSec < -10LL) {
+        return 0u;
+    }
+    dNs = dSec * 1000000000LL + (Ts->tv_nsec - nowNsec);
+    if (dNs <= 0) {
+        return 0u;
+    }
+    {
+        ULONGLONG ms = (ULONGLONG)(dNs + 999999LL) / 1000000ULL;
+        return (ULONG)(ms > 5000ULL ? 5000ULL : ms);
+    }
 }
 
 static int NtStatusToErrno(NTSTATUS St)
@@ -548,11 +607,17 @@ NTSTATUS MsmEscape(struct topazgpu_escape *E, PVOID Owner)
         st = Submit((struct drm_msm_gem_submit *)d, Owner);
         break;
     case DRM_COMMAND_BASE + DRM_MSM_WAIT_FENCE: {
-        ULONG f = ((struct drm_msm_wait_fence *)d)->fence;
-        KeReleaseMutex(&g_BoLock, FALSE);
-        st = HwWaitFence(f, 5000) ? STATUS_SUCCESS
-             : (HwWedged() ? STATUS_DEVICE_HARDWARE_ERROR : STATUS_TIMEOUT);
-        KeWaitForSingleObject(&g_BoLock, Executive, KernelMode, FALSE, NULL);
+        const struct drm_msm_wait_fence *w = (const struct drm_msm_wait_fence *)d;
+        ULONG waitMs = ComputeWaitMs(&w->timeout);
+        if (waitMs == 0u) {
+            st = ((LONG)(HwCompletedFence() - w->fence) >= 0) ? STATUS_SUCCESS : STATUS_TIMEOUT;
+        } else {
+            ULONG f = w->fence;
+            KeReleaseMutex(&g_BoLock, FALSE);
+            st = HwWaitFenceEx(f, waitMs, waitMs >= 5000u) ? STATUS_SUCCESS
+                 : (HwWedged() ? STATUS_DEVICE_HARDWARE_ERROR : STATUS_TIMEOUT);
+            KeWaitForSingleObject(&g_BoLock, Executive, KernelMode, FALSE, NULL);
+        }
         break;
     }
     case DRM_COMMAND_BASE + DRM_MSM_SUBMITQUEUE_NEW:
@@ -628,6 +693,7 @@ VOID MsmCleanup(VOID)
     while (!IsListEmpty(&g_Bos)) {
         BoFree(CONTAINING_RECORD(g_Bos.Flink, S23GPU_BO, Link), TRUE);
     }
+    g_LastSubmitOwner = NULL;
     KeReleaseMutex(&g_BoLock, FALSE);
 }
 

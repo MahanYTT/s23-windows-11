@@ -22,6 +22,11 @@ $thumb    = '05DBD92557F4FC52EF2A5E5955789D8EED637C68'
 New-Item -ItemType Directory -Force -Path $outDir, $pkgDir | Out-Null
 Remove-Item -Force (Join-Path $outDir '*'), (Join-Path $pkgDir '*') -ErrorAction SilentlyContinue
 
+$wslMesaDll = '/home/mahan/mesa_s23/build_d3d10/src/gallium/targets/d3d10umd/libgallium_d3d10.dll'
+$mesaUmd = Join-Path $outDir 'mesa_d3d10_arm64.dll'
+wsl bash -lc "test -f '$wslMesaDll' && cp '$wslMesaDll' '/mnt/c/Users/Mahan/Documents/windows-on-android/s23_dm1q/drivers/s23gpu/out/mesa_d3d10_arm64.dll'" 2>$null
+if ($LASTEXITCODE) { throw "Failed to copy Mesa UMD from WSL ($wslMesaDll)" }
+
 Write-Host '=== Assembling scm_arm64.asm ==='
 & $armasm -o (Join-Path $outDir 'scm_arm64.obj') (Join-Path $dir 'scm_arm64.asm')
 if ($LASTEXITCODE) { throw "armasm64 failed: $LASTEXITCODE" }
@@ -58,8 +63,11 @@ if ($LASTEXITCODE) { throw "cl.exe test failed: $LASTEXITCODE" }
 & $cl /nologo /MT /O2 /W3 @umInc (Join-Path $dir 's23gpu_install.c') "/Fo$outDir\s23gpu_install.obj" /link /MACHINE:ARM64 @umLibPaths setupapi.lib newdev.lib kernel32.lib "/OUT:$outDir\s23gpu_install.exe"
 if ($LASTEXITCODE) { throw "cl.exe install failed: $LASTEXITCODE" }
 
-& $cl /nologo /LD /MT /O2 /W3 /WX @umInc (Join-Path $dir 's23gpu_umd.c') "/Fo$outDir\s23gpu_umd.obj" /link /MACHINE:ARM64 @umLibPaths "/DEF:$(Join-Path $dir 's23gpu_umd.def')" kernel32.lib "/OUT:$outDir\s23gpu_umd.dll"
-if ($LASTEXITCODE) { throw "cl.exe umd failed: $LASTEXITCODE" }
+& $cl /nologo /MT /O2 /W3 @umInc (Join-Path $dir 's23gpu_d3d11_test.c') "/Fo$outDir\s23gpu_d3d11_test.obj" /link /MACHINE:ARM64 @umLibPaths d3d11.lib dxgi.lib dxguid.lib d3dcompiler.lib user32.lib gdi32.lib kernel32.lib "/OUT:$outDir\s23gpu_d3d11_test.exe"
+if ($LASTEXITCODE) { throw "cl.exe d3d11_test failed: $LASTEXITCODE" }
+
+Write-Host "Using Mesa Freedreno UMD: $mesaUmd"
+Copy-Item $mesaUmd (Join-Path $outDir 's23gpu_umd.dll') -Force
 
 Write-Host '=== Packaging & Signing ==='
 Copy-Item $sysOut (Join-Path $pkgDir 's23gpu.sys') -Force
@@ -79,7 +87,7 @@ Write-Host '=== Verifying PE Headers, Imports & Catalog ==='
 & $dumpbin /headers (Join-Path $pkgDir 's23gpu.sys') | Select-String -Pattern 'machine|checksum|subsystem|DLL characteristics'
 & $dumpbin /imports (Join-Path $pkgDir 's23gpu.sys') | Select-String -Pattern '\.sys|\.exe|\.dll'
 
-& $dumpbin /headers (Join-Path $outDir 's23gpu_test.exe') (Join-Path $outDir 's23gpu_install.exe') (Join-Path $pkgDir 's23gpu_umd.dll') | Select-String -Pattern 'machine|Dump of file'
+& $dumpbin /headers (Join-Path $outDir 's23gpu_test.exe') (Join-Path $outDir 's23gpu_install.exe') (Join-Path $outDir 's23gpu_d3d11_test.exe') (Join-Path $pkgDir 's23gpu_umd.dll') | Select-String -Pattern 'machine|Dump of file'
 python (Join-Path $dir '..\s23gpuprobe\verify_pe.py') (Join-Path $pkgDir 's23gpu.sys') 'C:\Users\Mahan\.gemini\antigravity\brain\69c04d84-af7a-419e-9781-d650ca2201d9\scratch\ntoskrnl_phone.exe' 'C:\Users\Mahan\.gemini\antigravity\brain\69c04d84-af7a-419e-9781-d650ca2201d9\scratch\hal.dll'
 if ($LASTEXITCODE) { throw "verify_pe.py failed: $LASTEXITCODE" }
 

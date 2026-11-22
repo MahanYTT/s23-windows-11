@@ -60,6 +60,9 @@ typedef struct _S23GPU_ALLOCATION {
     struct topazgpu_alloc Desc;
     SIZE_T                Size;
     S23GPU_BO            *Bo;
+    PMDL                  ApMdl;
+    PMDL                  ApPartial;
+    PVOID                 ApVa;
 } S23GPU_ALLOCATION;
 
 typedef struct _S23GPU_ADAPTER {
@@ -80,12 +83,20 @@ typedef struct _S23GPU_CONTEXT {
     S23GPU_DEVICE *Device;
 } S23GPU_CONTEXT;
 
-#define S23GPU_CMD_NOP     0
-#define S23GPU_CMD_PG_FILL 3
+#define S23GPU_CMD_NOP       0
+#define S23GPU_CMD_BLT       1
+#define S23GPU_CMD_FILL      2
+#define S23GPU_CMD_PG_FILL   3
+#define S23GPU_CMD_MAX_RECTS 8
 
 typedef struct _S23GPU_CMD {
     ULONG              Op;
+    ULONG              NumRects;
+    S23GPU_ALLOCATION *Src;
     S23GPU_ALLOCATION *Dst;
+    RECT               SrcRect;
+    RECT               DstRect;
+    RECT               Rects[S23GPU_CMD_MAX_RECTS];
     SIZE_T             Bytes;
     ULONG              Color;
 } S23GPU_CMD;
@@ -109,6 +120,7 @@ BOOLEAN   HwRecover(VOID);
 ULONG     HwFaultCount(VOID);
 ULONGLONG HwTimestamp(VOID);
 ULONG     HwCompletedFence(VOID);
+BOOLEAN   HwWaitFenceEx(ULONG Fence, ULONG TimeoutMs, BOOLEAN WedgeOnTimeout);
 BOOLEAN   HwWaitFence(ULONG Fence, ULONG TimeoutMs);
 NTSTATUS  HwSubmit(const ULONGLONG *IbIova, const ULONG *IbDwords, ULONG Count, PULONG Fence);
 
@@ -125,9 +137,12 @@ VOID     MsmInit(VOID);
 VOID     MsmCleanup(VOID);
 NTSTATUS MsmEscape(struct topazgpu_escape *Esc, PVOID Owner);
 VOID     MsmReleaseOwner(PVOID Owner);
-VOID     MsmDumpIova(PCSTR Tag, ULONGLONG Iova, ULONG Before, ULONG After);
+VOID     MsmResetLastOwner(VOID);
 S23GPU_BO *MsmBoAcquire(ULONG Name);
 VOID       MsmBoRelease(S23GPU_BO *Bo);
+
+/* ddi.c */
+PUCHAR AllocPixels(S23GPU_ALLOCATION *Al);
 
 /* eng.c */
 typedef VOID (*S23GPU_FENCE_DONE)(PVOID Ctx, ULONG Fence);

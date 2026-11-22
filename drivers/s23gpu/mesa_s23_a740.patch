@@ -1,0 +1,52 @@
+diff --git a/meson.build b/meson.build
+index 1b1f5b8..a80e371 100644
+--- a/meson.build
++++ b/meson.build
+@@ -783,13 +783,22 @@ if with_gallium_st_nine
+   endif
+ endif
+ 
++# TopazGpu: freedreno on Windows talks to the WDDM KMD through a libdrm shim (src/freedreno/drm/wddm)
++if with_gallium_freedreno and host_machine.system() == 'windows'
++  pre_args += ['-I' + (meson.current_source_dir() / 'src' / 'freedreno' / 'drm' / 'wddm' / 'include'),
++               '-I' + (meson.current_source_dir() / 'src' / 'freedreno' / 'drm' / 'wddm'),
++               (cc.get_argument_syntax() == 'msvc' ? '/FI' : '-include') + (meson.current_source_dir() / 'src' / 'freedreno' / 'drm' / 'wddm' / 'fd_wddm_compat.h'), # G717: -FI is clang-cl-only; plain clang needs -include (clang-cl accepts -include too)
++               '-DFD_WDDM']
++endif
++
+ with_gallium_st_d3d10umd =  get_option('gallium-d3d10umd')
+ if with_gallium_st_d3d10umd
+   if not [
+            with_gallium_swrast,
+            with_gallium_virgl,
++           with_gallium_freedreno,
+          ].contains(true)
+-    error('The d3d10umd state tracker requires gallium softpipe/llvmpipe or virgl.')
++    error('The d3d10umd state tracker requires gallium softpipe/llvmpipe, virgl or freedreno.')
+   endif
+   if with_gallium_softpipe and with_gallium_virgl
+     warning('The d3d10umd state trackes is built with both softpipe/llvmpipe and virgl, only virgl will be used.')
+--- a/src/freedreno/drm/wddm/fd_wddm.c
++++ b/src/freedreno/drm/wddm/fd_wddm.c
+@@ -167,6 +167,10 @@
+    ret = fn(ctx, e, sizeof(*e));
+    if (ret == 0) {
+       ret = e->ret;
++      if (ret == -62)
++         ret = -ETIMEDOUT; /* KMD STATUS_TIMEOUT (-62) -> UCRT ETIMEDOUT (138) */
++      else if (ret == -38)
++         ret = -ENOSYS;    /* KMD STATUS_NOT_SUPPORTED (-38) -> UCRT ENOSYS (40) */
+       if (size)
+          memcpy(data, e->data, size);
+    } else {
+--- a/src/gallium/frontends/d3d10umd/topaz_wddm.cpp
++++ b/src/gallium/frontends/d3d10umd/topaz_wddm.cpp
+@@ -190,7 +190,7 @@
+       timing = getenv("TOPAZ_TIMING") && getenv("TOPAZ_TIMING")[0] == '1';
+       /* default: no CPU wait - TopazGpuW >= v0.45 defers the MDP flip until the BO's GPU fence completed.
+        * TOPAZ_PRESENTWAIT=1 restores the wait (needed with an older KMD). */
+-      nowait = !(getenv("TOPAZ_PRESENTWAIT") && getenv("TOPAZ_PRESENTWAIT")[0] == '1');
++      nowait = getenv("TOPAZ_NOPRESENTWAIT") && getenv("TOPAZ_NOPRESENTWAIT")[0] == '1';
+       QueryPerformanceFrequency(&qf);
+    }
+    QueryPerformanceCounter(&t0);
