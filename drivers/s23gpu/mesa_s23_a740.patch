@@ -189,7 +189,9 @@ index 779cf08..f35f826 100644
     float16_t(float f) : bits(_mesa_float_to_half(f)) {}
 --- a/src/freedreno/drm/wddm/fd_wddm_compat.h
 +++ b/src/freedreno/drm/wddm/fd_wddm_compat.h
-@@ -18,6 +18,7 @@
+@@ -1,3 +1,4 @@
++#ifndef __ASSEMBLER__
+@@ -18,6 +19,7 @@
  #endif
  #define asprintf fd_wddm_asprintf
  #define vasprintf fd_wddm_vasprintf
@@ -197,12 +199,13 @@ index 779cf08..f35f826 100644
  #define strndup fd_wddm_strndup
  #define ftruncate fd_wddm_ftruncate
  #define open_memstream fd_wddm_open_memstream
-@@ -57,3 +58,5 @@
+@@ -57,3 +59,6 @@
  #define clock_gettime(c, t) fd_wddm_clock_gettime(c, t)
  #endif
  #endif
 +
 +#include <io.h>
++#endif /* __ASSEMBLER__ */
 --- a/src/freedreno/drm/wddm/include/xf86drm.h
 +++ b/src/freedreno/drm/wddm/include/xf86drm.h
 @@ -40,6 +40,7 @@
@@ -452,42 +455,54 @@ index 779cf08..f35f826 100644
 +      c->base.PatchLocationListSize = cc.PatchLocationListSize;
        pDevice->topazCtx = &c->base;
     }
-@@ -348,18 +409,25 @@
+@@ -348,18 +409,26 @@
  TopazWddmEnabled(void)
  {
     TopazWddmLogInit();
-+   if (GetEnvironmentVariableA("TOPAZGPU_DISABLE", NULL, 0) != 0)
++   if (GetEnvironmentVariableA("TOPAZGPU_DISABLE", NULL, 0) != 0 ||
++       GetFileAttributesA("C:/topaz/umd.disable") != INVALID_FILE_ATTRIBUTES)
 +      return false;
-    bool on = GetEnvironmentVariableA("TOPAZGPU_ENABLE", NULL, 0) != 0 ||
-              GetFileAttributesA("C:\\topaz\\umd.enable") != INVALID_FILE_ATTRIBUTES;
--   /* C:\topaz\umd.dwmonly: only dwm.exe uses the Adreno UMD; other processes fail OpenAdapter and the D3D
--    * runtime falls back (WARP) - safety switch while app processes crash/hang on our UMD */
--   if (on && GetFileAttributesA("C:\\topaz\\umd.dwmonly") != INVALID_FILE_ATTRIBUTES) {
-+   if (on) {
-       char path[MAX_PATH];
-       DWORD n = GetModuleFileNameA(NULL, path, sizeof(path));
-       const char *base = path;
-       for (DWORD i = 0; i < n; i++)
-          if (path[i] == '\\' || path[i] == '/')
-             base = path + i + 1;
--      if (_stricmp(base, "dwm.exe") != 0) {
-+      bool dwm_only = GetFileAttributesA("C:\\topaz\\umd.dwmonly") != INVALID_FILE_ATTRIBUTES;
-+      bool allow_dwm = GetFileAttributesA("C:\\topaz\\umd.allowdwm") != INVALID_FILE_ATTRIBUTES;
-+      /* S23 Render-Only mode: ROOT\BasicDisplay\0000 owns scanout, so exclude dwm.exe by default
-+       * unless C:\topaz\umd.allowdwm or C:\topaz\umd.dwmonly exists. */
-+      if (_stricmp(base, "dwm.exe") == 0 && !allow_dwm && !dwm_only) {
-+         TopazWddmLogf("topaz: render-only default - dwm.exe excluded (create C:\\topaz\\umd.allowdwm to override)\n");
-+         on = false;
-+      } else if (dwm_only &&
-+                 _stricmp(base, "dwm.exe") != 0 &&
-+                 _stricmp(base, "s23gpu_d3d11_test.exe") != 0 &&
-+                 GetEnvironmentVariableA("TOPAZGPU_FORCE", NULL, 0) == 0) {
-          TopazWddmLogf("topaz: umd.dwmonly - %s does not use the Adreno UMD\n", base);
-          on = false;
-       }
++   char path[MAX_PATH];
++   DWORD n = GetModuleFileNameA(NULL, path, sizeof(path));
++   const char *base = path;
++   for (DWORD i = 0; i < n; i++)
++      if (path[i] == '\\' || path[i] == '/')
++         base = path + i + 1;
++   if (GetFileAttributesA("C:/topaz/umd.nodwm") != INVALID_FILE_ATTRIBUTES &&
++       _stricmp(base, "dwm.exe") == 0)
++      return false;
++   if (GetFileAttributesA("C:/topaz/umd.allprocs") == INVALID_FILE_ATTRIBUTES) {
++      if (_stricmp(base, "dwm.exe") != 0 &&
++          _stricmp(base, "s23gpu_d3d11_test.exe") != 0 &&
++          GetEnvironmentVariableA("TOPAZGPU_FORCE", NULL, 0) == 0)
++         return false;
++   }
++   return true;
++}
 --- a/src/gallium/drivers/freedreno/freedreno_resource.c
 +++ b/src/gallium/drivers/freedreno/freedreno_resource.c
-@@ -104,8 +104,8 @@
+@@ -73,16 +73,16 @@
+    if (rsc->dirty & FD_DIRTY_VTXBUF) {
+       struct fd_vertexbuf_stateobj *vb = &ctx->vtx.vertexbuf;
+-      for (unsigned i = 0; i < vb->count && !(ctx->dirty & FD_DIRTY_VTXBUF);
++      for (unsigned i = 0; i < vb->count && !(ctx->dirty_resource & FD_DIRTY_VTXBUF);
+            i++) {
+          if (vb->vb[i].buffer.resource == prsc)
+             fd_dirty_resource(ctx, prsc, FD_DIRTY_VTXBUF, false);
+       }
+    }
+
+    /* xfb/so buffers: */
+    if (rsc->dirty & FD_DIRTY_STREAMOUT) {
+       struct fd_streamout_stateobj *so = &ctx->streamout;
+
+       for (unsigned i = 0;
+-            i < so->num_targets && !(ctx->dirty & FD_DIRTY_STREAMOUT);
++            i < so->num_targets && !(ctx->dirty_resource & FD_DIRTY_STREAMOUT);
+             i++) {
+          if (so->targets[i]->buffer == prsc)
+             fd_dirty_resource(ctx, prsc, FD_DIRTY_STREAMOUT, true);
+@@ -104,45 +104,45 @@
        if ((rsc->dirty & FD_DIRTY_CONST) &&
 -          !(ctx->dirty_shader[stage] & FD_DIRTY_CONST)) {
 +          !(ctx->dirty_shader_resource[stage] & FD_DIRTY_SHADER_CONST)) {
@@ -498,7 +513,51 @@ index 779cf08..f35f826 100644
              if (cb->cb[i].buffer == prsc) {
                 fd_dirty_shader_resource(ctx, prsc, stage,
                                          FD_DIRTY_SHADER_CONST, false);
-@@ -760,4 +760,4 @@
+               break;
+            }
+         }
+      }
+
+      /* Textures */
+      if ((rsc->dirty & FD_DIRTY_TEX) &&
+-          !(ctx->dirty_shader[stage] & FD_DIRTY_TEX)) {
++          !(ctx->dirty_shader_resource[stage] & FD_DIRTY_SHADER_TEX)) {
+         struct fd_texture_stateobj *tex = &ctx->tex[stage];
+         for (unsigned i = 0; i < tex->num_textures; i++) {
+            if (tex->textures[i] && (tex->textures[i]->texture == prsc)) {
+               fd_dirty_shader_resource(ctx, prsc, stage,
+                                        FD_DIRTY_SHADER_TEX, false);
+               break;
+            }
+         }
+      }
+
+      /* Images */
+      if ((rsc->dirty & FD_DIRTY_IMAGE) &&
+-          !(ctx->dirty_shader[stage] & FD_DIRTY_IMAGE)) {
++          !(ctx->dirty_shader_resource[stage] & FD_DIRTY_SHADER_IMAGE)) {
+         struct fd_shaderimg_stateobj *si = &ctx->shaderimg[stage];
+         const unsigned num_images = util_last_bit(si->enabled_mask);
+         for (unsigned i = 0; i < num_images; i++) {
+            if (si->si[i].resource == prsc) {
+               bool write = si->si[i].access & PIPE_IMAGE_ACCESS_WRITE;
+               fd_dirty_shader_resource(ctx, prsc, stage,
+                                        FD_DIRTY_SHADER_IMAGE, write);
+               break;
+            }
+         }
+      }
+
+      /* SSBOs */
+      if ((rsc->dirty & FD_DIRTY_SSBO) &&
+-          !(ctx->dirty_shader[stage] & FD_DIRTY_SSBO)) {
++          !(ctx->dirty_shader_resource[stage] & FD_DIRTY_SHADER_SSBO)) {
+@@ -551,4 +551,5 @@
+   pctx->set_active_query_state(pctx, saved_active_queries);
+
+   ctx->in_shadow = false;
++   rebind_resource(rsc);
+@@ -760,4 +761,4 @@
     if (needs_flush || resource_busy(rsc, op)) {
 -      rebind_resource(rsc);
        realloc_bo(rsc, fd_bo_size(rsc->bo));
@@ -506,7 +565,7 @@ index 779cf08..f35f826 100644
     } else {
 --- a/src/gallium/frontends/d3d10umd/Resource.cpp
 +++ b/src/gallium/frontends/d3d10umd/Resource.cpp
-@@ -1085,17 +1085,20 @@
+@@ -1085,17 +1085,21 @@
        const char *uf = getenv("TOPAZ_UPDFLUSH");
 -      char m = uf ? uf[0] : '1';
 +      char m = uf ? uf[0] : '0';
@@ -519,9 +578,10 @@ index 779cf08..f35f826 100644
     if (!pDstResource->buffer && getenv("TOPAZ_UPDSYNC") && getenv("TOPAZ_UPDSYNC")[0] == '1')
        updFlags = PIPE_MAP_WRITE;
     if (pDstResource->buffer) {
++      bool wholeBuf = (!pDstBox || (box.x == 0 && (unsigned)box.width >= dst_resource->width0)) &&
++                      dst_resource->last_level == 0 && dst_resource->array_size == 1;
 +      unsigned bufFlags = PIPE_MAP_WRITE |
-+         ((!pDstBox && dst_resource->last_level == 0 && dst_resource->array_size == 1)
-+          ? PIPE_MAP_DISCARD_WHOLE_RESOURCE : PIPE_MAP_DISCARD_RANGE);
++         (wholeBuf ? PIPE_MAP_DISCARD_WHOLE_RESOURCE : PIPE_MAP_DISCARD_RANGE);
        map = pipe->buffer_map(pipe,
                                dst_resource,
                                level,

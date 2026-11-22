@@ -20,7 +20,7 @@ $signtool = Join-Path $wdkBinX64 'signtool.exe'
 $thumb    = '05DBD92557F4FC52EF2A5E5955789D8EED637C68'
 
 New-Item -ItemType Directory -Force -Path $outDir, $pkgDir | Out-Null
-Remove-Item -Force (Join-Path $outDir '*'), (Join-Path $pkgDir '*') -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force (Join-Path $outDir '*'), (Join-Path $pkgDir '*') -ErrorAction SilentlyContinue
 
 $wslMesaDll = '/home/mahan/mesa_s23/build_d3d10/src/gallium/targets/d3d10umd/libgallium_d3d10.dll'
 $mesaUmd = Join-Path $outDir 'mesa_d3d10_arm64.dll'
@@ -83,12 +83,23 @@ if (Test-Path (Join-Path $outDir 'libgallium_wgl.dll')) {
     if ($LASTEXITCODE) { throw "signtool OpenGL DLLs failed: $LASTEXITCODE" }
 }
 
+$outX64Dir = Join-Path $outDir 'x64'
+New-Item -ItemType Directory -Force -Path $outX64Dir | Out-Null
+$wslWglX64 = '/home/mahan/mesa_s23/build_x64/src/gallium/targets/wgl/libgallium_wgl.dll'
+$wslGlX64  = '/home/mahan/mesa_s23/build_x64/src/gallium/targets/libgl-gdi/opengl32.dll'
+wsl bash -lc "if test -f '$wslWglX64' && test -f '$wslGlX64'; then cp '$wslWglX64' '/mnt/c/Users/Mahan/Documents/windows-on-android/s23_dm1q/drivers/s23gpu/out/x64/libgallium_wgl.dll' && cp '$wslGlX64' '/mnt/c/Users/Mahan/Documents/windows-on-android/s23_dm1q/drivers/s23gpu/out/x64/opengl32.dll'; fi" 2>$null
+if (Test-Path (Join-Path $outX64Dir 'libgallium_wgl.dll')) {
+    & $signtool sign /fd SHA256 /sha1 $thumb (Join-Path $outX64Dir 'libgallium_wgl.dll') (Join-Path $outX64Dir 'opengl32.dll')
+    if ($LASTEXITCODE) { throw "signtool x64 OpenGL DLLs failed: $LASTEXITCODE" }
+}
+
 Write-Host '=== Packaging & Signing ==='
 Copy-Item $sysOut (Join-Path $pkgDir 's23gpu.sys') -Force
 Copy-Item (Join-Path $outDir 's23gpu_umd.dll') (Join-Path $pkgDir 's23gpu_umd.dll') -Force
+Copy-Item (Join-Path $outDir 'libgallium_wgl.dll') (Join-Path $pkgDir 'libgallium_wgl.dll') -Force
 Copy-Item (Join-Path $dir 's23gpu.inf') (Join-Path $pkgDir 's23gpu.inf') -Force
 
-& $signtool sign /fd SHA256 /sha1 $thumb (Join-Path $pkgDir 's23gpu.sys') (Join-Path $pkgDir 's23gpu_umd.dll')
+& $signtool sign /fd SHA256 /sha1 $thumb (Join-Path $pkgDir 's23gpu.sys') (Join-Path $pkgDir 's23gpu_umd.dll') (Join-Path $pkgDir 'libgallium_wgl.dll')
 if ($LASTEXITCODE) { throw "signtool .sys/.dll failed: $LASTEXITCODE" }
 
 & $inf2cat "/driver:$pkgDir" /os:10_NI_ARM64,10_GE_ARM64

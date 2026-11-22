@@ -3,7 +3,7 @@ Signature="$WINDOWS NT$"
 Class=Display
 ClassGuid={4D36E968-E325-11CE-BFC1-08002BE10318}
 Provider=%Provider%
-DriverVer=11/22/2026,1.0.2.1
+DriverVer=11/22/2026,1.0.2.3
 CatalogFile=s23gpu.cat
 PnpLockdown=1
 
@@ -17,6 +17,7 @@ S23Gpu_Umd=11
 [SourceDisksFiles]
 s23gpu.sys=1
 s23gpu_umd.dll=1
+libgallium_wgl.dll=1
 
 [Manufacturer]
 %Mfg%=S23Gpu,NTarm64.10.0
@@ -35,11 +36,15 @@ s23gpu.sys
 
 [S23Gpu_Umd]
 s23gpu_umd.dll
+libgallium_wgl.dll
 
 [S23Gpu_AddReg]
 HKR,,InstalledDisplayDrivers,0x00010000,"s23gpu_umd"
 HKR,,UserModeDriverName,0x00010000,"s23gpu_umd.dll","s23gpu_umd.dll","s23gpu_umd.dll","s23gpu_umd.dll"
 HKR,,UserModeDriverGUID,0x00000000,"{7B3E2F10-5230-4740-A740-000000000001}"
+HKR,,OpenGLDriverName,0x00010000,"libgallium_wgl.dll"
+HKR,,OpenGLVersion,0x00010001,0x00001000
+HKR,,OpenGLFlags,0x00010001,0x00000003
 HKR,,HardwareInformation.ChipType,0x00000000,"Qualcomm Adreno 740 (GEN7_2_1)"
 HKR,,HardwareInformation.AdapterString,0x00000000,"Qualcomm Adreno 740 GPU (S23)"
 HKR,,HardwareInformation.DacType,0x00000000,"Integrated RAMDAC"

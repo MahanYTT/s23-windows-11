@@ -25,7 +25,14 @@ function Invoke-S23PS {
     $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($full))
     $prevEap = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    & python $s23link exec -t $Timeout "powershell -NoProfile -NonInteractive -EncodedCommand $enc"
+    if ($enc.Length -gt 1000) {
+        $tmpPs = Join-Path $dir 'out\_remote_step.ps1'
+        Set-Content -Path $tmpPs -Value $full -Encoding UTF8
+        & python $s23link put $tmpPs 'C:\s23gpu\_remote_step.ps1' | Out-Null
+        & python $s23link exec -t $Timeout 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\s23gpu\_remote_step.ps1'
+    } else {
+        & python $s23link exec -t $Timeout "powershell -NoProfile -NonInteractive -EncodedCommand $enc"
+    }
     $code = $LASTEXITCODE
     $ErrorActionPreference = $prevEap
     if ($code -ne 0) {
@@ -38,6 +45,9 @@ Invoke-S23Link ping
 
 $localSysMd5 = (Get-FileHash (Join-Path $pkgDir 's23gpu.sys') -Algorithm MD5).Hash
 $localUmdMd5 = (Get-FileHash (Join-Path $pkgDir 's23gpu_umd.dll') -Algorithm MD5).Hash
+$localWglMd5 = (Get-FileHash (Join-Path $pkgDir 'libgallium_wgl.dll') -Algorithm MD5).Hash
+$outDir      = Join-Path $dir 'out'
+$outX64Dir   = Join-Path $outDir 'x64'
 Write-Host "Local s23gpu.sys MD5=$localSysMd5"
 
 Write-Host '=== Uploading s23gpu package ==='
@@ -49,10 +59,27 @@ $remoteUmdOut = (Invoke-S23PS 'if (Test-Path C:\s23gpu\s23gpu_umd.dll) { (Get-Fi
 if ($remoteUmdOut -notmatch $localUmdMd5) {
     Invoke-S23Link put (Join-Path $pkgDir 's23gpu_umd.dll') 'C:\s23gpu\s23gpu_umd.dll'
 }
+$remoteWglOut = (Invoke-S23PS 'if (Test-Path C:\s23gpu\libgallium_wgl.dll) { (Get-FileHash C:\s23gpu\libgallium_wgl.dll -Algorithm MD5).Hash }') -join "`n"
+if ($remoteWglOut -notmatch $localWglMd5) {
+    Invoke-S23Link put (Join-Path $pkgDir 'libgallium_wgl.dll') 'C:\s23gpu\libgallium_wgl.dll'
+    Invoke-S23Link put (Join-Path $outDir 'opengl32.dll') 'C:\s23gpu\opengl32.dll'
+}
 
-Write-Host '=== Configuring Adreno 740 UMD DWM-only & 2x2 quad scissor defaults ==='
+if (Test-Path (Join-Path $outX64Dir 'libgallium_wgl.dll')) {
+    $localWglX64Md5 = (Get-FileHash (Join-Path $outX64Dir 'libgallium_wgl.dll') -Algorithm MD5).Hash
+    $remoteWglX64Out = (Invoke-S23PS 'New-Item -ItemType Directory -Force -Path C:\s23gpu\x64 | Out-Null; if (Test-Path C:\s23gpu\x64\libgallium_wgl.dll) { (Get-FileHash C:\s23gpu\x64\libgallium_wgl.dll -Algorithm MD5).Hash }') -join "`n"
+    if ($remoteWglX64Out -notmatch $localWglX64Md5) {
+        Write-Host '=== Uploading x64 Mesa Freedreno OpenGL 4.6 DLLs ==='
+        Invoke-S23Link put (Join-Path $outX64Dir 'libgallium_wgl.dll') 'C:\s23gpu\x64\libgallium_wgl.dll'
+        Invoke-S23Link put (Join-Path $outX64Dir 'opengl32.dll') 'C:\s23gpu\x64\opengl32.dll'
+    }
+}
+
+Write-Host '=== Configuring Adreno 740 UMD DWM-only, exact scissor & OpenGL 4.6 ICD ==='
 Invoke-S23PS @"
 New-Item -ItemType Directory -Force -Path 'C:\topaz','C:\ProgramData\topaz' | Out-Null
+& icacls.exe 'C:\topaz' /grant '*S-1-1-0:(OI)(CI)(RX)' '*S-1-15-2-1:(OI)(CI)(RX)' '*S-1-15-2-2:(OI)(CI)(RX)' | Out-Null
+& icacls.exe 'C:\ProgramData\topaz' /grant '*S-1-1-0:(OI)(CI)(RX)' '*S-1-15-2-1:(OI)(CI)(RX)' '*S-1-15-2-2:(OI)(CI)(RX)' | Out-Null
 Remove-Item 'C:\ProgramData\topaz\umd.log.enable','C:\ProgramData\topaz\umd-*.log' -Force -ErrorAction SilentlyContinue
 Set-Content -Path 'C:\topaz\umd.dwmonly' -Value '1' -Encoding ascii
 Set-Content -Path 'C:\ProgramData\topaz\umd.env' -Value "FD_MESA_DEBUG=sysmem`r`nTOPAZ_SCFIX=1`r`nTOPAZ_STRIPS=0`r`nTOPAZ_NOPRESENTWAIT=0`r`nTOPAZ_UPDFLUSH=0`r`nTOPAZ_UPDSYNC=1`r`nTOPAZ_SVSWZ=1`r`nTOPAZ_SVINFO=1`r`nTOPAZ_DEMOTE=1`r`n" -Encoding ascii
@@ -65,6 +92,28 @@ if (Test-Path 'C:\Windows\System32\s23gpu_umd.dll') {
         `$bak = "C:\Windows\System32\s23gpu_umd.dll.old." + [Guid]::NewGuid().ToString('N').Substring(0, 8)
         Move-Item 'C:\Windows\System32\s23gpu_umd.dll' `$bak -Force
         Copy-Item 'C:\s23gpu\s23gpu_umd.dll' 'C:\Windows\System32\s23gpu_umd.dll' -Force
+    }
+}
+if (Test-Path 'C:\s23gpu\libgallium_wgl.dll') {
+    `$curWgl = if (Test-Path 'C:\Windows\System32\libgallium_wgl.dll') { (Get-FileHash 'C:\Windows\System32\libgallium_wgl.dll' -Algorithm MD5).Hash } else { '' }
+    if (`$curWgl -ne '$localWglMd5') {
+        Get-ChildItem 'C:\Windows\System32\libgallium_wgl.dll.old*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        if (Test-Path 'C:\Windows\System32\libgallium_wgl.dll') {
+            `$wbak = "C:\Windows\System32\libgallium_wgl.dll.old." + [Guid]::NewGuid().ToString('N').Substring(0, 8)
+            Move-Item 'C:\Windows\System32\libgallium_wgl.dll' `$wbak -Force -ErrorAction SilentlyContinue
+        }
+        Copy-Item 'C:\s23gpu\libgallium_wgl.dll' 'C:\Windows\System32\libgallium_wgl.dll' -Force
+    }
+}
+foreach (`$fmDir in @('C:\Program Files\Geeks3D\FurMark2_x64', 'C:\Program Files\Geeks3D\FurMark2_x64\gpushark')) {
+    if ((Test-Path `$fmDir) -and (Test-Path 'C:\s23gpu\x64\libgallium_wgl.dll')) {
+        `$srcX64Hash = (Get-FileHash 'C:\s23gpu\x64\libgallium_wgl.dll' -Algorithm MD5).Hash
+        `$dstX64Path = Join-Path `$fmDir 'libgallium_wgl.dll'
+        `$dstX64Hash = if (Test-Path `$dstX64Path) { (Get-FileHash `$dstX64Path -Algorithm MD5).Hash } else { '' }
+        if (`$dstX64Hash -ne `$srcX64Hash) {
+            Copy-Item 'C:\s23gpu\x64\libgallium_wgl.dll' `$dstX64Path -Force -ErrorAction SilentlyContinue
+            Copy-Item 'C:\s23gpu\x64\opengl32.dll' (Join-Path `$fmDir 'opengl32.dll') -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 if (Test-Path 'C:\Windows\System32\drivers\s23gpu.sys') {
@@ -107,6 +156,36 @@ if (`$p.Data -ne 0) {
 
 Write-Host '=== Locking single S23 AMOLED display (120 Hz) ==='
 Invoke-S23Link exec -t 30 'C:\s23gpu\s23disp_only.exe'
+
+Write-Host '=== Refreshing non-DWM UI/shell processes onto WARP + Adreno 740 shared BO composition ==='
+Invoke-S23PS @'
+$staleProcs = @(Get-Process | Where-Object {
+    $_.ProcessName -ne 'dwm' -and
+    $_.ProcessName -ne 's23gpu_d3d11_test' -and
+    @(Get-ChildItem 'C:\Windows\System32\s23gpu_umd.dll.old*' -ErrorAction SilentlyContinue).Count -gt 0 -and
+    ($_.Modules.ModuleName -contains 's23gpu_umd.dll')
+})
+if ($staleProcs.Count -gt 0) {
+    $needExplorer = $false
+    foreach ($p in $staleProcs) {
+        Write-Output ("Restarting stale UMD host: " + $p.ProcessName + " (PID " + $p.Id + ")")
+        if ($p.ProcessName -ieq 'explorer') { $needExplorer = $true }
+        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Seconds 1
+    if ($needExplorer -and -not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) {
+        Start-ScheduledTask -TaskName 'S23StartExplorer' -ErrorAction SilentlyContinue
+        $user = (Get-CimInstance Win32_ComputerSystem).UserName
+        $act = New-ScheduledTaskAction -Execute 'explorer.exe'
+        $prin = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+        Register-ScheduledTask -TaskName 'S23StartExplorer' -Action $act -Principal $prin -Force | Out-Null
+        Start-ScheduledTask -TaskName 'S23StartExplorer'
+        Start-Sleep -Seconds 1
+        Unregister-ScheduledTask -TaskName 'S23StartExplorer' -Confirm:$false -ErrorAction SilentlyContinue
+    }
+}
+Get-ChildItem 'C:\Windows\System32\s23gpu_umd.dll.old*','C:\Windows\System32\libgallium_wgl.dll.old*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+'@
 
 Write-Host '=== Checking Task Manager GPU counters ==='
 Invoke-S23PS @'
