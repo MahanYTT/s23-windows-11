@@ -43,7 +43,7 @@
 #define S23_DSI_TPG_DATA    0x17Cu
 #define S23_DSI_TPG_RESET   0x1ECu
 
-#define S23_DBV_MIN         0x0014u
+#define S23_DBV_MIN         0x0008u
 #define S23_DBV_MAX         0x07FFu
 
 static DXGKRNL_INTERFACE        g_DispDxgk;
@@ -63,15 +63,36 @@ static BOOLEAN                  g_LutActive = FALSE;
 static ULONG                    g_LutR[256];
 static ULONG                    g_LutG[256];
 static ULONG                    g_LutB[256];
+static ULONG                    g_LutRowBuf[2048];
 static UINT                     g_HwPanelHz = 0;
 static ULONG                    g_ScanCount = 0;
 static ULONGLONG                g_ScanUsSum = 0;
 static ULONG                    g_ScanUsMax = 0;
 static S23GPU_ALLOCATION * volatile g_FlipAlloc = NULL;
 static PHYSICAL_ADDRESS         g_FlipAddr = {0};
-static KTIMER                   g_VsyncTimer;
-static KDPC                     g_VsyncDpc;
+static PEX_TIMER                g_VsyncTimer = NULL;
+static volatile LONGLONG        g_LastVsyncQpc = 0;
+static KEVENT                   g_BrightKick;
+static KEVENT                   g_BrightStop;
+static PKTHREAD                 g_BrightThread = NULL;
+static volatile LONG            g_TargetDbv = -1;
+static LONG                     g_AppliedDbv = -1;
 static KDPC                     g_ScanDpc;
+
+/* CIE L* perceptual lightness curve mapped to S6E3FAC DBV 8..2047 (~2..500 nits) */
+static const USHORT g_PctToDbv[101] = {
+       8u,   10u,   13u,   15u,   18u,   21u,   24u,   27u,   30u,   34u,
+      38u,   42u,   46u,   51u,   56u,   61u,   66u,   72u,   78u,   84u,
+      90u,   97u,  104u,  111u,  119u,  127u,  135u,  143u,  152u,  161u,
+     171u,  181u,  191u,  201u,  212u,  224u,  235u,  247u,  260u,  273u,
+     286u,  300u,  314u,  328u,  343u,  358u,  374u,  390u,  407u,  424u,
+     442u,  460u,  478u,  497u,  517u,  537u,  557u,  578u,  600u,  622u,
+     645u,  668u,  691u,  715u,  740u,  765u,  791u,  818u,  845u,  872u,
+     900u,  929u,  958u,  988u, 1019u, 1050u, 1082u, 1114u, 1147u, 1181u,
+    1215u, 1250u, 1286u, 1322u, 1359u, 1397u, 1435u, 1474u, 1514u, 1554u,
+    1595u, 1637u, 1680u, 1723u, 1767u, 1812u, 1857u, 1904u, 1951u, 1998u,
+    2047u
+};
 
 static __inline ULONG MmioR32(volatile UCHAR *Base, ULONG Off)
 {
@@ -197,18 +218,16 @@ static BOOLEAN Dsi0SendTpgFifoPkt(volatile UCHAR *Dsi0, const ULONG *Dwords, ULO
     return done;
 }
 
-static VOID DispHwSetDbv(USHORT Dbv)
+static BOOLEAN DispHwSetDbv(USHORT Dbv)
 {
-    static const ULONG pktUnlock9f[2] = { 0xC0390003u, 0xFFA5A59Fu };
-    static const ULONG pktUnlockF0[2] = { 0xC0390003u, 0xFF5A5AF0u };
-    static const ULONG pktUnlockF1[2] = { 0xC0390003u, 0xFF5A5AF1u };
-    static const ULONG pktUnlockFc[2] = { 0xC0390003u, 0xFF5A5AFCu };
-    static const ULONG pktWrCtrld[1]  = { 0x80152053u };
-    static const ULONG pktLatchF7[1]  = { 0x80150FF7u };
-    static const ULONG pktLockFc[2]   = { 0xC0390003u, 0xFFA5A5FCu };
-    static const ULONG pktLockF1[2]   = { 0xC0390003u, 0xFFA5A5F1u };
-    static const ULONG pktLockF0[2]   = { 0xC0390003u, 0xFFA5A5F0u };
-    static const ULONG pktLock9f[2]   = { 0xC0390003u, 0xFF5A5A9Fu };
+    static const ULONG pktUnlock9f[2] = { 0xC0390003u, 0xFFA5A59Fu }; /* 9F A5 A5 */
+    static const ULONG pktUnlockF0[2] = { 0xC0390003u, 0xFF5A5AF0u }; /* F0 5A 5A */
+    static const ULONG pktGpara94[2]  = { 0xC0390004u, 0x940D00B0u }; /* B0 00 0D 94 */
+    static const ULONG pktDim94[2]    = { 0xC0390003u, 0xFF0F7094u }; /* 94 70 0F (smooth dim ON, 15-frame) */
+    static const ULONG pktWrCtrld[1]  = { 0x80152853u };              /* 53 28 (BCTRL | DD smooth dim ON) */
+    static const ULONG pktLatchF7[1]  = { 0x80150FF7u };              /* F7 0F (update latch) */
+    static const ULONG pktLockF0[2]   = { 0xC0390003u, 0xFFA5A5F0u }; /* F0 A5 A5 */
+    static const ULONG pktLock9f[2]   = { 0xC0390003u, 0xFF5A5A9Fu }; /* 9F 5A 5A */
     static ULONG dbvLog = 0;
     ULONG pktDbv[2];
     PHYSICAL_ADDRESS pa;
@@ -219,17 +238,20 @@ static VOID DispHwSetDbv(USHORT Dbv)
     ULONG dsiCtrl = 0;
     BOOLEAN ok = FALSE;
     KIRQL irql = KeGetCurrentIrql();
+    LARGE_INTEGER freq = {0}, t0, t1;
+    ULONG us = 0;
 
     if (!g_DispStarted || !g_DsiLockInit || irql != PASSIVE_LEVEL) {
         if (irql == PASSIVE_LEVEL && ++dbvLog <= 32u) {
             LogPrint("disp: SetDbv skip early started=%u lock=%u dbv=0x%03x\n",
                      g_DispStarted ? 1u : 0u, g_DsiLockInit ? 1u : 0u, Dbv);
         }
-        return;
+        return FALSE;
     }
     if (Dbv < S23_DBV_MIN) Dbv = S23_DBV_MIN;
     if (Dbv > S23_DBV_MAX) Dbv = S23_DBV_MAX;
 
+    t0 = KeQueryPerformanceCounter(&freq);
     KeWaitForSingleObject(&g_DsiLock, Executive, KernelMode, FALSE, NULL);
     if (!g_DispStarted) {
         if (++dbvLog <= 32u) {
@@ -262,8 +284,24 @@ static VOID DispHwSetDbv(USHORT Dbv)
 
     prevAr = MmioR32(intf, S23_INTF_AR_CFG);
     if ((prevAr & 0x80000000u) != 0u) {
+        ULONG w, idleStreak = 0;
         MmioW32(intf, S23_INTF_AR_CFG, prevAr & ~0x80000000u);
-        DispSleepMs(20u);
+        KeStallExecutionProcessor(400u);
+        for (w = 0; w < 50u; w++) {
+            if ((MmioR32(dsi0, S23_DSI_STATUS) & 0x07u) == 0u) {
+                if (++idleStreak >= 2u) {
+                    break;
+                }
+                KeStallExecutionProcessor(150u);
+            } else {
+                idleStreak = 0;
+                if (w < 35u) {
+                    KeStallExecutionProcessor(150u);
+                } else {
+                    DispSleepMs(1u);
+                }
+            }
+        }
     }
 
     pktDbv[0] = 0xC0390003u;
@@ -271,21 +309,23 @@ static VOID DispHwSetDbv(USHORT Dbv)
 
     (VOID)Dsi0SendTpgFifoPkt(dsi0, pktUnlock9f, 2u);
     (VOID)Dsi0SendTpgFifoPkt(dsi0, pktUnlockF0, 2u);
-    (VOID)Dsi0SendTpgFifoPkt(dsi0, pktUnlockF1, 2u);
-    (VOID)Dsi0SendTpgFifoPkt(dsi0, pktUnlockFc, 2u);
+    (VOID)Dsi0SendTpgFifoPkt(dsi0, pktGpara94,  2u);
+    (VOID)Dsi0SendTpgFifoPkt(dsi0, pktDim94,    2u);
     (VOID)Dsi0SendTpgFifoPkt(dsi0, pktWrCtrld,  1u);
-    ok = Dsi0SendTpgFifoPkt(dsi0, pktDbv,     2u);
+    ok = Dsi0SendTpgFifoPkt(dsi0, pktDbv,       2u);
     (VOID)Dsi0SendTpgFifoPkt(dsi0, pktLatchF7,  1u);
-    (VOID)Dsi0SendTpgFifoPkt(dsi0, pktLockFc,   2u);
-    (VOID)Dsi0SendTpgFifoPkt(dsi0, pktLockF1,   2u);
     (VOID)Dsi0SendTpgFifoPkt(dsi0, pktLockF0,   2u);
     (VOID)Dsi0SendTpgFifoPkt(dsi0, pktLock9f,   2u);
 
     if ((prevAr & 0x80000000u) != 0u) {
         MmioW32(intf, S23_INTF_AR_CFG, prevAr);
     }
-    if (++dbvLog <= 32u || !ok) {
-        LogPrint("disp: SetDbv=0x%03x ok=%u\n", Dbv, ok ? 1u : 0u);
+    t1 = KeQueryPerformanceCounter(NULL);
+    if (freq.QuadPart > 0 && t1.QuadPart >= t0.QuadPart) {
+        us = (ULONG)(((ULONGLONG)(t1.QuadPart - t0.QuadPart) * 1000000ULL) / (ULONGLONG)freq.QuadPart);
+    }
+    if (++dbvLog <= 64u || !ok) {
+        LogPrint("disp: SetDbv=0x%03x ok=%u (%u us)\n", Dbv, ok ? 1u : 0u, us);
     }
 
 out_unmap:
@@ -294,6 +334,34 @@ out_unmap:
     if (cc != NULL)   MmUnmapIoSpace((PVOID)cc,   S23_SZ_DISP_CC);
 out_unlock:
     KeReleaseMutex(&g_DsiLock, FALSE);
+    return ok;
+}
+
+static KSTART_ROUTINE DispBrightThread;
+static VOID DispBrightThread(PVOID Ctx)
+{
+    PVOID objs[2] = { &g_BrightKick, &g_BrightStop };
+    NTSTATUS st;
+
+    UNREFERENCED_PARAMETER(Ctx);
+    for (;;) {
+        st = KeWaitForMultipleObjects(2, objs, WaitAny, Executive, KernelMode, FALSE, NULL, NULL);
+        if (st == STATUS_WAIT_1) {
+            break;
+        }
+        for (;;) {
+            LONG target = InterlockedCompareExchange(&g_TargetDbv, 0, 0);
+            if (!g_DispStarted || target <= 0 || target == g_AppliedDbv) {
+                break;
+            }
+            if (DispHwSetDbv((USHORT)target)) {
+                g_AppliedDbv = target;
+            } else {
+                break;
+            }
+        }
+    }
+    PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
 static VOID DispSetPanelHz(UINT Hz)
@@ -301,7 +369,8 @@ static VOID DispSetPanelHz(UINT Hz)
     PHYSICAL_ADDRESS pa;
     volatile UCHAR *cc = NULL;
     volatile UCHAR *intf = NULL;
-    ULONG arOld, arNew, f0, f1, f2, f3, dOld, dNew;
+    LARGE_INTEGER freq = {0}, t0, t1, t2, t3;
+    ULONG arOld, arNew, f0, f1, f2, f3, dOld, dNew, hzOld = 0, hzNew = 0;
 
     if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
         return;
@@ -328,33 +397,45 @@ static VOID DispSetPanelHz(UINT Hz)
     }
 
     arOld = MmioR32(intf, S23_INTF_AR_CFG);
+    t0 = KeQueryPerformanceCounter(&freq);
     f0 = MmioR32(intf, S23_INTF_FRAME_CNT);
     DispSleepMs(100u);
     f1 = MmioR32(intf, S23_INTF_FRAME_CNT);
+    t1 = KeQueryPerformanceCounter(NULL);
     dOld = f1 - f0;
+    if (freq.QuadPart > 0 && t1.QuadPart > t0.QuadPart) {
+        ULONGLONG dt = (ULONGLONG)(t1.QuadPart - t0.QuadPart);
+        hzOld = (ULONG)(((ULONGLONG)dOld * (ULONGLONG)freq.QuadPart + dt / 2ULL) / dt);
+    }
 
     arNew = (Hz >= 100u) ? S23_AR_120HZ : S23_AR_60HZ;
     if ((arOld & 0x80000000u) != 0u && arNew != arOld) {
         MmioW32(intf, S23_INTF_AR_CFG, arNew);
         DispSleepMs(20u);
+        t2 = KeQueryPerformanceCounter(NULL);
         f2 = MmioR32(intf, S23_INTF_FRAME_CNT);
         DispSleepMs(100u);
         f3 = MmioR32(intf, S23_INTF_FRAME_CNT);
+        t3 = KeQueryPerformanceCounter(NULL);
         dNew = f3 - f2;
+        if (freq.QuadPart > 0 && t3.QuadPart > t2.QuadPart) {
+            ULONGLONG dt = (ULONGLONG)(t3.QuadPart - t2.QuadPart);
+            hzNew = (ULONG)(((ULONGLONG)dNew * (ULONGLONG)freq.QuadPart + dt / 2ULL) / dt);
+        }
         if (dNew == 0u) {
             MmioW32(intf, S23_INTF_AR_CFG, arOld);
             LogPrint("disp: WARNING HW panel AR=0x%08x stalled (fc_delta=0), reverted to 0x%08x\n",
                      arNew, arOld);
         } else {
             g_HwPanelHz = Hz;
-            LogPrint("disp: HW panel refresh %u Hz (AR 0x%08x->0x%08x, fc_delta %u->%u per 100ms)\n",
-                     Hz, arOld, arNew, dOld, dNew);
+            LogPrint("disp: HW panel refresh %u Hz (AR 0x%08x->0x%08x, fc %u->%u meas %u->%u Hz)\n",
+                     Hz, arOld, arNew, dOld, dNew, hzOld, hzNew);
         }
     } else {
         if (arOld == S23_AR_120HZ) g_HwPanelHz = 120u;
         else if (arOld == S23_AR_60HZ) g_HwPanelHz = 60u;
-        LogPrint("disp: HW panel refresh status AR=0x%08x fc_delta=%u/100ms (req=%uHz)\n",
-                 arOld, dOld, Hz);
+        LogPrint("disp: HW panel refresh status AR=0x%08x fc=%u meas=%u Hz (req=%uHz)\n",
+                 arOld, dOld, hzOld, Hz);
     }
 
     MmUnmapIoSpace((PVOID)intf, S23_SZ_INTF1);
@@ -382,6 +463,7 @@ static BOOLEAN VsyncNotifyRoutine(PVOID Ctx)
     if (!g_DispStarted || g_DispDxgk.DeviceHandle == NULL) {
         return FALSE;
     }
+    InterlockedExchange64(&g_LastVsyncQpc, KeQueryPerformanceCounter(NULL).QuadPart);
     RtlZeroMemory(&d, sizeof(d));
     d.InterruptType = DXGK_INTERRUPT_CRTC_VSYNC;
     d.CrtcVsync.VidPnTargetId = 0;
@@ -391,14 +473,12 @@ static BOOLEAN VsyncNotifyRoutine(PVOID Ctx)
     return TRUE;
 }
 
-static KDEFERRED_ROUTINE VsyncDpc;
-static VOID VsyncDpc(PKDPC Dpc, PVOID Ctx, PVOID Arg1, PVOID Arg2)
+static EXT_CALLBACK VsyncTimerCb;
+static VOID VsyncTimerCb(PEX_TIMER Timer, PVOID Ctx)
 {
     BOOLEAN ret = FALSE;
-    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(Timer);
     UNREFERENCED_PARAMETER(Ctx);
-    UNREFERENCED_PARAMETER(Arg1);
-    UNREFERENCED_PARAMETER(Arg2);
 
     if (!g_DispStarted || InterlockedCompareExchange(&g_VsyncEnabled, 0, 0) == 0) {
         return;
@@ -471,15 +551,38 @@ NTSTATUS DispStart(PDXGKRNL_INTERFACE Dxgk)
     g_ScanCount = 0;
     g_ScanUsSum = 0;
     g_ScanUsMax = 0;
+    g_LastVsyncQpc = 0;
+    g_TargetDbv = -1;
+    g_AppliedDbv = -1;
 
-    KeInitializeTimerEx(&g_VsyncTimer, SynchronizationTimer);
-    KeInitializeDpc(&g_VsyncDpc, VsyncDpc, NULL);
+    g_VsyncTimer = ExAllocateTimer(VsyncTimerCb, NULL, EX_TIMER_HIGH_RESOLUTION);
+    if (g_VsyncTimer == NULL) {
+        LogPrint("disp: ExAllocateTimer(EX_TIMER_HIGH_RESOLUTION) failed!\n");
+        MmUnmapIoSpace(g_FbVa, g_FbBytes);
+        g_FbVa = NULL;
+        g_FbBytes = 0;
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
     KeInitializeDpc(&g_ScanDpc, ScanDpc, NULL);
     g_DispStarted = TRUE;
 
+    {
+        HANDLE th = NULL;
+        KeInitializeEvent(&g_BrightKick, SynchronizationEvent, FALSE);
+        KeInitializeEvent(&g_BrightStop, NotificationEvent, FALSE);
+        if (NT_SUCCESS(PsCreateSystemThread(&th, THREAD_ALL_ACCESS, NULL, NULL, NULL, DispBrightThread, NULL))) {
+            if (!NT_SUCCESS(ObReferenceObjectByHandle(th, SYNCHRONIZE, *PsThreadType, KernelMode,
+                                                      (PVOID *)&g_BrightThread, NULL))) {
+                g_BrightThread = NULL;
+                KeSetEvent(&g_BrightStop, IO_NO_INCREMENT, FALSE);
+            }
+            ZwClose(th);
+        }
+    }
+
     DispSetPanelHz(120u);
 
-    LogPrint("disp: started %ux%u @ %uHz (fb=0x%llx->%p bytes=%llu)\n",
+    LogPrint("disp: started %ux%u @ %uHz (fb=0x%llx->%p bytes=%llu hiResVsync=1 brightAsync=1)\n",
              g_PostInfo.Width, g_PostInfo.Height,
              g_HwPanelHz ? g_HwPanelHz : 120u,
              (ULONGLONG)g_PostInfo.PhysicAddress.QuadPart, g_FbVa, (ULONGLONG)g_FbBytes);
@@ -489,6 +592,7 @@ NTSTATUS DispStart(PDXGKRNL_INTERFACE Dxgk)
 VOID DispStop(VOID)
 {
     KIRQL irql;
+    PEX_TIMER vt = NULL;
 
     if (!g_DispStarted) {
         return;
@@ -496,10 +600,25 @@ VOID DispStop(VOID)
     KeAcquireSpinLock(&g_VsyncLock, &irql);
     g_DispStarted = FALSE;
     InterlockedExchange(&g_VsyncEnabled, 0);
-    KeCancelTimer(&g_VsyncTimer);
+    vt = g_VsyncTimer;
+    g_VsyncTimer = NULL;
+    if (vt != NULL) {
+        (void)ExCancelTimer(vt, NULL);
+    }
     KeReleaseSpinLock(&g_VsyncLock, irql);
 
+    if (vt != NULL) {
+        (void)ExDeleteTimer(vt, TRUE, TRUE, NULL);
+    }
+
     KeFlushQueuedDpcs();
+
+    if (g_BrightThread != NULL) {
+        KeSetEvent(&g_BrightStop, IO_NO_INCREMENT, FALSE);
+        KeWaitForSingleObject(g_BrightThread, Executive, KernelMode, FALSE, NULL);
+        ObDereferenceObject(g_BrightThread);
+        g_BrightThread = NULL;
+    }
 
     if (g_DsiLockInit) {
         KeWaitForSingleObject(&g_DsiLock, Executive, KernelMode, FALSE, NULL);
@@ -559,17 +678,17 @@ VOID DispVsyncEnable(BOOLEAN Enable)
         return;
     }
     KeAcquireSpinLock(&g_VsyncLock, &irql);
-    if (g_DispStarted) {
+    if (g_DispStarted && g_VsyncTimer != NULL) {
         InterlockedExchange(&g_VsyncEnabled, Enable ? 1 : 0);
         if (Enable) {
-            LARGE_INTEGER due;
+            EXT_SET_PARAMETERS params;
             LONG hz = InterlockedCompareExchange(&g_TargetHz, 0, 0);
-            LONGLONG due100ns = (hz >= 100) ? -83333LL : -166667LL;
-            LONG periodMs = (hz >= 100) ? 8 : 16;
-            due.QuadPart = due100ns;
-            KeSetTimerEx(&g_VsyncTimer, due, periodMs, &g_VsyncDpc);
+            LONGLONG period100ns = (hz >= 100) ? 83333LL : 166667LL;
+            ExInitializeSetTimerParameters(&params);
+            params.NoWakeTolerance = 0;
+            (void)ExSetTimer(g_VsyncTimer, -period100ns, period100ns, &params);
         } else {
-            KeCancelTimer(&g_VsyncTimer);
+            (void)ExCancelTimer(g_VsyncTimer, NULL);
         }
     }
     KeReleaseSpinLock(&g_VsyncLock, irql);
@@ -578,6 +697,22 @@ VOID DispVsyncEnable(BOOLEAN Enable)
 static VOID CopyRowWithLut(ULONG *Dst, const ULONG *Src, ULONG Pixels)
 {
     ULONG i = 0;
+
+    if (Pixels <= 2048u) {
+        for (; i + 4u <= Pixels; i += 4u) {
+            ULONG p0 = Src[i], p1 = Src[i + 1u], p2 = Src[i + 2u], p3 = Src[i + 3u];
+            g_LutRowBuf[i]      = 0xFF000000u | g_LutR[(p0 >> 16) & 0xFFu] | g_LutG[(p0 >> 8) & 0xFFu] | g_LutB[p0 & 0xFFu];
+            g_LutRowBuf[i + 1u] = 0xFF000000u | g_LutR[(p1 >> 16) & 0xFFu] | g_LutG[(p1 >> 8) & 0xFFu] | g_LutB[p1 & 0xFFu];
+            g_LutRowBuf[i + 2u] = 0xFF000000u | g_LutR[(p2 >> 16) & 0xFFu] | g_LutG[(p2 >> 8) & 0xFFu] | g_LutB[p2 & 0xFFu];
+            g_LutRowBuf[i + 3u] = 0xFF000000u | g_LutR[(p3 >> 16) & 0xFFu] | g_LutG[(p3 >> 8) & 0xFFu] | g_LutB[p3 & 0xFFu];
+        }
+        for (; i < Pixels; i++) {
+            ULONG p = Src[i];
+            g_LutRowBuf[i] = 0xFF000000u | g_LutR[(p >> 16) & 0xFFu] | g_LutG[(p >> 8) & 0xFFu] | g_LutB[p & 0xFFu];
+        }
+        RtlCopyMemory(Dst, g_LutRowBuf, (SIZE_T)Pixels * 4u);
+        return;
+    }
 
     for (; i + 4u <= Pixels; i += 4u) {
         ULONG p0 = Src[i], p1 = Src[i + 1u], p2 = Src[i + 2u], p3 = Src[i + 3u];
@@ -1302,7 +1437,11 @@ NTSTATUS DispGetScanLine(DXGKARG_GETSCANLINE *A)
     now = KeQueryPerformanceCounter(&freq);
     tpf = (freq.QuadPart > 0) ? ((ULONGLONG)freq.QuadPart / (ULONGLONG)hz) : 0ULL;
     if (tpf > 0ULL) {
-        UINT line = (UINT)((((ULONGLONG)now.QuadPart % tpf) * 2400ULL) / tpf);
+        LONGLONG lastV = InterlockedCompareExchange64(&g_LastVsyncQpc, 0, 0);
+        ULONGLONG elapsed = (lastV > 0 && now.QuadPart >= lastV)
+                          ? (ULONGLONG)(now.QuadPart - lastV)
+                          : (ULONGLONG)now.QuadPart;
+        UINT line = (UINT)(((elapsed % tpf) * 2400ULL) / tpf);
         A->InVerticalBlank = (line >= 2340u) ? TRUE : FALSE;
         A->ScanLine = (line < 2340u) ? line : 0u;
     } else {
@@ -1361,11 +1500,16 @@ static NTSTATUS DispSetBrightness(PVOID Context, UCHAR Brightness)
         Brightness = 100u;
     }
     InterlockedExchange(&g_BrightnessPct, (LONG)Brightness);
-    dbv = (USHORT)(S23_DBV_MIN + (((ULONG)Brightness * (ULONG)Brightness * (S23_DBV_MAX - S23_DBV_MIN)) / 10000u));
-    if (++sbLog <= 32u) {
+    dbv = g_PctToDbv[Brightness];
+    if (++sbLog <= 64u) {
         LogPrint("disp: SetBrightness pct=%u -> dbv=0x%03x\n", (ULONG)Brightness, dbv);
     }
-    DispHwSetDbv(dbv);
+    InterlockedExchange(&g_TargetDbv, (LONG)dbv);
+    if (g_BrightThread != NULL) {
+        KeSetEvent(&g_BrightKick, IO_NO_INCREMENT, FALSE);
+    } else {
+        (VOID)DispHwSetDbv(dbv);
+    }
     return STATUS_SUCCESS;
 }
 

@@ -391,7 +391,7 @@ static NTSTATUS QueryAdapterInfoInner(const S23GPU_ADAPTER *A, const DXGKARG_QUE
             return STATUS_BUFFER_TOO_SMALL;
         }
         RtlZeroMemory(gv, Q->OutputDataSize);
-        RtlStringCbCopyW(gv->BiosVersion, sizeof(gv->BiosVersion), L"A740.4001.0017");
+        RtlStringCbCopyW(gv->BiosVersion, sizeof(gv->BiosVersion), L"A740.4001.0018");
         RtlStringCbCopyW(gv->GpuArchitecture, sizeof(gv->GpuArchitecture), L"Adreno 740 (GEN7_2_1)");
         return STATUS_SUCCESS;
     }
@@ -1290,7 +1290,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     NTSTATUS st;
 
     LogOpen();
-    LogPrint("==== s23gpu.sys v1.0.1.7 WDDM 2.0 Full Display (1080x2340 @ 120Hz HW + Coherent WBWA + Brightness + Night Light) + Adreno 740 KMD ====\n");
+    LogPrint("==== s23gpu.sys v1.0.1.8 WDDM 2.0 Full Display (1080x2340 @ 120Hz HW + Coherent WBWA + Brightness + Night Light) + Adreno 740 KMD ====\n");
     MsmInit();
 
     RtlZeroMemory(&d, sizeof(d));
