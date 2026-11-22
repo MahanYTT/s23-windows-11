@@ -1758,14 +1758,14 @@ ULONG HwCompletedFence(VOID)
 BOOLEAN HwWaitFenceEx(ULONG Fence, ULONG TimeoutMs, BOOLEAN WedgeOnTimeout)
 {
     if (Fence == 0 || (LONG)(HwCompletedFence() - Fence) >= 0) return TRUE;
-    for (ULONG us = 0; us < 250u; us += 5u) {
+    for (ULONG us = 0; us < 3000u; us += 2u) {
         if ((LONG)(HwCompletedFence() - Fence) >= 0) return TRUE;
-        StallUs(5u);
+        StallUs(2u);
     }
     if (TimeoutMs == 0) {
         return (LONG)(HwCompletedFence() - Fence) >= 0;
     }
-    for (ULONG ms = 0; ms < TimeoutMs; ms++) {
+    for (ULONG ms = 3u; ms < TimeoutMs; ms++) {
         SleepMs(1u);
         if ((LONG)(HwCompletedFence() - Fence) >= 0) return TRUE;
     }

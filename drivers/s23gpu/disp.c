@@ -49,6 +49,8 @@
 static DXGKRNL_INTERFACE        g_DispDxgk;
 static DXGK_DISPLAY_INFORMATION g_PostInfo;
 static PVOID                    g_FbVa = NULL;
+static PUCHAR                   g_ShadowVa = NULL;
+static BOOLEAN                  g_ShadowDirty = TRUE;
 static SIZE_T                   g_FbBytes = 0;
 static KMUTEX                   g_ScanLock;
 static BOOLEAN                  g_ScanLockInit = FALSE;
@@ -56,6 +58,7 @@ static KMUTEX                   g_DsiLock;
 static BOOLEAN                  g_DsiLockInit = FALSE;
 static KSPIN_LOCK               g_VsyncLock;
 static BOOLEAN                  g_DispStarted = FALSE;
+static BOOLEAN                  g_TimerResSet = FALSE;
 static volatile LONG            g_VsyncEnabled = 0;
 static volatile LONG            g_TargetHz = 120;
 static volatile LONG            g_BrightnessPct = 50;
@@ -66,8 +69,11 @@ static ULONG                    g_LutB[256];
 static ULONG                    g_LutRowBuf[2048];
 static UINT                     g_HwPanelHz = 0;
 static ULONG                    g_ScanCount = 0;
+static ULONG                    g_ScanWinCount = 0;
 static ULONGLONG                g_ScanUsSum = 0;
 static ULONG                    g_ScanUsMax = 0;
+static ULONGLONG                g_ScanRowsSum = 0;
+static volatile LONG            g_FlipCount = 0;
 static S23GPU_ALLOCATION * volatile g_FlipAlloc = NULL;
 static PHYSICAL_ADDRESS         g_FlipAddr = {0};
 static PEX_TIMER                g_VsyncTimer = NULL;
@@ -77,6 +83,10 @@ static KEVENT                   g_BrightStop;
 static PKTHREAD                 g_BrightThread = NULL;
 static volatile LONG            g_TargetDbv = -1;
 static LONG                     g_AppliedDbv = -1;
+static KEVENT                   g_ScanKickEvent;
+static KEVENT                   g_ScanStopEvent;
+static PKTHREAD                 g_ScanThread = NULL;
+static volatile LONG            g_ScanPending = 0;
 static KDPC                     g_ScanDpc;
 
 /* CIE L* perceptual lightness curve mapped to S6E3FAC DBV 8..2047 (~2..500 nits) */
@@ -442,6 +452,42 @@ static VOID DispSetPanelHz(UINT Hz)
     MmUnmapIoSpace((PVOID)cc, S23_SZ_DISP_CC);
 }
 
+static VOID DispKickScanout(VOID)
+{
+    if (!g_DispStarted) {
+        return;
+    }
+    InterlockedExchange(&g_ScanPending, 1);
+    if (g_ScanThread != NULL) {
+        KeSetEvent(&g_ScanKickEvent, IO_VIDEO_INCREMENT, FALSE);
+    } else {
+        EngKickScanout();
+    }
+}
+
+static KSTART_ROUTINE DispScanThread;
+static VOID DispScanThread(PVOID Ctx)
+{
+    PVOID objs[2] = { &g_ScanKickEvent, &g_ScanStopEvent };
+    NTSTATUS st;
+
+    UNREFERENCED_PARAMETER(Ctx);
+    KeSetPriorityThread(KeGetCurrentThread(), LOW_REALTIME_PRIORITY);
+    for (;;) {
+        st = KeWaitForMultipleObjects(2u, objs, WaitAny, Executive, KernelMode, FALSE, NULL, NULL);
+        if (st == STATUS_WAIT_1) {
+            break;
+        }
+        while (InterlockedExchange(&g_ScanPending, 0) != 0) {
+            if (!g_DispStarted) {
+                break;
+            }
+            DispScanoutWork();
+        }
+    }
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
 static KDEFERRED_ROUTINE ScanDpc;
 static VOID ScanDpc(PKDPC Dpc, PVOID Ctx, PVOID Arg1, PVOID Arg2)
 {
@@ -451,7 +497,7 @@ static VOID ScanDpc(PKDPC Dpc, PVOID Ctx, PVOID Arg1, PVOID Arg2)
     UNREFERENCED_PARAMETER(Arg2);
 
     if (g_DispStarted) {
-        EngKickScanout();
+        DispKickScanout();
     }
 }
 
@@ -542,6 +588,8 @@ NTSTATUS DispStart(PDXGKRNL_INTERFACE Dxgk)
                  (ULONGLONG)g_PostInfo.PhysicAddress.QuadPart, (ULONGLONG)g_FbBytes);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+    g_ShadowVa = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, g_FbBytes, S23GPU_POOL_TAG);
+    g_ShadowDirty = TRUE;
 
     g_FlipAlloc = NULL;
     g_FlipAddr.QuadPart = 0;
@@ -549,15 +597,23 @@ NTSTATUS DispStart(PDXGKRNL_INTERFACE Dxgk)
     g_TargetHz = 120;
     g_HwPanelHz = 0;
     g_ScanCount = 0;
+    g_ScanWinCount = 0;
     g_ScanUsSum = 0;
     g_ScanUsMax = 0;
+    g_ScanRowsSum = 0;
+    g_FlipCount = 0;
     g_LastVsyncQpc = 0;
     g_TargetDbv = -1;
     g_AppliedDbv = -1;
+    g_ScanPending = 0;
 
     g_VsyncTimer = ExAllocateTimer(VsyncTimerCb, NULL, EX_TIMER_HIGH_RESOLUTION);
     if (g_VsyncTimer == NULL) {
         LogPrint("disp: ExAllocateTimer(EX_TIMER_HIGH_RESOLUTION) failed!\n");
+        if (g_ShadowVa != NULL) {
+            ExFreePoolWithTag(g_ShadowVa, S23GPU_POOL_TAG);
+            g_ShadowVa = NULL;
+        }
         MmUnmapIoSpace(g_FbVa, g_FbBytes);
         g_FbVa = NULL;
         g_FbBytes = 0;
@@ -565,6 +621,26 @@ NTSTATUS DispStart(PDXGKRNL_INTERFACE Dxgk)
     }
     KeInitializeDpc(&g_ScanDpc, ScanDpc, NULL);
     g_DispStarted = TRUE;
+
+    if (!g_TimerResSet) {
+        ULONG actualRes = ExSetTimerResolution(5000u, TRUE);
+        g_TimerResSet = TRUE;
+        LogPrint("disp: ExSetTimerResolution(5000, TRUE) -> %u (100ns)\n", actualRes);
+    }
+
+    {
+        HANDLE th = NULL;
+        KeInitializeEvent(&g_ScanKickEvent, SynchronizationEvent, FALSE);
+        KeInitializeEvent(&g_ScanStopEvent, NotificationEvent, FALSE);
+        if (NT_SUCCESS(PsCreateSystemThread(&th, THREAD_ALL_ACCESS, NULL, NULL, NULL, DispScanThread, NULL))) {
+            if (!NT_SUCCESS(ObReferenceObjectByHandle(th, SYNCHRONIZE, *PsThreadType, KernelMode,
+                                                      (PVOID *)&g_ScanThread, NULL))) {
+                g_ScanThread = NULL;
+                KeSetEvent(&g_ScanStopEvent, IO_NO_INCREMENT, FALSE);
+            }
+            ZwClose(th);
+        }
+    }
 
     {
         HANDLE th = NULL;
@@ -582,10 +658,11 @@ NTSTATUS DispStart(PDXGKRNL_INTERFACE Dxgk)
 
     DispSetPanelHz(120u);
 
-    LogPrint("disp: started %ux%u @ %uHz (fb=0x%llx->%p bytes=%llu hiResVsync=1 brightAsync=1)\n",
+    LogPrint("disp: started %ux%u @ %uHz (fb=0x%llx->%p shadow=%p bytes=%llu hiResVsync=1 scanThread=%u brightAsync=1)\n",
              g_PostInfo.Width, g_PostInfo.Height,
              g_HwPanelHz ? g_HwPanelHz : 120u,
-             (ULONGLONG)g_PostInfo.PhysicAddress.QuadPart, g_FbVa, (ULONGLONG)g_FbBytes);
+             (ULONGLONG)g_PostInfo.PhysicAddress.QuadPart, g_FbVa, g_ShadowVa, (ULONGLONG)g_FbBytes,
+             (g_ScanThread != NULL) ? 1u : 0u);
     return STATUS_SUCCESS;
 }
 
@@ -613,11 +690,23 @@ VOID DispStop(VOID)
 
     KeFlushQueuedDpcs();
 
+    if (g_ScanThread != NULL) {
+        KeSetEvent(&g_ScanStopEvent, IO_NO_INCREMENT, FALSE);
+        KeWaitForSingleObject(g_ScanThread, Executive, KernelMode, FALSE, NULL);
+        ObDereferenceObject(g_ScanThread);
+        g_ScanThread = NULL;
+    }
+
     if (g_BrightThread != NULL) {
         KeSetEvent(&g_BrightStop, IO_NO_INCREMENT, FALSE);
         KeWaitForSingleObject(g_BrightThread, Executive, KernelMode, FALSE, NULL);
         ObDereferenceObject(g_BrightThread);
         g_BrightThread = NULL;
+    }
+
+    if (g_TimerResSet) {
+        (void)ExSetTimerResolution(0u, FALSE);
+        g_TimerResSet = FALSE;
     }
 
     if (g_DsiLockInit) {
@@ -628,6 +717,10 @@ VOID DispStop(VOID)
     KeWaitForSingleObject(&g_ScanLock, Executive, KernelMode, FALSE, NULL);
     g_FlipAlloc = NULL;
     g_LutActive = FALSE;
+    if (g_ShadowVa != NULL) {
+        ExFreePoolWithTag(g_ShadowVa, S23GPU_POOL_TAG);
+        g_ShadowVa = NULL;
+    }
     if (g_FbVa != NULL) {
         MmUnmapIoSpace(g_FbVa, g_FbBytes);
         g_FbVa = NULL;
@@ -767,11 +860,19 @@ VOID DispPresentRects(S23GPU_ALLOCATION *Dst, const UCHAR *DstPixels, const RECT
                 }
                 {
                     LONG y;
+                    SIZE_T rectBytes = (SIZE_T)w * 4u;
+                    if (g_ShadowVa != NULL) {
+                        for (y = r.top; y < r.bottom; y++) {
+                            RtlCopyMemory(g_ShadowVa + (SIZE_T)y * g_PostInfo.Pitch + (SIZE_T)r.left * 4u,
+                                          DstPixels + (SIZE_T)y * dstPitch + (SIZE_T)r.left * 4u,
+                                          rectBytes);
+                        }
+                    }
                     if (!g_LutActive) {
                         for (y = r.top; y < r.bottom; y++) {
                             RtlCopyMemory((PUCHAR)g_FbVa + (SIZE_T)y * g_PostInfo.Pitch + (SIZE_T)r.left * 4u,
                                           DstPixels + (SIZE_T)y * dstPitch + (SIZE_T)r.left * 4u,
-                                          (SIZE_T)w * 4u);
+                                          rectBytes);
                         }
                     } else {
                         for (y = r.top; y < r.bottom; y++) {
@@ -824,29 +925,33 @@ VOID DispScanoutWork(VOID)
 
                 if (copyW > 0u && copyH > 0u) {
                     LARGE_INTEGER freq = {0}, t0, t1;
-                    ULONG us = 0;
+                    ULONG us = 0, row, dirtyRows = 0;
+                    BOOLEAN forceAll = g_ShadowDirty;
+                    SIZE_T rowBytes = (SIZE_T)copyW * 4u;
+
+                    g_ShadowDirty = FALSE;
                     t0 = KeQueryPerformanceCounter(&freq);
-                    if (!g_LutActive) {
-                        if (srcPitch == g_PostInfo.Pitch && copyW * 4u == g_PostInfo.Pitch) {
-                            RtlCopyMemory(g_FbVa, src, (SIZE_T)copyH * g_PostInfo.Pitch);
-                        } else {
-                            ULONG row;
-                            for (row = 0; row < copyH; row++) {
-                                RtlCopyMemory((PUCHAR)g_FbVa + (SIZE_T)row * g_PostInfo.Pitch,
-                                              src + (SIZE_T)row * srcPitch,
-                                              (SIZE_T)copyW * 4u);
+                    for (row = 0; row < copyH; row++) {
+                        const UCHAR *srcRow = src + (SIZE_T)row * srcPitch;
+                        PUCHAR fbRow = (PUCHAR)g_FbVa + (SIZE_T)row * g_PostInfo.Pitch;
+                        if (g_ShadowVa != NULL) {
+                            PUCHAR shRow = g_ShadowVa + (SIZE_T)row * g_PostInfo.Pitch;
+                            if (!forceAll && RtlCompareMemory(shRow, srcRow, rowBytes) == rowBytes) {
+                                continue;
                             }
+                            RtlCopyMemory(shRow, srcRow, rowBytes);
                         }
-                    } else {
-                        ULONG row;
-                        for (row = 0; row < copyH; row++) {
-                            CopyRowWithLut((PULONG)((PUCHAR)g_FbVa + (SIZE_T)row * g_PostInfo.Pitch),
-                                           (const ULONG *)(src + (SIZE_T)row * srcPitch),
-                                           copyW);
+                        dirtyRows++;
+                        if (!g_LutActive) {
+                            RtlCopyMemory(fbRow, srcRow, rowBytes);
+                        } else {
+                            CopyRowWithLut((PULONG)fbRow, (const ULONG *)srcRow, copyW);
                         }
                     }
                     t1 = KeQueryPerformanceCounter(NULL);
                     g_ScanCount++;
+                    g_ScanWinCount++;
+                    g_ScanRowsSum += dirtyRows;
                     if (freq.QuadPart > 0) {
                         us = (ULONG)(((ULONGLONG)(t1.QuadPart - t0.QuadPart) * 1000000ULL) / (ULONGLONG)freq.QuadPart);
                         g_ScanUsSum += us;
@@ -854,7 +959,9 @@ VOID DispScanoutWork(VOID)
                             g_ScanUsMax = us;
                         }
                     }
-                    if (g_ScanCount <= 300u && (g_ScanCount == 1u || g_ScanCount == 10u || (g_ScanCount % 60u) == 0u)) {
+                    if (g_ScanCount == 1u || g_ScanCount == 10u ||
+                        ((g_ScanCount % 120u) == 0u && g_ScanCount <= 3600u) ||
+                        ((g_ScanCount % 600u) == 0u)) {
                         volatile ULONG *fb = (volatile ULONG *)g_FbVa;
                         SIZE_T stridePx = g_PostInfo.Pitch / 4u;
                         SIZE_T totalPx = g_FbBytes / 4u;
@@ -863,14 +970,16 @@ VOID DispScanoutWork(VOID)
                         ULONG p0 = (totalPx > 0u) ? fb[0] : 0u;
                         ULONG p1 = (midIdx < totalPx) ? fb[midIdx] : 0u;
                         ULONG p2 = (botIdx < totalPx) ? fb[botIdx] : 0u;
-                        ULONG avg = (g_ScanCount > 1u) ? (ULONG)(g_ScanUsSum / (g_ScanCount - 1u)) : us;
-                        LogPrint("disp: scanout #%u last=%u us avg=%u us max=%u us (%ux%u pitch=%u->%u bo=%u px=%08x/%08x/%08x)\n",
-                                 g_ScanCount, us, avg, g_ScanUsMax, copyW, copyH, srcPitch, g_PostInfo.Pitch,
-                                 (al->Bo != NULL) ? 1u : 0u, p0, p1, p2);
-                        if (g_ScanCount == 1u) {
-                            g_ScanUsSum = 0;
-                            g_ScanUsMax = 0;
-                        }
+                        ULONG avg = (g_ScanWinCount > 0u) ? (ULONG)(g_ScanUsSum / g_ScanWinCount) : us;
+                        ULONG avgRows = (g_ScanWinCount > 0u) ? (ULONG)(g_ScanRowsSum / g_ScanWinCount) : dirtyRows;
+                        ULONG flips = (ULONG)InterlockedCompareExchange(&g_FlipCount, 0, 0);
+                        LogPrint("disp: scanout #%u flips=%u last=%u us avg=%u us max=%u us rows=%u/%u (%ux%u pitch=%u->%u bo=%u px=%08x/%08x/%08x)\n",
+                                 g_ScanCount, flips, us, avg, g_ScanUsMax, avgRows, copyH, copyW, copyH,
+                                 srcPitch, g_PostInfo.Pitch, (al->Bo != NULL) ? 1u : 0u, p0, p1, p2);
+                        g_ScanWinCount = 0;
+                        g_ScanUsSum = 0;
+                        g_ScanUsMax = 0;
+                        g_ScanRowsSum = 0;
                     }
                 }
             }
@@ -889,6 +998,7 @@ VOID DispSystemWrite(PVOID Src, UINT W, UINT H, UINT Stride, UINT X, UINT Y)
     if (g_FbVa == NULL || Src == NULL || X >= g_PostInfo.Width || Y >= g_PostInfo.Height) {
         return;
     }
+    g_ShadowDirty = TRUE;
     copyW = (X + W > g_PostInfo.Width) ? (g_PostInfo.Width - X) : W;
     copyH = (Y + H > g_PostInfo.Height) ? (g_PostInfo.Height - Y) : H;
     for (row = 0; row < copyH; row++) {
@@ -905,17 +1015,18 @@ NTSTATUS DispSetSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS *A)
     if (A == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
+    InterlockedIncrement(&g_FlipCount);
     g_FlipAddr = A->PrimaryAddress;
     if (A->hAllocation != NULL) {
         InterlockedExchangePointer((PVOID volatile *)&g_FlipAlloc, A->hAllocation);
     }
-    if (++flipLog <= 30) {
+    if (KeGetCurrentIrql() == PASSIVE_LEVEL && ++flipLog <= 16) {
         LogPrint("disp: SetVidPnSourceAddress alloc=%p addr=0x%llx flags=0x%x irql=%u\n",
                  A->hAllocation, (ULONGLONG)A->PrimaryAddress.QuadPart,
                  A->Flags.Value, KeGetCurrentIrql());
     }
     if (KeGetCurrentIrql() <= DISPATCH_LEVEL) {
-        EngKickScanout();
+        DispKickScanout();
     } else {
         KeInsertQueueDpc(&g_ScanDpc, NULL, NULL);
     }
@@ -929,7 +1040,7 @@ NTSTATUS DispSetVisibility(const DXGKARG_SETVIDPNSOURCEVISIBILITY *A)
     }
     LogPrint("disp: SetVidPnSourceVisibility src=%u vis=%u\n", A->VidPnSourceId, A->Visible);
     if (A->Visible) {
-        EngKickScanout();
+        DispKickScanout();
     }
     return STATUS_SUCCESS;
 }
@@ -950,6 +1061,9 @@ static NTSTATUS DispApplyGammaRamp(const D3DKMDT_GAMMA_RAMP *Ramp, BOOLEAN Kick)
     prevActive = g_LutActive;
     if (Ramp == NULL || Ramp->Type == D3DDDI_GAMMARAMP_DEFAULT || Ramp->Type == D3DDDI_GAMMARAMP_UNINITIALIZED) {
         g_LutActive = FALSE;
+        if (prevActive) {
+            g_ShadowDirty = TRUE;
+        }
     } else if (Ramp->Type == D3DDDI_GAMMARAMP_RGB256x3x16) {
         const D3DDDI_GAMMA_RAMP_RGB256x3x16 *tbl = Ramp->Data.pRgb256x3x16;
         if (tbl == NULL || Ramp->DataSize < sizeof(*tbl)) {
@@ -969,6 +1083,7 @@ static NTSTATUS DispApplyGammaRamp(const D3DKMDT_GAMMA_RAMP *Ramp, BOOLEAN Kick)
                 }
             }
             g_LutActive = !isIdentity;
+            g_ShadowDirty = TRUE;
         }
     } else {
         st = STATUS_NOT_SUPPORTED;
@@ -988,7 +1103,7 @@ static NTSTATUS DispApplyGammaRamp(const D3DKMDT_GAMMA_RAMP *Ramp, BOOLEAN Kick)
                  r255, g255, b255);
     }
     if (NT_SUCCESS(st) && Kick && g_DispStarted) {
-        EngKickScanout();
+        DispKickScanout();
     }
     return st;
 }
@@ -1062,9 +1177,10 @@ NTSTATUS DispCommitVidPn(PDXGKRNL_INTERFACE Dxgk, const DXGKARG_COMMITVIDPN *A)
     }
     KeWaitForSingleObject(&g_ScanLock, Executive, KernelMode, FALSE, NULL);
     g_FlipAlloc = (S23GPU_ALLOCATION *)A->hPrimaryAllocation;
+    g_ShadowDirty = TRUE;
     KeReleaseMutex(&g_ScanLock, FALSE);
     if (A->hPrimaryAllocation != NULL) {
-        EngKickScanout();
+        DispKickScanout();
     }
     return STATUS_SUCCESS;
 }

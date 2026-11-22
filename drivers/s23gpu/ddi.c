@@ -1290,7 +1290,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     NTSTATUS st;
 
     LogOpen();
-    LogPrint("==== s23gpu.sys v1.0.1.8 WDDM 2.0 Full Display (1080x2340 @ 120Hz HW + Coherent WBWA + Brightness + Night Light) + Adreno 740 KMD ====\n");
+    LogPrint("==== s23gpu.sys v1.0.1.9 WDDM 2.0 Full Display (1080x2340 @ 120Hz HW + 0.5ms TimerRes + RowDelta Scanout + Brightness + Night Light) + Adreno 740 KMD ====\n");
     MsmInit();
 
     RtlZeroMemory(&d, sizeof(d));

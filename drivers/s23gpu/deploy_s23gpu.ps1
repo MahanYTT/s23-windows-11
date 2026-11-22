@@ -21,10 +21,15 @@ function Invoke-S23Link {
 
 function Invoke-S23PS {
     param([string]$Script, [int]$Timeout = 60)
-    $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Script))
-    & python $s23link exec -t $Timeout "powershell -NoProfile -NonInteractive -OutputFormat Text -EncodedCommand $enc"
-    if ($LASTEXITCODE -ne 0) {
-        throw "Remote PowerShell failed ($LASTEXITCODE)"
+    $full = "`$ProgressPreference = 'SilentlyContinue'; " + $Script
+    $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($full))
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & python $s23link exec -t $Timeout "powershell -NoProfile -NonInteractive -EncodedCommand $enc"
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $prevEap
+    if ($code -ne 0) {
+        throw "Remote PowerShell failed ($code)"
     }
 }
 
@@ -44,6 +49,15 @@ $remoteUmdOut = (Invoke-S23PS 'if (Test-Path C:\s23gpu\s23gpu_umd.dll) { (Get-Fi
 if ($remoteUmdOut -notmatch $localUmdMd5) {
     Invoke-S23Link put (Join-Path $pkgDir 's23gpu_umd.dll') 'C:\s23gpu\s23gpu_umd.dll'
 }
+
+Write-Host '=== Configuring Adreno 740 UMD fast scissor & present defaults ==='
+Invoke-S23PS @'
+New-Item -ItemType Directory -Force -Path 'C:\ProgramData\topaz' | Out-Null
+Remove-Item 'C:\ProgramData\topaz\umd.log.enable','C:\ProgramData\topaz\umd-*.log' -Force -ErrorAction SilentlyContinue
+Set-Content -Path 'C:\ProgramData\topaz\umd.env' -Value "TOPAZ_SCFIX=0`r`nTOPAZ_NOPRESENTWAIT=1`r`n" -Encoding ascii
+[Environment]::SetEnvironmentVariable('TOPAZ_SCFIX', '0', 'Machine')
+[Environment]::SetEnvironmentVariable('TOPAZ_NOPRESENTWAIT', '1', 'Machine')
+'@
 
 Write-Host '=== Installing driver ==='
 Invoke-S23Link exec -t 60 'C:\s23gpu\s23gpu_install.exe C:\s23gpu\s23gpu.inf'
