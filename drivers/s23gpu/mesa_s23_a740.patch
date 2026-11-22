@@ -26,9 +26,329 @@ index 1b1f5b8..a80e371 100644
    endif
    if with_gallium_softpipe and with_gallium_virgl
      warning('The d3d10umd state trackes is built with both softpipe/llvmpipe and virgl, only virgl will be used.')
+diff --git a/src/gallium/targets/wgl/meson.build b/src/gallium/targets/wgl/meson.build
+index de50809..e51d4ad 100644
+--- a/src/gallium/targets/wgl/meson.build
++++ b/src/gallium/targets/wgl/meson.build
+@@ -13,7 +13,7 @@ wgl_def = custom_target(
+ gallium_wgl_name = get_option('gallium-wgl-dll-name')
+ libgallium_wgl = shared_library(
+   gallium_wgl_name,
+-  ['wgl.c', 'dxgi_framebuffer.cpp'],
++  ['wgl.c'],
+   vs_module_defs : wgl_def,
+   include_directories : [
+     inc_include, inc_src, inc_mapi, inc_mesa, inc_gallium, inc_gallium_aux, inc_wgl, inc_gallium_winsys, inc_gallium_winsys_sw, inc_gallium_drivers,
+@@ -24,7 +24,7 @@ libgallium_wgl = shared_library(
+   ],
+   dependencies : [
+     dep_ws2_32, idep_nir, idep_mesautil, driver_swrast,
+-    driver_d3d12, driver_zink, driver_virgl, winsys_d3d12_wgl
++    driver_d3d12, driver_zink, driver_virgl, driver_freedreno, winsys_d3d12_wgl
+   ],
+   link_args : gallium_wgl_link_args,
+   name_prefix : '',
+diff --git a/src/gallium/targets/wgl/wgl.c b/src/gallium/targets/wgl/wgl.c
+index f11629e..5e3671f 100644
+--- a/src/gallium/targets/wgl/wgl.c
++++ b/src/gallium/targets/wgl/wgl.c
+@@ -63,6 +63,37 @@
+ #include "zink/zink_public.h"
+ #endif
+ 
++#ifdef GALLIUM_FREEDRENO
++#include "xf86drm.h"
++#include "util/xmlconfig.h"
++#include "util/driconf.h"
++#include "util/u_inlines.h"
++#include "util/u_transfer.h"
++#include "util/format/u_format.h"
++#include "renderonly/renderonly.h"
++#include "compiler/glsl_types.h"
++
++struct pipe_screen *fd_screen_create(int fd, const struct pipe_screen_config *config, struct renderonly *ro);
++static bool use_freedreno = false;
++static const driOptionDescription fd_driconf[] = {
++#include "freedreno/driinfo_freedreno.h"
++};
++static driOptionCache fd_options;
++static struct pipe_screen_config fd_config;
++
++void
++renderonly_scanout_destroy(struct renderonly_scanout *scanout, struct renderonly *ro)
++{
++}
++
++struct renderonly_scanout *
++renderonly_create_gpu_import_for_resource(struct pipe_resource *rsc, struct renderonly *ro,
++                                          struct winsys_handle *out_handle)
++{
++   return NULL;
++}
++#endif
++
+ #ifdef GALLIUM_VIRGL
+ #include "virgl/gdi/virgl_gdi_public.h"
+ static bool use_virgl = false;
+@@ -86,6 +117,22 @@ wgl_screen_create_by_name(HDC hDC, const char* driver, struct sw_winsys *winsys)
+ {
+    struct pipe_screen* screen = NULL;
+ 
++#ifdef GALLIUM_FREEDRENO
++   if (strcmp(driver, "freedreno") == 0) {
++      int fd = fd_wddm_open_kmt();
++      if (fd >= 0) {
++         glsl_type_singleton_init_or_ref();
++         if (!fd_config.options) {
++            driParseOptionInfo(&fd_options, fd_driconf, ARRAY_SIZE(fd_driconf));
++            fd_config.options = &fd_options;
++            fd_config.options_info = &fd_options;
++         }
++         screen = fd_screen_create(fd, &fd_config, NULL);
++         if (screen)
++            use_freedreno = true;
++      }
++   }
++#endif
+ #ifdef GALLIUM_VIRGL
+    if (strcmp(driver, "virgl") == 0) {
+       screen = virgl_gdi_screen_create(gdikmt_create_from_hdc(hDC));
+@@ -135,6 +182,9 @@ wgl_screen_create(HDC hDC)
+ 
+    const char *const drivers[] = {
+       debug_get_option("GALLIUM_DRIVER", ""),
++#ifdef GALLIUM_FREEDRENO
++      sw_only ? "" : "freedreno",
++#endif
+ #ifdef GALLIUM_VIRGL
+       sw_only ? "" : "virgl",
+ #endif
+@@ -191,6 +241,48 @@ wgl_present(struct pipe_screen *screen,
+    struct sw_displaytarget *dt = NULL;
+ #endif
+ 
++#ifdef GALLIUM_FREEDRENO
++   if (use_freedreno) {
++      if (!hDC || !res)
++         return;
++      static struct pipe_context *present_ctx = NULL;
++      struct pipe_context *pctx = ctx;
++      if (!pctx) {
++         if (!present_ctx)
++            present_ctx = screen->context_create(screen, NULL, 0);
++         pctx = present_ctx;
++      }
++      if (!pctx)
++         return;
++      struct pipe_transfer *transfer = NULL;
++      void *map = pipe_texture_map(pctx, res, 0, 0, PIPE_MAP_READ,
++                                   0, 0, res->width0, res->height0, &transfer);
++      if (map && transfer) {
++         unsigned cpp = util_format_get_blocksize(res->format);
++         unsigned bpp = util_format_get_blocksizebits(res->format);
++         BITMAPV5HEADER bmi;
++         memset(&bmi, 0, sizeof(bmi));
++         bmi.bV5Size = sizeof(BITMAPV5HEADER);
++         bmi.bV5Width = (LONG)(transfer->stride / (cpp ? cpp : 4));
++         bmi.bV5Height = -(LONG)res->height0;
++         bmi.bV5Planes = 1;
++         bmi.bV5BitCount = (WORD)(bpp ? bpp : 32);
++         bmi.bV5Compression = BI_RGB;
++         if (res->format == PIPE_FORMAT_R8G8B8X8_UNORM ||
++             res->format == PIPE_FORMAT_R8G8B8A8_UNORM) {
++            bmi.bV5Compression = BI_BITFIELDS;
++            bmi.bV5RedMask = 0x000000ff;
++            bmi.bV5GreenMask = 0x0000ff00;
++            bmi.bV5BlueMask = 0x00ff0000;
++         }
++         StretchDIBits(hDC, 0, 0, res->width0, res->height0,
++                       0, 0, res->width0, res->height0,
++                       map, (BITMAPINFO *)&bmi, 0, SRCCOPY);
++         pipe_texture_unmap(pctx, transfer);
++      }
++      return;
++   }
++#endif
+ #ifdef GALLIUM_VIRGL
+    if (use_virgl) {
+       screen->flush_frontbuffer(screen, ctx, res, 0, 0, hDC, 0, NULL);
+diff --git a/src/util/half_float.h b/src/util/half_float.h
+index 779cf08..f35f826 100644
+--- a/src/util/half_float.h
++++ b/src/util/half_float.h
+@@ -118,6 +118,10 @@ _mesa_half_is_negative(uint16_t h)
+ 
+ /* Helper class for disambiguating fp16 from uint16_t in C++ overloads */
+ 
++#if defined(__clang__) && (defined(_M_ARM64) || defined(__aarch64__))
++#include <arm_neon.h>
++#endif
++#define float16_t mesa_float16_t
+ struct float16_t {
+    uint16_t bits;
+    float16_t(float f) : bits(_mesa_float_to_half(f)) {}
+--- a/src/freedreno/drm/wddm/fd_wddm_compat.h
++++ b/src/freedreno/drm/wddm/fd_wddm_compat.h
+@@ -18,6 +18,7 @@
+ #endif
+ #define asprintf fd_wddm_asprintf
+ #define vasprintf fd_wddm_vasprintf
++#define STRNDUP_H
+ #define strndup fd_wddm_strndup
+ #define ftruncate fd_wddm_ftruncate
+ #define open_memstream fd_wddm_open_memstream
+@@ -57,3 +58,5 @@
+ #define clock_gettime(c, t) fd_wddm_clock_gettime(c, t)
+ #endif
+ #endif
++
++#include <io.h>
+--- a/src/freedreno/drm/wddm/include/xf86drm.h
++++ b/src/freedreno/drm/wddm/include/xf86drm.h
+@@ -40,6 +40,7 @@
+ /* TopazGpu: fake DRM fd bound to an escape callback (the D3D10 UMD's KMD channel). */
+ typedef int (*fd_wddm_escape_fn)(void *ctx, void *data, unsigned size);
+ int fd_wddm_open(fd_wddm_escape_fn escape, void *ctx);
++int fd_wddm_open_kmt(void);
+ /* the D3D device behind ctx is gone: its slots must never escape again */
+ void fd_wddm_detach(void *ctx);
+ #ifdef __cplusplus
 --- a/src/freedreno/drm/wddm/fd_wddm.c
 +++ b/src/freedreno/drm/wddm/fd_wddm.c
-@@ -167,6 +167,10 @@
+@@ -51,6 +51,109 @@
+    return ret;
+ }
+ 
++
++typedef LONG NTSTATUS;
++#include <d3dkmthk.h>
++
++struct fd_wddm_kmt_ctx {
++   D3DKMT_HANDLE hAdapter;
++   D3DKMT_HANDLE hDevice;
++   PFND3DKMT_ESCAPE pfnEscape;
++};
++
++static int
++fd_wddm_kmt_escape(void *ctx, void *data, unsigned size)
++{
++   struct fd_wddm_kmt_ctx *k = (struct fd_wddm_kmt_ctx *)ctx;
++   D3DKMT_ESCAPE ke;
++   memset(&ke, 0, sizeof(ke));
++   ke.hAdapter = k->hAdapter;
++   ke.hDevice = k->hDevice;
++   ke.Type = D3DKMT_ESCAPE_DRIVERPRIVATE;
++   ke.pPrivateDriverData = data;
++   ke.PrivateDriverDataSize = size;
++   return k->pfnEscape(&ke) >= 0 ? 0 : -1;
++}
++
++int
++fd_wddm_open_kmt(void)
++{
++   static struct fd_wddm_kmt_ctx s_kmt;
++   static int s_fd = -1;
++   if (s_fd >= 0)
++      return s_fd;
++
++   HMODULE hGdi = GetModuleHandleA("gdi32.dll");
++   if (!hGdi)
++      hGdi = LoadLibraryA("gdi32.dll");
++   if (!hGdi)
++      return -1;
++
++   PFND3DKMT_ENUMADAPTERS3 pEnum3 = (PFND3DKMT_ENUMADAPTERS3)GetProcAddress(hGdi, "D3DKMTEnumAdapters3");
++   PFND3DKMT_ENUMADAPTERS2 pEnum2 = (PFND3DKMT_ENUMADAPTERS2)GetProcAddress(hGdi, "D3DKMTEnumAdapters2");
++   PFND3DKMT_QUERYADAPTERINFO pQuery = (PFND3DKMT_QUERYADAPTERINFO)GetProcAddress(hGdi, "D3DKMTQueryAdapterInfo");
++   PFND3DKMT_CREATEDEVICE pCreateDev = (PFND3DKMT_CREATEDEVICE)GetProcAddress(hGdi, "D3DKMTCreateDevice");
++   PFND3DKMT_CLOSEADAPTER pClose = (PFND3DKMT_CLOSEADAPTER)GetProcAddress(hGdi, "D3DKMTCloseAdapter");
++   PFND3DKMT_ESCAPE pEsc = (PFND3DKMT_ESCAPE)GetProcAddress(hGdi, "D3DKMTEscape");
++   if (!pQuery || !pCreateDev || !pClose || !pEsc || (!pEnum3 && !pEnum2))
++      return -1;
++
++   D3DKMT_ADAPTERINFO infos[32];
++   ULONG count = 0;
++   if (pEnum3) {
++      D3DKMT_ENUMADAPTERS3 e3;
++      memset(&e3, 0, sizeof(e3));
++      e3.Filter.IncludeComputeOnly = 1;
++      e3.Filter.IncludeDisplayOnly = 1;
++      e3.NumAdapters = 32;
++      e3.pAdapters = infos;
++      if (pEnum3(&e3) >= 0)
++         count = e3.NumAdapters;
++   }
++   if (count == 0 && pEnum2) {
++      D3DKMT_ENUMADAPTERS2 e2;
++      memset(&e2, 0, sizeof(e2));
++      e2.NumAdapters = 32;
++      e2.pAdapters = infos;
++      if (pEnum2(&e2) >= 0)
++         count = e2.NumAdapters;
++   }
++
++   D3DKMT_HANDLE found = 0;
++   for (ULONG i = 0; i < count; i++) {
++      ULONG magic = 0;
++      D3DKMT_QUERYADAPTERINFO q;
++      memset(&q, 0, sizeof(q));
++      q.hAdapter = infos[i].hAdapter;
++      q.Type = KMTQAITYPE_UMDRIVERPRIVATE;
++      q.pPrivateDriverData = &magic;
++      q.PrivateDriverDataSize = sizeof(magic);
++      if (pQuery(&q) >= 0 && magic == TOPAZGPU_ESC_MAGIC && found == 0) {
++         found = infos[i].hAdapter;
++      } else {
++         D3DKMT_CLOSEADAPTER ca = { infos[i].hAdapter };
++         pClose(&ca);
++      }
++   }
++   if (!found)
++      return -1;
++
++   D3DKMT_CREATEDEVICE cd;
++   memset(&cd, 0, sizeof(cd));
++   cd.hAdapter = found;
++   if (pCreateDev(&cd) < 0) {
++      D3DKMT_CLOSEADAPTER ca = { found };
++      pClose(&ca);
++      return -1;
++   }
++
++   s_kmt.hAdapter = found;
++   s_kmt.hDevice = cd.hDevice;
++   s_kmt.pfnEscape = pEsc;
++   s_fd = fd_wddm_open(fd_wddm_kmt_escape, &s_kmt);
++   return s_fd;
++}
++
+ void
+ fd_wddm_detach(void *ctx)
+ {
+@@ -84,7 +187,7 @@
+ }
+ 
+ /* TopazGpu: TOPAZ_ESCLOG=1 logs escape counts per DRM command nr once per second (busy-polling hunt) */
+-extern void TopazWddmLogf(const char *fmt, ...);
++
+ static unsigned esc_count[256];
+ static ULONGLONG esc_t0;
+ static int esc_log = -1;
+@@ -120,11 +223,11 @@
+       for (unsigned i = 0; i < 256 && n < (int)sizeof(line) - 16; i++)
+          if (esc_count[i])
+             n += snprintf(line + n, sizeof(line) - n, " %02x=%u", i, esc_count[i]);
+-      TopazWddmLogf("%s\n", line);
++      fprintf(stderr, "%s\n", line);
+       n = snprintf(line, sizeof(line), "GEM_NEW/s by size (<=4K,16K,64K,256K,1M,4M,16M,>) x flags(wc,cohe,cached,unc):");
+       for (unsigned c = 0; c < 8; c++)
+          n += snprintf(line + n, sizeof(line) - n, " [%u %u %u %u]", esc_new_sz[c][0], esc_new_sz[c][1], esc_new_sz[c][2], esc_new_sz[c][3]);
+-      TopazWddmLogf("%s\n", line);
++      fprintf(stderr, "%s\n", line);
+       memset(esc_new_sz, 0, sizeof(esc_new_sz));
+       memset(esc_count, 0, sizeof(esc_count));
+       esc_t0 = now;
+@@ -167,6 +270,10 @@
     ret = fn(ctx, e, sizeof(*e));
     if (ret == 0) {
        ret = e->ret;
@@ -50,3 +370,33 @@ index 1b1f5b8..a80e371 100644
        QueryPerformanceFrequency(&qf);
     }
     QueryPerformanceCounter(&t0);
+@@ -348,18 +348,25 @@
+ TopazWddmEnabled(void)
+ {
+    TopazWddmLogInit();
++   if (GetEnvironmentVariableA("TOPAZGPU_DISABLE", NULL, 0) != 0)
++      return false;
+    bool on = GetEnvironmentVariableA("TOPAZGPU_ENABLE", NULL, 0) != 0 ||
+              GetFileAttributesA("C:\\topaz\\umd.enable") != INVALID_FILE_ATTRIBUTES;
+-   /* C:\topaz\umd.dwmonly: only dwm.exe uses the Adreno UMD; other processes fail OpenAdapter and the D3D
+-    * runtime falls back (WARP) - safety switch while app processes crash/hang on our UMD */
+-   if (on && GetFileAttributesA("C:\\topaz\\umd.dwmonly") != INVALID_FILE_ATTRIBUTES) {
++   if (on) {
+       char path[MAX_PATH];
+       DWORD n = GetModuleFileNameA(NULL, path, sizeof(path));
+       const char *base = path;
+       for (DWORD i = 0; i < n; i++)
+          if (path[i] == '\\' || path[i] == '/')
+             base = path + i + 1;
+-      if (_stricmp(base, "dwm.exe") != 0) {
++      bool dwm_only = GetFileAttributesA("C:\\topaz\\umd.dwmonly") != INVALID_FILE_ATTRIBUTES;
++      bool allow_dwm = GetFileAttributesA("C:\\topaz\\umd.allowdwm") != INVALID_FILE_ATTRIBUTES;
++      /* S23 Render-Only mode: ROOT\BasicDisplay\0000 owns scanout, so exclude dwm.exe by default
++       * unless C:\topaz\umd.allowdwm or C:\topaz\umd.dwmonly exists. */
++      if (_stricmp(base, "dwm.exe") == 0 && !allow_dwm && !dwm_only) {
++         TopazWddmLogf("topaz: render-only default - dwm.exe excluded (create C:\\topaz\\umd.allowdwm to override)\n");
++         on = false;
++      } else if (dwm_only && _stricmp(base, "dwm.exe") != 0) {
+          TopazWddmLogf("topaz: umd.dwmonly - %s does not use the Adreno UMD\n", base);
+          on = false;
+       }

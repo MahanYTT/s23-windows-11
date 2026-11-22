@@ -66,8 +66,19 @@ if ($LASTEXITCODE) { throw "cl.exe install failed: $LASTEXITCODE" }
 & $cl /nologo /MT /O2 /W3 @umInc (Join-Path $dir 's23gpu_d3d11_test.c') "/Fo$outDir\s23gpu_d3d11_test.obj" /link /MACHINE:ARM64 @umLibPaths d3d11.lib dxgi.lib dxguid.lib d3dcompiler.lib user32.lib gdi32.lib kernel32.lib "/OUT:$outDir\s23gpu_d3d11_test.exe"
 if ($LASTEXITCODE) { throw "cl.exe d3d11_test failed: $LASTEXITCODE" }
 
+& $cl /nologo /MT /O2 /W3 @umInc (Join-Path $dir 's23gpu_opengl_test.c') "/Fo$outDir\s23gpu_opengl_test.obj" /link /MACHINE:ARM64 @umLibPaths opengl32.lib user32.lib gdi32.lib kernel32.lib "/OUT:$outDir\s23gpu_opengl_test.exe"
+if ($LASTEXITCODE) { throw "cl.exe opengl_test failed: $LASTEXITCODE" }
+
 Write-Host "Using Mesa Freedreno UMD: $mesaUmd"
 Copy-Item $mesaUmd (Join-Path $outDir 's23gpu_umd.dll') -Force
+
+$wslWglDll = '/home/mahan/mesa_s23/build_d3d10/src/gallium/targets/wgl/libgallium_wgl.dll'
+$wslGlDll  = '/home/mahan/mesa_s23/build_d3d10/src/gallium/targets/libgl-gdi/opengl32.dll'
+wsl bash -lc "if test -f '$wslWglDll' && test -f '$wslGlDll'; then cp '$wslWglDll' '/mnt/c/Users/Mahan/Documents/windows-on-android/s23_dm1q/drivers/s23gpu/out/libgallium_wgl.dll' && cp '$wslGlDll' '/mnt/c/Users/Mahan/Documents/windows-on-android/s23_dm1q/drivers/s23gpu/out/opengl32.dll'; fi" 2>$null
+if (Test-Path (Join-Path $outDir 'libgallium_wgl.dll')) {
+    & $signtool sign /fd SHA256 /sha1 $thumb (Join-Path $outDir 'libgallium_wgl.dll') (Join-Path $outDir 'opengl32.dll')
+    if ($LASTEXITCODE) { throw "signtool OpenGL DLLs failed: $LASTEXITCODE" }
+}
 
 Write-Host '=== Packaging & Signing ==='
 Copy-Item $sysOut (Join-Path $pkgDir 's23gpu.sys') -Force

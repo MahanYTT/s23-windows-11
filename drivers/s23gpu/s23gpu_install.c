@@ -9,9 +9,14 @@
 #include <devguid.h>
 #include <stdio.h>
 
-static int FindExistingRootS23Gpu(void)
+static const WCHAR kS23GpuHwIds[] =
+    L"ROOT\\S23GPU\0"
+    L"PCI\\VEN_5143&DEV_0740&SUBSYS_07405143&REV_01\0"
+    L"PCI\\VEN_5143&DEV_0740\0";
+
+static int EnsureRootS23GpuHwIds(void)
 {
-    HDEVINFO dis = SetupDiGetClassDevsW(&GUID_DEVCLASS_DISPLAY, NULL, NULL, 0);
+    HDEVINFO dis = SetupDiGetClassDevsW(NULL, L"ROOT", NULL, DIGCF_ALLCLASSES);
     if (dis == INVALID_HANDLE_VALUE) return 0;
 
     SP_DEVINFO_DATA did;
@@ -21,6 +26,8 @@ static int FindExistingRootS23Gpu(void)
         if (SetupDiGetDeviceRegistryPropertyW(dis, &did, SPDRP_HARDWAREID, NULL,
                                               (PBYTE)hwid, sizeof(hwid) - sizeof(WCHAR), NULL)) {
             if (_wcsicmp(hwid, L"ROOT\\S23GPU") == 0) {
+                SetupDiSetDeviceRegistryPropertyW(dis, &did, SPDRP_HARDWAREID,
+                                                  (const BYTE *)kS23GpuHwIds, sizeof(kS23GpuHwIds));
                 SetupDiDestroyDeviceInfoList(dis);
                 return 1;
             }
@@ -38,7 +45,7 @@ int wmain(int argc, wchar_t **argv)
     }
     LPCWSTR infPath = argv[1];
 
-    if (!FindExistingRootS23Gpu()) {
+    if (!EnsureRootS23GpuHwIds()) {
         HDEVINFO dis = SetupDiCreateDeviceInfoList(&GUID_DEVCLASS_DISPLAY, NULL);
         if (dis == INVALID_HANDLE_VALUE) {
             wprintf(L"[ERR] SetupDiCreateDeviceInfoList err=%lu\n", GetLastError());
@@ -53,9 +60,8 @@ int wmain(int argc, wchar_t **argv)
             SetupDiDestroyDeviceInfoList(dis);
             return 1;
         }
-        static const WCHAR kHwId[] = L"ROOT\\S23GPU\0";
         if (!SetupDiSetDeviceRegistryPropertyW(dis, &did, SPDRP_HARDWAREID,
-                                               (const BYTE *)kHwId, sizeof(kHwId))) {
+                                               (const BYTE *)kS23GpuHwIds, sizeof(kS23GpuHwIds))) {
             wprintf(L"[ERR] SetDeviceRegistryProperty err=%lu\n", GetLastError());
             SetupDiDestroyDeviceInfoList(dis);
             return 1;
@@ -66,9 +72,9 @@ int wmain(int argc, wchar_t **argv)
             return 1;
         }
         SetupDiDestroyDeviceInfoList(dis);
-        wprintf(L"Created ROOT\\S23GPU root device node\n");
+        wprintf(L"Created ROOT\\S23GPU root device node (VEN_5143&DEV_0740)\n");
     } else {
-        wprintf(L"ROOT\\S23GPU device node already exists\n");
+        wprintf(L"ROOT\\S23GPU device node already exists (updated HardwareIDs to VEN_5143&DEV_0740)\n");
     }
 
     BOOL reboot = FALSE;

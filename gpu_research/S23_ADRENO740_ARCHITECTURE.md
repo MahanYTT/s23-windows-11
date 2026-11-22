@@ -377,30 +377,36 @@ Tested incrementally live on the Galaxy S23 (`RFCW90N0N7X`, `StageMask = 0x7B` -
     - **Test 4** (BO close + re-alloc): `PASS`.
   - Clean `StopDevice` + cold-restart cycle (`pnputil /disable-device` -> `/enable-device` on `ROOT\DISPLAY\0000`) -> Run 2 (`LUID 0:0151d263`, `TS=154908831397->154909044075`, `d=212678`): all 4 tests passed identically with `s23link.py ping` (`pong 2.0 ms`).
 
-### 5.7 Live ARM64 Mesa 24.3 (`Freedreno` + `d3d10umd`) Hardware-Accelerated Direct3D 11 & DXGI SwapChain Rendering (`s23gpu.sys v1.0.0.4`)
+### 5.7 Live ARM64 Mesa 24.3 (`Freedreno` + `d3d10umd` + `WGL`) Hardware-Accelerated Direct3D 11, DXGI SwapChain & OpenGL 4.6 Rendering (`s23gpu.sys v1.0.0.5`)
 
 - **WSL2 ARM64 Mesa 24.3 (`62f1e49a1eb3a408f748725326fe53447887f97d`) Cross-Build (`/home/mahan/mesa_s23/`)**:
-  - Cross-compiled `libgallium_d3d10.dll` -> `s23gpu_umd.dll` (`8,237,440 B` signed with `CN=S23TouchTest2020`, `[766/766]` targets) using `clang-18 --driver-mode=cl --target=aarch64-pc-windows-msvc` + `lld-link`, MSVC `14.44.35207` ARM64 `/MT` static CRT, Windows SDK `10.0.26100.0` ARM64 libraries, and static `zlib` (`-Dgallium-drivers=freedreno -Dgallium-d3d10umd=true -Dfreedreno-kmds=msm -Db_vscrt=mt -Dzlib=enabled -Dzlib:default_library=static`).
-  - Applied `mesa-G739` (`src/freedreno/drm/wddm/fd_wddm.c` + `src/gallium/frontends/d3d10umd/topaz_wddm.cpp`) plus S23-specific patch [`drivers/s23gpu/mesa_s23_a740.patch`](../drivers/s23gpu/mesa_s23_a740.patch):
+  - Cross-compiled `libgallium_d3d10.dll` -> `s23gpu_umd.dll` (`8,237,952 B`), `libgallium_wgl.dll` (`13,479,296 B`), and `opengl32.dll` (`137,088 B`, all signed with `CN=S23TouchTest2020`, `[1050/1050]` targets) using `clang-18 --driver-mode=cl --target=aarch64-pc-windows-msvc` + `lld-link`, MSVC `14.44.35207` ARM64 `/MT` static CRT, Windows SDK `10.0.26100.0` ARM64 libraries, and static `zlib` (`-Dgallium-drivers=freedreno -Dgallium-d3d10umd=true -Dopengl=true -Dfreedreno-kmds=msm -Db_vscrt=mt -Dzlib=enabled -Dzlib:default_library=static`).
+  - Applied `mesa-G739` (`src/freedreno/drm/wddm/fd_wddm.c` + `src/gallium/frontends/d3d10umd/topaz_wddm.cpp`) plus S23-specific patch [`drivers/s23gpu/mesa_s23_a740.patch`](../drivers/s23gpu/mesa_s23_a740.patch) (`402 lines`):
     1. `meson.build`: `(cc.get_argument_syntax() == 'msvc' ? '/FI' : '-include')` for `fd_wddm_compat.h`.
-    2. `fd_wddm.c`: translate KMD `-62 -> -ETIMEDOUT (138)` and `-38 -> -ENOSYS (40)` for Windows UCRT `errno.h`.
-    3. `topaz_wddm.cpp`: default `nowait = 0` (`TOPAZ_NOPRESENTWAIT` opt-in) so Render-Only presents wait for the GPU BO fence before `pfnPresentCb`.
-- **KMD `s23gpu.sys v1.0.0.4` Enhancements (`70,016 B`, `PE VERIFICATION: PASS` 48/48 `ntoskrnl` + 3/3 `hal`)**:
+    2. `fd_wddm.c` / `xf86drm.h`: translate KMD `-62 -> -ETIMEDOUT (138)` and `-38 -> -ENOSYS (40)` for Windows UCRT `errno.h`, and add `fd_wddm_open_kmt()` (`D3DKMTEnumAdapters3`/`D3DKMTQueryAdapterInfo` `TOPAZGPU_ESC_MAGIC` + `D3DKMTCreateDevice` + `D3DKMTEscape`) so OpenGL WGL (`libgallium_wgl.dll`) opens `s23gpu.sys` directly.
+    3. `topaz_wddm.cpp`: default `nowait = 0` (`TOPAZ_NOPRESENTWAIT` opt-in) so Render-Only presents wait for the GPU BO fence before `pfnPresentCb`, and exclude `dwm.exe` by default in `TopazWddmEnabled()` (unless `C:\topaz\umd.allowdwm` or `C:\topaz\umd.dwmonly` exists) so `C:\topaz\umd.enable` can be enabled globally for all applications while `dwm.exe` stays safely on `ROOT\BasicDisplay\0000`.
+    4. `src/gallium/targets/wgl/{meson.build, wgl.c}`: wire `GALLIUM_FREEDRENO` (`driver_freedreno`) into `wgl_screen_create_by_name`, `wgl_screen_create`, and `wgl_present` (`pipe_texture_map` + `StretchDIBits`).
+- **KMD `s23gpu.sys v1.0.0.5` Enhancements (`70,016 B`, `PE VERIFICATION: PASS` 48/48 `ntoskrnl` + 3/3 `hal`)**:
   - `msm_validate.h`: check `c->nr_relocs != 0u` only (upstream Mesa `msm_ringbuffer_sp.c` allocates `drm_msm_gem_submit_cmd` on the stack with `nr_relocs = 0` and uninitialized `relocs`).
   - `msm.c` / `hw.c`: QPC-based `KeQueryPerformanceCounter` timeout loop in `DRM_MSM_WAIT_FENCE` with live A740 fault telemetry (`RPTR`, `WPTR`, `RBBM_STATUS`, `CP_HW_FAULT`, `CB0_FSR`, `CB0_FAR`) and multi-context `g_LastSubmitOwner` tracking (`CP_SET_AMBLE(1)` `CTX_RESTORE_BUF` preamble emitted on context switch).
   - `ddi.c` / `eng.c`: WDDM allocation private data (`TOPAZGPU_ALLOC_MAGIC = 0x31415054`), Render-Only `DxgkDdiPresent` (`TgPresent`) & `DxgkDdiBuildPagingBuffer`, and 128-slot `EngSubmit` fence ring so `DxgkCbNotifyInterrupt` + `DxgkCbNotifyDpc` complete every DXGI `PresentCb` cleanly.
-- **Live On-Device Verification (`drivers/s23gpu/s23gpu_d3d11_test.c`, captured in `drivers/s23gpu/s23gpu_v3_d3d11_live.log`)**:
+- **Live On-Device Verification (`drivers/s23gpu/s23gpu_d3d11_test.c` & `drivers/s23gpu/s23gpu_opengl_test.c`, captured in `drivers/s23gpu/s23gpu_v3_d3d11_live.log`)**:
   - **`FD_MESA_DEBUG=sysmem` (System Memory Bypass Mode)**:
     - `D3D11CreateDevice` on `Qualcomm Adreno 740 Render-Only GPU (S23)` succeeded with `FeatureLevel = 0xa000`.
     - **Test 1 (Clear RT `256x256`)**: `@128,128 RGBA = (51,102,204,255)` -> **`PASS`**.
     - **Test 2 (HLSL VS+PS 3D Triangle)**: `corner(4,4)=(13,13,38,255)`, `center(128,140)=(108,74,73,255)`, `top(128,70)=(216,20,19,255)`, `right(175,190)=(32,184,39,255)`, `left(81,190)=(32,40,183,255)` -> **`PASS`**.
     - **Test 3 (120-Frame Rotating 3D Triangle Benchmark)**: `120 frames in 43.83 ms` (**`2,738.1 FPS`**) -> **`PASS`**.
-  - **Default 3 MiB On-Chip GMEM Tiled Binning Mode (`0x01000000 + 0x00300000`, `HBB = 16`)**:
+  - **Default 3 MiB On-Chip GMEM Tiled Binning Mode (`0x01000000 + 0x00300000`, `HBB = 16`, Global `C:\topaz\umd.enable`)**:
     - Tests 1–3 **`ALL PASS`**, achieving **`2,674.0 FPS` cold (`44.88 ms`)** and **`4,710.4 FPS` warm (`25.48 ms`)**.
     - Pixel-for-pixel comparison between `sysmem` and `gmem` `256x256` readback BMPs: **`max_abs_diff = 0` across all `196,608` color channels**.
   - **Session 1 Interactive Desktop `IDXGISwapChain` (`s23gpu_d3d11_test.exe --window`)**:
     - `IDXGIFactory::CreateSwapChain` on Adreno 740 (`DXGI[1]` alongside `ROOT\BasicDisplay\0000` on `DXGI[0]`): **`hr = 0x00000000 (S_OK)`**.
     - `IDXGISwapChain::Present(0, 0)` across 60 consecutive interactive frames: **`DXGI Present #1..#60 -> 0x00000000 (S_OK)`**.
+  - **Live Hardware OpenGL 4.6 + WGL (`s23gpu_opengl_test.exe` with `opengl32.dll` + `libgallium_wgl.dll`)**:
+    - **`GL_VENDOR: freedreno`**, **`GL_RENDERER: FD740`**, **`GL_VERSION: 4.6 (Compatibility Profile) Mesa 24.3.0-devel (git-62f1e49a1e)`**, **`GL_SHADING_LANGUAGE_VERSION: 4.60`**.
+    - **Test 1 (`glClear 256x256`)**: `@128,128 RGBA = (51,102,204,255)` -> **`PASS`**.
+    - **Test 2 (`GLSL VS+FS 3D Triangle + SwapBuffers`)**: `corner=(13,13,38,255)`, `center=(108,74,73,255)`, `top=(216,20,19,255)`, `right=(32,184,39,255)`, `left=(32,40,183,255)` (**`max_abs_diff = 0` vs D3D11 GMEM BMP!**) -> **`PASS`**.
+    - **Test 3 (120-Frame Rotating 3D Triangle OpenGL Benchmark)**: `120 frames in 12.93 ms` (**`9,280.0 FPS`**) -> **`PASS`**.
 
 
 

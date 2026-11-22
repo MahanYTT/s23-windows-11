@@ -3,7 +3,7 @@ Signature="$WINDOWS NT$"
 Class=Display
 ClassGuid={4D36E968-E325-11CE-BFC1-08002BE10318}
 Provider=%Provider%
-DriverVer=04/01/2024,1.0.0.4
+DriverVer=04/01/2024,1.0.0.5
 CatalogFile=s23gpu.cat
 PnpLockdown=1
 
@@ -23,6 +23,7 @@ s23gpu_umd.dll=1
 
 [S23Gpu.NTarm64.10.0]
 %Desc%=S23Gpu_Inst,ROOT\S23GPU
+%Desc%=S23Gpu_Inst,PCI\VEN_5143&DEV_0740
 
 [S23Gpu_Inst]
 FeatureScore=F8
@@ -39,6 +40,10 @@ s23gpu_umd.dll
 HKR,,InstalledDisplayDrivers,0x00010000,"s23gpu_umd"
 HKR,,UserModeDriverName,0x00010000,"s23gpu_umd.dll","s23gpu_umd.dll","s23gpu_umd.dll","s23gpu_umd.dll"
 HKR,,UserModeDriverGUID,0x00000000,"{7B3E2F10-5230-4740-A740-000000000001}"
+HKR,,HardwareInformation.ChipType,0x00000000,"Qualcomm Adreno 740 (GEN7_2_1)"
+HKR,,HardwareInformation.AdapterString,0x00000000,"Qualcomm Adreno 740 GPU (S23)"
+HKR,,HardwareInformation.DacType,0x00000000,"Integrated RAMDAC"
+HKR,,HardwareInformation.BiosString,0x00000000,"A740.4001.0009"
 
 [S23Gpu_Inst.Services]
 AddService=s23gpu,0x00000002,S23Gpu_Svc
