@@ -586,9 +586,9 @@ static void FlushLogFile(void) {
 /* ============================================================================
  * Device Extension, Packet Ring Buffers, and IRP Queues
  * ============================================================================ */
-#define RING_SLOTS      32U
+#define RING_SLOTS      64U
 #define MAX_PKT_BYTES   1280U
-#define MAX_PENDING_IRP 16U
+#define MAX_PENDING_IRP 32U
 
 typedef struct _HCI_PKT_SLOT {
     uint16_t Len;
@@ -698,6 +698,18 @@ static BOOLEAN PollMaskMs(const volatile uint8_t *base, uint32_t off, uint32_t m
         SleepMs(1U);
     }
     return ((Rd32(base, off) & mask) == want) ? TRUE : FALSE;
+}
+static BOOLEAN PollTxDoneFast(const volatile uint8_t *se, uint32_t timeoutMs) {
+    /* Busy-poll up to 4.5 ms (~1440 B @ 3.2 Mbps) to avoid 15.6 ms OS timer-tick stalls on A2DP frames */
+    for (uint32_t i = 0; i < 450U; i++) {
+        if ((Rd32(se, SE_GENI_M_IRQ_STATUS) & M_CMD_DONE_EN) == M_CMD_DONE_EN) return TRUE;
+        KeStallExecutionProcessor(10U);
+    }
+    for (uint32_t ms = 0; ms < timeoutMs; ms++) {
+        if ((Rd32(se, SE_GENI_M_IRQ_STATUS) & M_CMD_DONE_EN) == M_CMD_DONE_EN) return TRUE;
+        SleepMs(1U);
+    }
+    return ((Rd32(se, SE_GENI_M_IRQ_STATUS) & M_CMD_DONE_EN) == M_CMD_DONE_EN) ? TRUE : FALSE;
 }
 
 /* ============================================================================
@@ -1069,7 +1081,7 @@ static BOOLEAN GeniTxRaw(PS23BTHX_EXT ext, const uint8_t *pkt, uint32_t len) {
         Wr32(se, SE_GENI_TX_FIFOn, w);
     }
 
-    BOOLEAN done = PollMaskMs(se, SE_GENI_M_IRQ_STATUS, M_CMD_DONE_EN, M_CMD_DONE_EN, 1000U);
+    BOOLEAN done = PollTxDoneFast(se, 1000U);
     uint32_t mIrq = Rd32(se, SE_GENI_M_IRQ_STATUS);
     if (!done) {
         Wr32(se, SE_GENI_M_CMD_CTRL_REG, M_GENI_CMD_ABORT);
@@ -1701,6 +1713,7 @@ static VOID ProcessRxByte(PS23BTHX_EXT ext, uint8_t ch) {
 static VOID S23BthxRxThread(PVOID ctx) {
     PS23BTHX_EXT ext = (PS23BTHX_EXT)ctx;
     volatile uint8_t *se = ext->Se;
+    uint32_t idleSpin = 0;
 
     while (!ext->Stopping) {
         uint32_t sIrq = Rd32(se, SE_GENI_S_IRQ_STATUS);
@@ -1708,9 +1721,15 @@ static VOID S23BthxRxThread(PVOID ctx) {
         uint32_t wc = st & 0x01FFFFFFU;
         if (wc == 0U) {
             if (sIrq != 0U) Wr32(se, SE_GENI_S_IRQ_CLEAR, sIrq);
-            SleepMs(1U);
+            if (idleSpin > 0U) {
+                idleSpin--;
+                KeStallExecutionProcessor(10U);
+            } else {
+                SleepMs(1U);
+            }
             continue;
         }
+        idleSpin = 50U;
 
         uint32_t last = (st >> 31) & 1U;
         uint32_t lastValid = (st >> 28) & 7U;
@@ -1798,7 +1817,7 @@ static NTSTATUS S23BthxDispatchIoctl(PDEVICE_OBJECT fdo, PIRP irp) {
         }
         PBTHX_CAPABILITIES caps = (PBTHX_CAPABILITIES)outBuf;
         MemZero(caps, sizeof(*caps));
-        caps->MaxAclTransferInSize = 1021U;
+        caps->MaxAclTransferInSize = 1025U;
         caps->ScoSupport           = ScoSupportHCIBypass;
         caps->MaxScoChannels       = 1U;
         caps->IsDeviceIdleCapable  = FALSE;
@@ -2151,7 +2170,7 @@ volatile ULONG gRelocTouch = 1u;
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
     (void)RegistryPath;
-    LogStr("=== s23bthx.sys v1.0.0.4 (ARM64 WDM BTHX LowerFilter) DriverEntry ===\r\n");
+    LogStr("=== s23bthx.sys v1.0.0.5 (ARM64 WDM BTHX LowerFilter) DriverEntry ===\r\n");
     if (!gRelocAnchors[0] || !gRelocAnchors[1] || gRelocTouch == 0U) {
         return STATUS_UNSUCCESSFUL;
     }
