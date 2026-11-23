@@ -17,10 +17,10 @@ This repository contains the ARM64 kernel drivers, UEFI DXE patches, ACPI SSDTs,
 
 | Area | Driver / Path | Status | Highlights |
 |---|---|---|---|
-| **Display & GPU** (Adreno 740) | [`drivers/s23gpu/`](drivers/s23gpu/) | ✅ Working | WDDM 2.0 display + 3D KMD, `1080×2340 @ 120 Hz` with high-resolution VSync, native brightness & Night Light, Mesa Freedreno D3D11 (`d3d10umd`) and **OpenGL 4.6** WGL ICD (ARM64 + x64), live **GPU utilization** and **TSENS GPU temperature** in Task Manager. |
+| **Display & GPU** (Adreno 740) | [`drivers/s23gpu/`](drivers/s23gpu/) | ✅ Working (Experimental) | WDDM 2.0 display + 3D KMD, `1080×2340 @ 120 Hz` with high-resolution VSync, native brightness & Night Light, Mesa Freedreno D3D11 (`d3d10umd`) and **OpenGL 4.6** WGL ICD (ARM64 + x64), live **GPU utilization** and **TSENS GPU temperature** in Task Manager. |
 | **Battery & fast charging** | [`drivers/s23batt/`](drivers/s23batt/) | ✅ Working | Battery miniclass driver for the Maxim **MAX77705** fuel gauge (`@0x36`) and charger (`@0x69`): 3.0 A input limit, 2.5 A CC fast charge, 4.4 V float, watchdog handling, abnormal-off recovery, calibrated battery temperature. |
-| **Touchscreen** | [`drivers/s23touch/`](drivers/s23touch/) | ✅ Deployed | HID multitouch minidriver for the STM **FTS2BA61Y** on QUP1 SE4 GENI SPI (`0x00A90000`, IRQ `gpio25`). |
-| **Physical keys** | [`drivers/s23keys/`](drivers/s23keys/) | ✅ Deployed | HID minidriver for Power / Volume Up / Volume Down, read-only via the SPMI PMIC arbiter observer. |
+| **Touchscreen** | [`drivers/s23touch/`](drivers/s23touch/) | ✅ Working | HID multitouch minidriver for the STM **FTS2BA61Y** on QUP1 SE4 GENI SPI (`0x00A90000`, IRQ `gpio25`). |
+| **Physical keys** | [`drivers/s23keys/`](drivers/s23keys/) | ✅ Working (Power button needs investigation) | HID minidriver for Power / Volume Up / Volume Down, read-only via the SPMI PMIC arbiter observer. |
 | **Bluetooth 5.3 + BLE** | [`drivers/s23bthx/`](drivers/s23bthx/) | ✅ Working | `BthMini` extensible-transport lower filter for the **QCA6490** on `UART14` (QUP2 SE6, `3.2 Mbaud`, IBS), Classic + BLE, A2DP-sized ACL buffers. |
 | **USB-C PC link** | [`s23link.py`](s23link.py) | ✅ Working | WinUSB remote shell and file transfer between PC and phone (`ping`, `ver`, `exec`, `put`, `get`, `reboot`). |
 | **Audio** (ADSP AudioReach, Dual CS35L43) | [`drivers/s23audio/`](drivers/s23audio/), [`drivers/s23audprobe/`](drivers/s23audprobe/) | ✅ Working | Native ARM64 PortCls WaveRT + Topology driver (`ROOT\S23AUDIO` / `ACPI\S23AUD01`) with lazy ADSP PIL, GLink/GPRv2/PRM, Gunyah-safe APPS-SMMU bypass, and dual CS35L43 speaker amps (`Speakers (Samsung Galaxy S23 Stereo)` verified via WASAPI). |
