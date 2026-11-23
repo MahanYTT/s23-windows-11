@@ -318,6 +318,7 @@ __declspec(dllimport) VOID     PoStartNextPowerIrp(PIRP Irp);
 __declspec(dllimport) NTSTATUS ZwCreateFile(HANDLE *FileHandle, ULONG DesiredAccess, POBJECT_ATTRIBUTES ObjAttr, PIO_STATUS_BLOCK IoStatusBlock, PLARGE_INTEGER AllocSize, ULONG FileAttributes, ULONG ShareAccess, ULONG CreateDisposition, ULONG CreateOptions, PVOID EaBuffer, ULONG EaLength);
 __declspec(dllimport) NTSTATUS ZwWriteFile(HANDLE FileHandle, HANDLE Event, PVOID ApcRoutine, PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length, PLARGE_INTEGER ByteOffset, ULONG *Key);
 __declspec(dllimport) NTSTATUS ZwClose(HANDLE Handle);
+__declspec(dllimport) NTSTATUS ZwWaitForSingleObject(HANDLE Handle, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
 __declspec(dllimport) VOID     RtlInitUnicodeString(PUNICODE_STRING Dest, PCWSTR Source);
 
 /* Inline WDM helpers */
@@ -1797,11 +1798,24 @@ static NTSTATUS S23Pnp(PDEVICE_OBJECT fdo, PIRP irp) {
                 HANDLE hThread = NULL;
                 NTSTATUS tst = PsCreateSystemThread(&hThread, 0x1FFFFFu, NULL, NULL, NULL, S23WorkerThread, ext);
                 if (NT_SUCCESS(tst) && hThread) {
-                    ObReferenceObjectByHandle(hThread, 0x1FFFFFu, NULL, KernelMode, &ext->ThreadObj, NULL);
+                    tst = ObReferenceObjectByHandle(hThread, 0x1FFFFFu, NULL, KernelMode, &ext->ThreadObj, NULL);
+                    if (!NT_SUCCESS(tst)) {
+                        /* Without a thread object StopDevice could not wait for the worker, which might
+                         * then touch MMIO after it is unmapped: stop the worker and join it via the handle. */
+                        ext->ThreadObj = NULL;
+                        ext->Stopping = 1;
+                        (void)ZwWaitForSingleObject(hThread, FALSE, NULL);
+                    }
                     ZwClose(hThread);
+                } else if (NT_SUCCESS(tst)) {
+                    tst = STATUS_UNSUCCESSFUL;
+                }
+                if (!NT_SUCCESS(tst)) {
+                    ext->Stopping = 1;
+                    st = tst;   /* fail START instead of running without a worker */
                 }
             }
-            S23LogStr("S23Pnp START_DEVICE OK");
+            if (NT_SUCCESS(st)) S23LogStr("S23Pnp START_DEVICE OK");
         }
         irp->IoStatus.Status = st;
         IofCompleteRequest(irp, IO_NO_INCREMENT);
@@ -1914,6 +1928,14 @@ static NTSTATUS S23InternalIoctl(PDEVICE_OBJECT fdo, PIRP irp) {
             break;
         }
         qIrql = KeAcquireSpinLockRaiseToDpc(&ext->QueueLock);
+        /* Re-check under the queue lock: StopDevice sets Stopping before FlushPendingIrps takes this
+         * lock, so a READ queued after the flush (and then never completed) is impossible. */
+        if (ext->Stopping) {
+            KeReleaseSpinLock(&ext->QueueLock, qIrql);
+            IoReleaseCancelSpinLock(cancelIrql);
+            st = STATUS_DEVICE_NOT_CONNECTED;
+            break;
+        }
         if (ext->PendingCount < MAX_PENDING_IRPS) {
             IoSetCancelRoutine(irp, S23CancelReadIrp);
             IoMarkIrpPending(irp);

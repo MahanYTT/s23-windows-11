@@ -32,6 +32,7 @@ EXPORTS
   ZwCreateFile
   ZwWriteFile
   ZwClose
+  ZwWaitForSingleObject
   RtlInitUnicodeString
 """
 

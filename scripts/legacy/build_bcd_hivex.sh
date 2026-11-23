@@ -1,7 +1,8 @@
 #!/bin/bash
 set -e
 if ! python3 -c "import hivex" 2>/dev/null; then
-  echo mahan | sudo -S apt-get install -y -qq python3-hivex >/dev/null 2>&1
+  # interactive sudo prompt; never pipe a password into "sudo -S"
+  sudo apt-get install -y -qq python3-hivex
 fi
 python3 - << 'PYEOF'
 import hivex, uuid, shutil
