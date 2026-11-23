@@ -56,6 +56,28 @@ jobs:
           mapfile -d '' files < <(git ls-files -z '*.sh')
           if [ "${#files[@]}" -gt 0 ]; then shellcheck --severity=error "${files[@]}"; fi
 
+  acpi:
+    name: ACPI SSDT syntax (iasl)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install acpica-tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends acpica-tools
+      # audio_sensors_research/ is deliberately excluded (live work in progress on the device)
+      - name: Compile every tracked .asl (errors fail the job, output goes to a temp dir)
+        run: |
+          out="$(mktemp -d)"
+          mapfile -d '' files < <(git ls-files -z '*.asl' ':(exclude)audio_sensors_research/**')
+          rc=0
+          for f in "${files[@]}"; do
+            echo "::group::$f"
+            iasl -p "$out/$(basename "$f" .asl)" "$f" || { echo "::error file=$f::iasl failed"; rc=1; }
+            echo "::endgroup::"
+          done
+          exit $rc
+
   drivers:
     name: ARM64 drivers build + stack check (clang, no hardware)
     runs-on: ubuntu-24.04
