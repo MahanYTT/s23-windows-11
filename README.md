@@ -2,7 +2,6 @@
 
 [![lint](https://github.com/MahanYTT/s23-windows-11/actions/workflows/lint.yml/badge.svg)](https://github.com/MahanYTT/s23-windows-11/actions/workflows/lint.yml)
 [![GitHub Stars](https://img.shields.io/github/stars/MahanYTT/s23-windows-11?style=flat)](https://github.com/MahanYTT/s23-windows-11/stargazers)
-[![Views](https://hits.sh/github.com/MahanYTT/s23-windows-11.svg?view=today-total&label=Views&color=007ec6)](https://hits.sh/github.com/MahanYTT/s23-windows-11/)
 
 Native **Windows 11 Pro 24H2 ARM64 (`10.0.26100`)** on the **Samsung Galaxy S23** (Snapdragon 8 Gen 2 for Galaxy, `SM8550-AC`, "Kailua").
 This repository contains the ARM64 kernel drivers, UEFI DXE patches, ACPI SSDTs, kernel research probes and PC-side tooling used to bring the phone up.
@@ -323,24 +322,12 @@ Proprietary Samsung/Qualcomm firmware, partition images, logs and all compiled b
 
 ---
 
-## Stats
-
-### Star History
+## Star History
 
 <a href="https://star-history.com/#MahanYTT/s23-windows-11&Date">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=MahanYTT/s23-windows-11&type=Date&theme=dark" />
     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=MahanYTT/s23-windows-11&type=Date" />
     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=MahanYTT/s23-windows-11&type=Date" />
-  </picture>
-</a>
-
-### Views History
-
-<a href="https://hits.sh/github.com/MahanYTT/s23-windows-11/">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/MahanYTT/s23-windows-11/refs/heads/stats/views-dark.svg" />
-    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/MahanYTT/s23-windows-11/refs/heads/stats/views-light.svg" />
-    <img alt="Repository Views Chart" src="https://raw.githubusercontent.com/MahanYTT/s23-windows-11/refs/heads/stats/views-light.svg" />
   </picture>
 </a>
