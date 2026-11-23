@@ -1,8 +1,30 @@
-"""PE32+ ARM64, /TSAWARE:NO, .reloc, CheckSum, Authenticode & phone ntoskrnl.exe import verifier."""
+"""PE32+ ARM64, /TSAWARE:NO, .reloc, CheckSum, Authenticode, __chkstk/stack-frame & phone ntoskrnl.exe import verifier.
+
+Usage: verify_pe.py <driver.sys> [ntoskrnl.exe] [extra_dll.sys ...] [--frame-warn BYTES] [--max-frame BYTES]
+
+Exit code 0 = PASS, 1 = FAIL, 2 = usage error.
+
+Stack checks (the ARM64 kernel stack is only 24 KB, an overflow is bugcheck 0x50/0x7F):
+  * FAIL if the driver imports __chkstk or contains the ARM64 __chkstk call sequence
+    (`bl __chkstk` is always followed by `sub sp, sp, x15, uxtx #4`), i.e. some function has a frame
+    larger than one page.  MSVC links __chkstk statically from libcntpr.lib, so the import table alone
+    is not enough.
+  * WARN for every function prologue that reserves more than --frame-warn bytes (default 1024) with
+    `sub sp, sp, #imm` (this also catches clang builds that use -mno-stack-arg-probe).
+  * FAIL instead of WARN when --max-frame is given and a frame exceeds it.
+"""
 import hashlib
 import os
 import struct
 import sys
+
+IMAGE_SCN_MEM_EXECUTE = 0x20000000
+# `sub sp, sp, x15, uxtx #4`: emitted right after every `bl __chkstk` by MSVC and clang for ARM64 Windows.
+ARM64_SUB_SP_X15_UXTX4 = 0xCB2F73FF
+# `sub sp, sp, #imm{, lsl #12}` (64-bit SUB immediate, Rd = Rn = SP): (word & MASK) == VALUE
+ARM64_SUB_SP_IMM_MASK = 0xFF8003FF
+ARM64_SUB_SP_IMM_VALUE = 0xD10003FF
+DEFAULT_FRAME_WARN = 1024
 
 
 def compute_pe_checksum(data: bytes) -> int:
@@ -40,6 +62,57 @@ def parse_sections(data: bytes):
         vsize, va, raw_sz, raw_ptr = struct.unpack_from("<4I", data, off + 8)
         secs.append((va, vsize, raw_ptr, raw_sz))
     return secs
+
+
+def parse_section_headers(data: bytes):
+    """-> [(name, va, vsize, raw_ptr, raw_sz, characteristics)]"""
+    pe = struct.unpack_from("<I", data, 0x3C)[0]
+    n_sec = struct.unpack_from("<H", data, pe + 6)[0]
+    opt_sz = struct.unpack_from("<H", data, pe + 20)[0]
+    sec_off = pe + 24 + opt_sz
+    out = []
+    for i in range(n_sec):
+        off = sec_off + i * 40
+        name = data[off : off + 8].rstrip(b"\0").decode("ascii", "replace")
+        vsize, va, raw_sz, raw_ptr = struct.unpack_from("<4I", data, off + 8)
+        chars = struct.unpack_from("<I", data, off + 36)[0]
+        out.append((name, va, vsize, raw_ptr, raw_sz, chars))
+    return out
+
+
+def iter_code_words(data: bytes):
+    """yield (rva, insn) for every 4-byte aligned word of the executable sections' file data"""
+    for _name, va, vsize, raw_ptr, raw_sz, chars in parse_section_headers(data):
+        if not chars & IMAGE_SCN_MEM_EXECUTE:
+            continue
+        n = min(vsize or raw_sz, raw_sz, max(0, len(data) - raw_ptr)) & ~3
+        for i in range(0, n, 4):
+            yield va + i, struct.unpack_from("<I", data, raw_ptr + i)[0]
+
+
+def find_chkstk_sites(data: bytes):
+    """RVAs of `sub sp, sp, x15, uxtx #4` (the instruction that follows every `bl __chkstk`)"""
+    return [rva for rva, w in iter_code_words(data) if w == ARM64_SUB_SP_X15_UXTX4]
+
+
+def find_stack_frames(data: bytes):
+    """[(rva, bytes)] for every run of consecutive `sub sp, sp, #imm{, lsl #12}` instructions"""
+    frames = []
+    run_rva, run_size, prev_rva = None, 0, None
+    for rva, w in iter_code_words(data):
+        if (w & ARM64_SUB_SP_IMM_MASK) == ARM64_SUB_SP_IMM_VALUE:
+            imm = (w >> 10) & 0xFFF
+            size = imm << 12 if (w >> 22) & 1 else imm
+            if run_rva is not None and prev_rva == rva - 4:
+                run_size += size
+            else:
+                if run_rva is not None:
+                    frames.append((run_rva, run_size))
+                run_rva, run_size = rva, size
+            prev_rva = rva
+    if run_rva is not None:
+        frames.append((run_rva, run_size))
+    return frames
 
 
 def get_imports(data: bytes):
@@ -93,17 +166,45 @@ def get_exports(data: bytes):
     return exports
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: verify_pe.py <driver.sys> [ntoskrnl.exe] [extra_dll.sys ...]")
-        sys.exit(2)
-    sys_path = sys.argv[1]
-    nt_path = sys.argv[2] if len(sys.argv) >= 3 else None
-    extra_refs = sys.argv[3:] if len(sys.argv) >= 4 else []
+def parse_args(argv):
+    """-> (positional args, frame_warn, max_frame); raises ValueError on bad options"""
+    pos, frame_warn, max_frame = [], DEFAULT_FRAME_WARN, None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--frame-warn", "--max-frame"):
+            if i + 1 >= len(argv) or not argv[i + 1].isdigit():
+                raise ValueError(f"{a} needs a byte count")
+            if a == "--frame-warn":
+                frame_warn = int(argv[i + 1])
+            else:
+                max_frame = int(argv[i + 1])
+            i += 2
+            continue
+        pos.append(a)
+        i += 1
+    if not pos:
+        raise ValueError("missing <driver.sys>")
+    return pos, frame_warn, max_frame
 
-    data = open(sys_path, "rb").read()
+
+def verify(sys_path, nt_path=None, extra_refs=(), frame_warn=DEFAULT_FRAME_WARN, max_frame=None):
+    """print the report; -> list of failure messages (empty = PASS)"""
+    fails = []
+
+    def check(cond, msg):
+        if not cond:
+            fails.append(msg)
+            print(f"  FAIL: {msg}")
+        return cond
+
+    with open(sys_path, "rb") as f:
+        data = f.read()
+    if not check(len(data) >= 0x40 and data[:2] == b"MZ", "Not an MZ/PE file"):
+        return fails
     pe = struct.unpack_from("<I", data, 0x3C)[0]
-    assert data[pe : pe + 4] == b"PE\0\0", "Invalid PE signature"
+    if not check(pe + 24 + 112 + 16 * 8 <= len(data) and data[pe : pe + 4] == b"PE\0\0", "Invalid PE signature"):
+        return fails
     machine = struct.unpack_from("<H", data, pe + 4)[0]
     magic = struct.unpack_from("<H", data, pe + 24)[0]
     stored_csum = struct.unpack_from("<I", data, pe + 24 + 64)[0]
@@ -121,36 +222,60 @@ def main():
     print(f"  Reloc=0x{reloc_rva:X}+{reloc_sz}, AuthSig=0x{sec_off:X}+{sec_sz}")
     print(f"  CheckSum stored=0x{stored_csum:08X} calc=0x{calc_csum:08X} match={stored_csum == calc_csum}")
 
-    assert machine == 0xAA64, "Not ARM64"
-    assert magic == 0x020B, "Not PE32+"
-    assert subsys == 1, "Not NATIVE subsystem"
-    assert not tsaware, "TSAWARE must be False for ARM64 WDM driver"
-    assert reloc_sz > 0, "Missing .reloc section"
-    assert sec_off > 0 and sec_sz > 0, "Missing Authenticode Security Data Directory (DD[4])"
-    assert stored_csum == calc_csum, "PE CheckSum mismatch!"
+    check(machine == 0xAA64, "Not ARM64")
+    check(magic == 0x020B, "Not PE32+")
+    check(subsys == 1, "Not NATIVE subsystem")
+    check(not tsaware, "TSAWARE must be False for ARM64 WDM driver")
+    check(reloc_sz > 0, "Missing .reloc section")
+    check(sec_off > 0 and sec_sz > 0, "Missing Authenticode Security Data Directory (DD[4])")
+    check(stored_csum == calc_csum, "PE CheckSum mismatch!")
 
     imports = get_imports(data)
     for dll, syms in imports.items():
         print(f"  Imports from {dll} ({len(syms)}): {', '.join(syms)}")
 
+    # ---- kernel stack safety
+    chk_imports = [f"{dll}!{s}" for dll, syms in imports.items() for s in syms if "chkstk" in s.lower()]
+    check(not chk_imports, f"__chkstk imported ({', '.join(chk_imports)}): a stack frame exceeds one page")
+    sites = find_chkstk_sites(data) if machine == 0xAA64 else []
+    print(f"  __chkstk call sites: {len(sites)}")
+    check(not sites, "__chkstk call sequence (sub sp, sp, x15, uxtx #4) at RVA "
+          + ", ".join(f"0x{r:X}" for r in sites[:8]) + (" ..." if len(sites) > 8 else "")
+          + ": move large locals off the 24 KB ARM64 kernel stack")
+    frames = sorted(find_stack_frames(data), key=lambda t: -t[1]) if machine == 0xAA64 else []
+    if frames:
+        print(f"  Largest stack frame: {frames[0][1]} bytes at RVA 0x{frames[0][0]:X} ({len(frames)} frames scanned)")
+    for rva, size in frames:
+        if max_frame is not None and size > max_frame:
+            check(False, f"stack frame of {size} bytes at RVA 0x{rva:X} exceeds --max-frame {max_frame}")
+        elif size > frame_warn:
+            print(f"  WARN: stack frame of {size} bytes at RVA 0x{rva:X} (> {frame_warn})")
+
+    # ---- imports against the phone's own binaries
     ref_map = {}
-    if nt_path and os.path.exists(nt_path):
-        ref_map["ntoskrnl.exe"] = nt_path
+    if nt_path:
+        if os.path.exists(nt_path):
+            ref_map["ntoskrnl.exe"] = nt_path
+        else:
+            print(f"  NOTE: reference {nt_path} not found, ntoskrnl.exe imports not resolved")
     for rp in extra_refs:
         if os.path.exists(rp):
             bn = os.path.basename(rp).lower()
             if bn.endswith("_phone.sys"):
                 bn = bn[:-10] + ".sys"
             ref_map[bn] = rp
+        else:
+            print(f"  NOTE: reference {rp} not found")
 
     allowed = set(["ntoskrnl.exe"]) | set(ref_map.keys())
     unexpected = [d for d in imports.keys() if d not in allowed]
-    assert not unexpected, f"Unexpected DLL imports: {unexpected}"
+    check(not unexpected, f"Unexpected DLL imports: {unexpected}")
 
     for dll, syms in imports.items():
         ref_path = ref_map.get(dll)
         if ref_path and os.path.exists(ref_path):
-            ref_data = open(ref_path, "rb").read()
+            with open(ref_path, "rb") as f:
+                ref_data = f.read()
             ref_pe = struct.unpack_from("<I", ref_data, 0x3C)[0]
             ref_mach = struct.unpack_from("<H", ref_data, ref_pe + 4)[0]
             exports = get_exports(ref_data)
@@ -159,11 +284,33 @@ def main():
                 f"  Ref {dll} check (Machine=0x{ref_mach:04X}, {len(exports)} exports): "
                 f"{len(syms) - len(missing)}/{len(syms)} OK, missing={missing}"
             )
-            assert ref_mach == 0xAA64, f"Reference {dll} is not ARM64"
-            assert not missing, f"Unresolved {dll} imports: {missing}"
+            check(ref_mach == 0xAA64, f"Reference {dll} is not ARM64")
+            check(not missing, f"Unresolved {dll} imports: {missing}")
+    return fails
 
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    try:
+        pos, frame_warn, max_frame = parse_args(argv)
+    except ValueError as e:
+        print(f"error: {e}")
+        print("Usage: verify_pe.py <driver.sys> [ntoskrnl.exe] [extra_dll.sys ...] [--frame-warn BYTES] [--max-frame BYTES]")
+        return 2
+    sys_path = pos[0]
+    nt_path = pos[1] if len(pos) >= 2 else None
+    extra_refs = pos[2:]
+    try:
+        fails = verify(sys_path, nt_path, extra_refs, frame_warn, max_frame)
+    except (OSError, struct.error, ValueError, UnicodeDecodeError) as e:
+        fails = [f"cannot parse {sys_path}: {e}"]
+        print(f"  FAIL: {fails[0]}")
+    if fails:
+        print(f"PE VERIFICATION: FAIL ({len(fails)} problem{'s' if len(fails) != 1 else ''})")
+        return 1
     print("PE VERIFICATION: PASS")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
