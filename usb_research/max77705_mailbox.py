@@ -109,3 +109,125 @@ def decode_pd_status1(v):
     """REG_PD_STATUS1 (0x0D): PD_DataRole[7], PD_PSRDY[4], FCT_ID[3:0]."""
     v = _byte(v)
     return {"PD_DataRole": (v >> 7) & 1, "PD_PSRDY": (v >> 4) & 1, "FCT_ID": v & 0xF}
+
+
+# ---------------------------------------------------------------------------------------------------
+# USB Power Delivery 3.0 data objects (USB PD Rev 3.0, section 6.4.1 Power Data Objects and 6.4.2
+# Request Data Object). Generic PD encoding only - nothing MAX77705-specific is assumed here.
+#   Source PDO type (bits 31:30): 00 Fixed, 01 Battery, 10 Variable, 11 Augmented (APDO);
+#   APDO type (bits 29:28): 00 Programmable Power Supply (PPS).
+# Units: Fixed/Variable/Battery voltage 50 mV, current 10 mA, power 250 mW;
+#        PPS voltage 100 mV, current 50 mA; PPS RDO output voltage 20 mV, operating current 50 mA.
+# ---------------------------------------------------------------------------------------------------
+
+PDO_FIXED, PDO_BATTERY, PDO_VARIABLE, PDO_PPS = "fixed", "battery", "variable", "pps"
+MAX_SPR_OBJECT_POSITION = 7   # a Source_Capabilities message carries at most 7 PDOs in SPR mode
+
+
+class PdError(ValueError):
+    pass
+
+
+def _u32(v):
+    if not 0 <= v <= 0xFFFFFFFF:
+        raise PdError("data object must be a 32-bit value")
+    return v
+
+
+def _field(value, unit, bits, name):
+    if value % unit:
+        raise PdError(f"{name}={value} is not a multiple of {unit}")
+    q = value // unit
+    if not 0 <= q < (1 << bits):
+        raise PdError(f"{name}={value} does not fit {bits} bits of {unit}")
+    return q
+
+
+def decode_pdo(v):
+    """Source PDO -> dict(type=..., values in mV / mA / mW, flags)."""
+    v = _u32(v)
+    kind = v >> 30
+    if kind == 0:
+        return {"type": PDO_FIXED,
+                "dual_role_power": (v >> 29) & 1, "usb_suspend_supported": (v >> 28) & 1,
+                "unconstrained_power": (v >> 27) & 1, "usb_comms_capable": (v >> 26) & 1,
+                "dual_role_data": (v >> 25) & 1, "unchunked_ext_msg": (v >> 24) & 1,
+                "peak_current": (v >> 20) & 3,
+                "voltage_mv": ((v >> 10) & 0x3FF) * 50, "max_current_ma": (v & 0x3FF) * 10}
+    if kind == 1:
+        return {"type": PDO_BATTERY, "max_voltage_mv": ((v >> 20) & 0x3FF) * 50,
+                "min_voltage_mv": ((v >> 10) & 0x3FF) * 50, "max_power_mw": (v & 0x3FF) * 250}
+    if kind == 2:
+        return {"type": PDO_VARIABLE, "max_voltage_mv": ((v >> 20) & 0x3FF) * 50,
+                "min_voltage_mv": ((v >> 10) & 0x3FF) * 50, "max_current_ma": (v & 0x3FF) * 10}
+    if (v >> 28) & 3 == 0:
+        return {"type": PDO_PPS, "pps_power_limited": (v >> 27) & 1,
+                "max_voltage_mv": ((v >> 17) & 0xFF) * 100, "min_voltage_mv": ((v >> 8) & 0xFF) * 100,
+                "max_current_ma": (v & 0x7F) * 50}
+    raise PdError(f"APDO type {(v >> 28) & 3} is not defined in USB PD 3.0 (SPR)")
+
+
+def encode_pdo(p):
+    """Inverse of decode_pdo (keys as returned by it; flags default to 0)."""
+    t = p.get("type")
+    if t == PDO_FIXED:
+        v = (0 << 30) | (p.get("dual_role_power", 0) & 1) << 29 | (p.get("usb_suspend_supported", 0) & 1) << 28
+        v |= (p.get("unconstrained_power", 0) & 1) << 27 | (p.get("usb_comms_capable", 0) & 1) << 26
+        v |= (p.get("dual_role_data", 0) & 1) << 25 | (p.get("unchunked_ext_msg", 0) & 1) << 24
+        v |= (p.get("peak_current", 0) & 3) << 20
+        return v | _field(p["voltage_mv"], 50, 10, "voltage_mv") << 10 | _field(p["max_current_ma"], 10, 10, "max_current_ma")
+    if t in (PDO_BATTERY, PDO_VARIABLE):
+        last = (_field(p["max_power_mw"], 250, 10, "max_power_mw") if t == PDO_BATTERY
+                else _field(p["max_current_ma"], 10, 10, "max_current_ma"))
+        return ((1 if t == PDO_BATTERY else 2) << 30 | _field(p["max_voltage_mv"], 50, 10, "max_voltage_mv") << 20
+                | _field(p["min_voltage_mv"], 50, 10, "min_voltage_mv") << 10 | last)
+    if t == PDO_PPS:
+        return (3 << 30 | (p.get("pps_power_limited", 0) & 1) << 27
+                | _field(p["max_voltage_mv"], 100, 8, "max_voltage_mv") << 17
+                | _field(p["min_voltage_mv"], 100, 8, "min_voltage_mv") << 8
+                | _field(p["max_current_ma"], 50, 7, "max_current_ma"))
+    raise PdError(f"unknown PDO type {t!r}")
+
+
+def _rdo_common(v):
+    return {"object_position": (v >> 28) & 0xF, "give_back": (v >> 27) & 1, "capability_mismatch": (v >> 26) & 1,
+            "usb_comms_capable": (v >> 25) & 1, "no_usb_suspend": (v >> 24) & 1, "unchunked_ext_msg": (v >> 23) & 1}
+
+
+def decode_rdo(v, pdo_type):
+    """Request Data Object -> dict. The layout depends on the type of the PDO it references."""
+    v = _u32(v)
+    d = _rdo_common(v)
+    if d["object_position"] == 0:
+        raise PdError("object position 0 is reserved")
+    if pdo_type in (PDO_FIXED, PDO_VARIABLE):
+        d.update(operating_current_ma=((v >> 10) & 0x3FF) * 10, limit_current_ma=(v & 0x3FF) * 10)
+    elif pdo_type == PDO_BATTERY:
+        d.update(operating_power_mw=((v >> 10) & 0x3FF) * 250, limit_power_mw=(v & 0x3FF) * 250)
+    elif pdo_type == PDO_PPS:
+        d.update(output_voltage_mv=((v >> 9) & 0x7FF) * 20, operating_current_ma=(v & 0x7F) * 50)
+    else:
+        raise PdError(f"unknown PDO type {pdo_type!r}")
+    return d
+
+
+def encode_rdo(object_position, pdo_type, give_back=0, capability_mismatch=0, usb_comms_capable=0,
+               no_usb_suspend=0, unchunked_ext_msg=0, **values):
+    """Build a Request Data Object for the PDO at 1-based object_position.
+    fixed/variable: operating_current_ma, limit_current_ma (max, or min when give_back)
+    battery:        operating_power_mw, limit_power_mw
+    pps:            output_voltage_mv, operating_current_ma"""
+    if not 1 <= object_position <= MAX_SPR_OBJECT_POSITION:
+        raise PdError(f"object position must be 1..{MAX_SPR_OBJECT_POSITION}")
+    v = (object_position << 28 | (give_back & 1) << 27 | (capability_mismatch & 1) << 26
+         | (usb_comms_capable & 1) << 25 | (no_usb_suspend & 1) << 24 | (unchunked_ext_msg & 1) << 23)
+    if pdo_type in (PDO_FIXED, PDO_VARIABLE):
+        return (v | _field(values["operating_current_ma"], 10, 10, "operating_current_ma") << 10
+                | _field(values["limit_current_ma"], 10, 10, "limit_current_ma"))
+    if pdo_type == PDO_BATTERY:
+        return (v | _field(values["operating_power_mw"], 250, 10, "operating_power_mw") << 10
+                | _field(values["limit_power_mw"], 250, 10, "limit_power_mw"))
+    if pdo_type == PDO_PPS:
+        return (v | _field(values["output_voltage_mv"], 20, 11, "output_voltage_mv") << 9
+                | _field(values["operating_current_ma"], 50, 7, "operating_current_ma"))
+    raise PdError(f"unknown PDO type {pdo_type!r}")

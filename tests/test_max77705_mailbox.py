@@ -96,5 +96,84 @@ class StatusRegisterTest(unittest.TestCase):
                 f(256)
 
 
+class PowerDeliveryTest(unittest.TestCase):
+    """USB PD 3.0 PDO/RDO bit layouts (generic PD, not MAX77705-specific)."""
+
+    def test_fixed_pdo_5v_3a(self):
+        p = mb.decode_pdo(0x0801912C)                     # 5 V / 3 A, unconstrained power
+        self.assertEqual((p["type"], p["voltage_mv"], p["max_current_ma"], p["unconstrained_power"]),
+                         (mb.PDO_FIXED, 5000, 3000, 1))
+        self.assertEqual(mb.encode_pdo(p), 0x0801912C)
+
+    def test_fixed_pdo_flags(self):
+        p = mb.decode_pdo((0x3F << 24) | (2 << 20) | (180 << 10) | 200)   # all flags, peak 2, 9 V / 2 A
+        self.assertEqual([p[k] for k in ("dual_role_power", "usb_suspend_supported", "unconstrained_power",
+                                         "usb_comms_capable", "dual_role_data", "unchunked_ext_msg")], [1] * 6)
+        self.assertEqual((p["peak_current"], p["voltage_mv"], p["max_current_ma"]), (2, 9000, 2000))
+
+    def test_variable_and_battery_pdo(self):
+        v = mb.decode_pdo((2 << 30) | (240 << 20) | (100 << 10) | 150)
+        self.assertEqual((v["type"], v["max_voltage_mv"], v["min_voltage_mv"], v["max_current_ma"]),
+                         (mb.PDO_VARIABLE, 12000, 5000, 1500))
+        b = mb.decode_pdo((1 << 30) | (420 << 20) | (60 << 10) | 60)
+        self.assertEqual((b["type"], b["max_voltage_mv"], b["min_voltage_mv"], b["max_power_mw"]),
+                         (mb.PDO_BATTERY, 21000, 3000, 15000))
+        for p in (v, b):
+            self.assertEqual(mb.decode_pdo(mb.encode_pdo(p)), p)
+
+    def test_pps_apdo(self):
+        raw = (3 << 30) | (1 << 27) | (110 << 17) | (33 << 8) | 60        # 3.3-11 V, 3 A, power limited
+        p = mb.decode_pdo(raw)
+        self.assertEqual((p["type"], p["min_voltage_mv"], p["max_voltage_mv"], p["max_current_ma"], p["pps_power_limited"]),
+                         (mb.PDO_PPS, 3300, 11000, 3000, 1))
+        self.assertEqual(mb.encode_pdo(p), raw)
+        with self.assertRaises(mb.PdError):
+            mb.decode_pdo((3 << 30) | (1 << 28))                           # APDO type 1 not defined in PD 3.0 SPR
+
+    def test_fixed_rdo(self):
+        r = mb.encode_rdo(1, mb.PDO_FIXED, usb_comms_capable=1, no_usb_suspend=1,
+                          operating_current_ma=3000, limit_current_ma=3000)
+        self.assertEqual(r, (1 << 28) | (1 << 25) | (1 << 24) | (300 << 10) | 300)
+        d = mb.decode_rdo(r, mb.PDO_FIXED)
+        self.assertEqual((d["object_position"], d["operating_current_ma"], d["limit_current_ma"], d["give_back"]),
+                         (1, 3000, 3000, 0))
+
+    def test_battery_and_pps_rdo(self):
+        r = mb.encode_rdo(3, mb.PDO_BATTERY, give_back=1, operating_power_mw=15000, limit_power_mw=5000)
+        self.assertEqual(mb.decode_rdo(r, mb.PDO_BATTERY)["limit_power_mw"], 5000)
+        r = mb.encode_rdo(2, mb.PDO_PPS, output_voltage_mv=9000, operating_current_ma=2000)
+        self.assertEqual(r, 0x20038428)
+        d = mb.decode_rdo(r, mb.PDO_PPS)
+        self.assertEqual((d["object_position"], d["output_voltage_mv"], d["operating_current_ma"]), (2, 9000, 2000))
+
+    def test_rdo_flags_round_trip(self):
+        r = mb.encode_rdo(7, mb.PDO_VARIABLE, 1, 1, 1, 1, 1, operating_current_ma=10, limit_current_ma=10230)
+        d = mb.decode_rdo(r, mb.PDO_VARIABLE)
+        self.assertEqual([d[k] for k in ("give_back", "capability_mismatch", "usb_comms_capable",
+                                         "no_usb_suspend", "unchunked_ext_msg")], [1] * 5)
+        self.assertEqual((d["object_position"], d["limit_current_ma"]), (7, 10230))
+
+    def test_rejects_invalid_values(self):
+        bad = [lambda: mb.encode_rdo(0, mb.PDO_FIXED, operating_current_ma=0, limit_current_ma=0),
+               lambda: mb.encode_rdo(8, mb.PDO_FIXED, operating_current_ma=0, limit_current_ma=0),
+               lambda: mb.encode_rdo(1, mb.PDO_FIXED, operating_current_ma=15, limit_current_ma=0),     # not 10 mA steps
+               lambda: mb.encode_rdo(1, mb.PDO_FIXED, operating_current_ma=10240, limit_current_ma=0),  # > 10 bits
+               lambda: mb.encode_rdo(1, mb.PDO_PPS, output_voltage_mv=9010, operating_current_ma=50),
+               lambda: mb.encode_rdo(1, "unknown"),
+               lambda: mb.encode_pdo({"type": mb.PDO_FIXED, "voltage_mv": 5025, "max_current_ma": 100}),
+               lambda: mb.decode_rdo(0, mb.PDO_FIXED),                                                    # position 0
+               lambda: mb.decode_rdo(1 << 28, "unknown"),
+               lambda: mb.decode_pdo(1 << 32)]
+        for f in bad:
+            with self.assertRaises(mb.PdError):
+                f()
+
+    def test_every_fixed_pdo_round_trips(self):
+        for volt in range(0, 1024, 37):
+            for cur in range(0, 1024, 41):
+                raw = (volt << 10) | cur
+                self.assertEqual(mb.encode_pdo(mb.decode_pdo(raw)), raw)
+
+
 if __name__ == "__main__":
     unittest.main()
