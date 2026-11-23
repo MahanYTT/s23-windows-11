@@ -86,7 +86,7 @@ New-Item -ItemType Directory -Force -Path 'C:\topaz','C:\ProgramData\topaz' | Ou
 & icacls.exe 'C:\ProgramData\topaz' /grant '*S-1-1-0:(OI)(CI)(RX)' '*S-1-15-2-1:(OI)(CI)(RX)' '*S-1-15-2-2:(OI)(CI)(RX)' | Out-Null
 Remove-Item 'C:\ProgramData\topaz\umd.log.enable','C:\ProgramData\topaz\umd-*.log' -Force -ErrorAction SilentlyContinue
 Set-Content -Path 'C:\topaz\umd.dwmonly' -Value '1' -Encoding ascii
-Set-Content -Path 'C:\ProgramData\topaz\umd.env' -Value "FD_MESA_DEBUG=sysmem`r`nTOPAZ_SCFIX=1`r`nTOPAZ_STRIPS=0`r`nTOPAZ_NOPRESENTWAIT=0`r`nTOPAZ_UPDFLUSH=1`r`nTOPAZ_SYNCMAP=1`r`nTOPAZ_CBFLUSH=1`r`nTOPAZ_UPDSYNC=1`r`nTOPAZ_SVSWZ=1`r`nTOPAZ_SVINFO=1`r`nTOPAZ_DEMOTE=1`r`n" -Encoding ascii
+Set-Content -Path 'C:\ProgramData\topaz\umd.env' -Value "FD_MESA_DEBUG=sysmem`r`nTOPAZ_SCFIX=0`r`nTOPAZ_STRIPS=0`r`nTOPAZ_NOPRESENTWAIT=0`r`nTOPAZ_UPDFLUSH=1`r`nTOPAZ_SYNCMAP=1`r`nTOPAZ_CBFLUSH=1`r`nTOPAZ_UPDSYNC=1`r`nTOPAZ_SVSWZ=1`r`nTOPAZ_SVINFO=1`r`nTOPAZ_DEMOTE=1`r`n" -Encoding ascii
 [Environment]::SetEnvironmentVariable('TOPAZ_SCFIX', `$null, 'Machine')
 [Environment]::SetEnvironmentVariable('TOPAZ_NOPRESENTWAIT', `$null, 'Machine')
 if (Test-Path 'C:\Windows\System32\s23gpu_umd.dll') {
