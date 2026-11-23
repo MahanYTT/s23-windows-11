@@ -406,12 +406,7 @@ static NTSTATUS QueryAdapterInfoInner(const S23GPU_ADAPTER *A, const DXGKARG_QUE
 
         ULONG temp = HwReadTsens();
         if (temp > 0 && temp < 1500) {
-            /* Task Manager expects temperature in half-Kelvins or something similar? Actually, according to docs it's 0.1 C ? Let's check docs, but for now map deciCelsius to whatever TM expects, typically it's raw C or K. Wait, S23_ADAPTER_PERFDATA is proprietary D3DKMT extension. Actually, the TSENS hardware returns deciCelsius. */
-            /* WDDM DxgkDdiQueryAdapterInfo DXGKQAITYPE_ADAPTERPERFDATA extension:
-             * Temperature is usually in units of 0.1 Celsius (or sometimes 1 C).
-             * Let's just pass the TSENS deciCelsius directly, or C. Let's pass C since it's ULONG. Wait, NVIDIA/AMD pass Celsius.
-             */
-            ap->Temperature = temp / 10; /* Pass Celsius */
+            ap->Temperature = temp; /* The WDDM schema expects 0.1C / deciCelsius for DXGKQAITYPE_ADAPTERPERFDATA Temperature */
         }
         return STATUS_SUCCESS;
     }

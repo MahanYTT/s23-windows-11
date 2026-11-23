@@ -931,7 +931,9 @@ static int S23BattReadHardware(PS23BATT_EXT ext, S23_BATT_STATE *out, BOOLEAN lo
         temp01C = ((int32_t)(int16_t)temp08 * 10) / 256;
         if (temp01C < -300 || temp01C > 850) temp01C = 250;
     }
-    ULONG tempTenthsK = (ULONG)(temp01C + 2732);
+
+    /* MAX1720x returns temperature natively in 1/256 Celsius. Windows expects tenths of Kelvin. */
+    ULONG tempTenthsK = (ULONG)(temp01C + 2731);
 
     uint32_t desMah  = ((uint32_t)design18 * 5u) >> 1;
     if (desMah < 2000u || desMah > 6000u) desMah = S23_FALLBACK_CAP_MAH;

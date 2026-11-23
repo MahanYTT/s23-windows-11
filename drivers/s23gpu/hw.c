@@ -2025,13 +2025,14 @@ ULONG HwReadTsens(VOID)
 {
     /* Poll TSENS2 sensor 1 (gpuss-0) or sensor 5 (gpuss-4) */
     if (g_Tsens2 == NULL) return 0;
-    ULONG ctrl = R32(g_Tsens2, 0x0C224004u - 0x0C224000u); /* SROT CTRL */
-    if ((ctrl & 1u) == 0) return 0;
 
-    for (ULONG i = 0; i < 50; i++) {
-        /* TSENS_TM_SN_STATUS for sensor 5 (gpuss-4) */
-        ULONG status = R32(g_Tsens2, 0x1000u + 0x0A0u + 5u * 4u);
-        if (status & (1u << 21)) {
+    /* We only mapped TM (0x0C273000), skip reading SROT (0x0C224000) CTRL to avoid faults.
+     * TSENS is definitely initialized and enabled by XBL/Linux. */
+
+    for (ULONG i = 0; i < 25; i++) {
+        /* TSENS_TM_SN_STATUS for sensor 5 (gpuss-4) in TSENS2 (0x0C273000) */
+        ULONG status = R32(g_Tsens2, 0x0A0u + 5u * 4u);
+        if (status != 0xFFFFFFFFU && (status & (1u << 21))) {
             LONG raw = (LONG)(status & 0xFFFu);
             if (raw & 0x800) raw |= ~0xFFF;
             return (ULONG)raw; /* return in deciCelsius */
