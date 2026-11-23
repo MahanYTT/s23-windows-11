@@ -9,6 +9,7 @@ Single entry point for everything modem-related. The former `modem_research/` fo
 
 | File | Origin | Content |
 |---|---|---|
+| [`FIRMWARE_GROUND_TRUTH.md`](FIRMWARE_GROUND_TRUTH.md) | from the firmware dump | Measured ELF load spans, segment-hash integrity, IPA/GSI v5.5 evidence, `modem_dtb` content, carve-out confirmation |
 | [`S23_5G_MODEM_AUTONOMOUS_BLUEPRINT.md`](S23_5G_MODEM_AUTONOMOUS_BLUEPRINT.md) | newest | Scope tiers (registration / packet data / voice), target architecture, SM8550 hardware spec, EFS safety protocol, agent harness, Day-0 checklist |
 | [`S23_5G_MODEM_AND_PIL_BRINGUP.md`](S23_5G_MODEM_AND_PIL_BRINGUP.md) | `modem_5g_research/` | Remoteproc table (MPSS/ADSP/CDSP/SPSS), DDR carve-outs vs `MemoryMapLib.c`, PAS SMC calling convention, IPCC/SMEM/SMP2P/GLINK, IPA + QMI data path, extracted firmware inventory |
 | [`S23_5G_MODEM_BRINGUP.md`](S23_5G_MODEM_BRINGUP.md) | moved from `modem_research/` | X70 hardware map, MBB dependency chain, 5 hard blockers, phased bring-up order, quick wins |
@@ -30,22 +31,26 @@ Related elsewhere: [`drivers/s23pilprobe/`](../drivers/s23pilprobe/) (read-only 
 | IPA / GSI MMIO | IPA `0x03E00000` (`0x84000`), GSI `0x03E04000` (`0xFC000`); IRQs GSI `686` (ipa) and `464` (gsi) | both docs, both SSDTs |
 | IPA firmware | `ipa_fws`, PAS ID `0x0F`; `apps_smmu` SID `0x4A0` | both bring-up docs |
 
-## Open contradictions (not resolved — verify before relying on them)
+## Contradictions — status after the firmware dump
 
-| # | Topic | Statement A | Statement B | How to settle |
-|---|---|---|---|---|
-| 1 | **IPA hardware version** | `S23_5G_MODEM_BRINGUP.md` and `S23_5G_MODEM_AND_PIL_BRINGUP.md`: **IPA v5.0** (`qcom,ipa-hw-ver = 0x18` from the live DTS) | `S23_5G_MODEM_AUTONOMOUS_BLUEPRINT.md`: **IPA v5.5 / GSI v5.0** (mainline `ipa_match` for SM8550); the firmware pull script also extracts `modem_image/fw_ipa_gsi_5.5_w.elf` | Decode `qcom,ipa-hw-ver` against the enum of the exact downstream kernel the DTS came from, and compare with the GSI firmware the modem image ships. This decides the register layout and GSI ring format. |
-| 2 | **Two SSDTs describe the same devices** | `s23_subsys_pil.asl`: `\_SB.IPCC`, `\_SB.MSS0` (`QCOM0C1C`), `\_SB.IPA0` (`QCOM0C6A`) | `s23_modem_subsystems.asl`: `\_SB.IPCC`, `\_SB.AMSS` (`QCOM0C1C`), `\_SB.IPA` (`QCOM0C6A`) with the same MMIO | **Never load both:** `\_SB.IPCC` exists in both, so the second table fails to load (name collision), and `MSS0`/`AMSS` and `IPA0`/`IPA` would claim the same resources. Pick one SSDT per experiment. |
-| 3 | **IPA interrupt trigger** | `s23_subsys_pil.asl`: IPA/GSI interrupts **Level** | `s23_modem_subsystems.asl`: IPA/GSI interrupts **Edge** | Check the `interrupts` trigger cells of the IPA node in the live DTS. |
-| 4 | **Paths in the blueprint's Day-0 checklist** | Mentions `HANDOFF.md`, `compile_dm1q_memfix.sh` and "both `modem*research/` folders" | These now live in `docs/archive/HANDOFF.md`, `scripts/legacy/compile_dm1q_memfix.sh` and this single folder | Use the new paths. |
+Measured against the stock images in [`FIRMWARE_GROUND_TRUTH.md`](FIRMWARE_GROUND_TRUTH.md) (dump kept outside the repo, reproducible with `scripts/verify_firmware_dump.py`).
+
+| # | Topic | Status | Result |
+|---|---|---|---|
+| 1 | **IPA / GSI version** (docs: v5.0 from `qcom,ipa-hw-ver = 0x18`; blueprint: v5.5) | ✅ **Resolved: v5.5** | The shipped GSI firmware is `fw_ipa_gsi_5.5_w.elf` (byte-identical segments to `ipa_fws.mdt/.bNN`) and the MPSS image carries the IPA component tag `ipa.dataipa.mpss.5.5.1`. The "0x18 = 5.0" decoding is not supported; decode `0x18` (= 24) against the matching downstream `enum ipa_hw_type` before quoting it again. `S23_5G_MODEM_BRINGUP.md` / `S23_5G_MODEM_AND_PIL_BRINGUP.md` still say v5.0 in their text — read them with this correction. |
+| 2 | **Two SSDTs describe the same devices** (`\_SB.IPCC` in both, `MSS0`/`AMSS` and `IPA0`/`IPA` with the same MMIO) | ⚠️ **Open (by design)** | Not a firmware question. **Never load both**; pick one SSDT per experiment. |
+| 3 | **IPA/GSI interrupt trigger** (Level in `s23_subsys_pil.asl`, Edge in `s23_modem_subsystems.asl`) | ⚠️ **Open** | The modem DTB in the dump is the Q6-side `qcom,kailua-mtp` tree without interrupt data; needs the AP-side live DTS. |
+| 4 | **Stale paths in the blueprint** | ✅ **Resolved** | All root paths (`HANDOFF.md`, `compile_dm1q_*.sh`, `build_bcd_hivex.sh`, `WIFI_BRINGUP_FIXES.md`, …) now point to `docs/archive/`, `scripts/legacy/`, `wifi_research/`. |
+| 5 | **Carve-outs** (MPSS `0x8A800000`/264 MiB, MPSS DTB `0x9B000000`, CDSP `0x9C900000`/32 MiB, CDSP/ADSP DTB `0x9E900000`/`0x9E980000`) | ✅ **Confirmed** | The image load spans match exactly. The ADSP image really spans `0x9EA00000..0xA43B4000`, i.e. past `PIL Reserved` — the critical finding in `S23_5G_MODEM_AND_PIL_BRINGUP.md` is real. |
 
 ## Master checklist
 
 Combined from the phase plan in `S23_5G_MODEM_BRINGUP.md` (section 3) and the blueprint (tiers, Day-0 checklist). The details live in those sections; nothing here is new.
 
 - [ ] **Gate 0 — backups (human, one time):** full partition backup incl. `modemst1/2`, `fsg`, `fsc`, `efs`, `sec_efs`, `persist` (blueprint, Day-0 step 1).
-- [ ] **Ground truth:** pull stock firmware read-only with `pull_s23_5g_and_subsys_fw.py`; re-dump the live DTB and re-check every address in the table above.
-- [ ] **Settle the open contradictions** (IPA version, SSDT choice, IRQ trigger).
+- [x] **Firmware ground truth:** stock images pulled and analysed ([`FIRMWARE_GROUND_TRUTH.md`](FIRMWARE_GROUND_TRUTH.md)); check a local dump with `scripts/verify_firmware_dump.py`.
+- [ ] **Live DTS:** re-dump the AP-side live DTB (IPA interrupt trigger, `qcom,ipa-hw-ver` decoding).
+- [ ] **Settle the remaining open points** (SSDT choice, IPA IRQ trigger).
 - [ ] **Phase 0:** reserve `mpss_dsm_region` (`0xD4D00000`, 51 MiB) in `MemoryMapLib.c`; verify Windows still boots.
 - [ ] **Phase 1:** `qcscm` (`QCOM05DD`) + `qcabd` (`QCOM0427`), read-only SCM query first.
 - [ ] **Phase 2:** RPMh/clock votes (`cx.lvl`, `mss.lvl`, `xo`) via the verified `APPS_RSC DRV2 TCS0` path.

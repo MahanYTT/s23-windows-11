@@ -63,3 +63,6 @@ audio_sensors_research/s23_vendor_audio_haptics_fw/
 *.elf
 *.elf*
 *.msc
+
+# Local stock firmware dump (never commit firmware)
+s23_dm1q_firmware_dump/
