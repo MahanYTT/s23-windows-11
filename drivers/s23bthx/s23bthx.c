@@ -297,6 +297,8 @@ _Static_assert(offsetof(IRP, CurrentStackLocation) == 0xB8, "IRP.CurrentStackLoc
 /* Kernel Imports (strictly verified against phone's ntoskrnl.exe) */
 __declspec(dllimport) PVOID    MmMapIoSpace(PHYSICAL_ADDRESS PhysicalAddress, SIZE_T NumberOfBytes, ULONG CacheType);
 __declspec(dllimport) VOID     MmUnmapIoSpace(PVOID BaseAddress, SIZE_T NumberOfBytes);
+__declspec(dllimport) PVOID    ExAllocatePool2(ULONGLONG Flags, SIZE_T NumberOfBytes, ULONG Tag);
+__declspec(dllimport) VOID     ExFreePoolWithTag(PVOID P, ULONG Tag);
 __declspec(dllimport) NTSTATUS PsCreateSystemThread(HANDLE *ThreadHandle, ULONG DesiredAccess, POBJECT_ATTRIBUTES ObjAttr, HANDLE ProcessHandle, PVOID ClientId, PKSTART_ROUTINE StartRoutine, PVOID StartContext);
 __declspec(dllimport) NTSTATUS PsTerminateSystemThread(NTSTATUS ExitStatus);
 __declspec(dllimport) NTSTATUS ObReferenceObjectByHandle(HANDLE Handle, ULONG DesiredAccess, PVOID ObjectType, CHAR AccessMode, PVOID *Object, PVOID HandleInfo);
@@ -648,13 +650,29 @@ typedef struct _S23BTHX_EXT {
     uint32_t          RxNeed;
     uint8_t           RxPktBuf[MAX_PKT_BYTES];
     uint8_t           TxScratch[1280];
+    uint8_t           ReadScratch[MAX_PKT_BYTES]; /* READ_HCI packet copy, owned via ReadScratchBusy */
+    volatile LONG     ReadScratchBusy;            /* 0 = free, 1 = owned by one READ_HCI dispatch */
 
     uint32_t          LogIoctlCount;
     uint32_t          LogTxCount;
     uint32_t          LogRxCount;
 } S23BTHX_EXT, *PS23BTHX_EXT;
 
-static PS23BTHX_EXT g_ActiveExt = NULL;
+#define S23BTHX_POOL_TAG    0x33324254u               /* 'TB23', same tag as the remove lock */
+#define POOL_FLAG_NON_PAGED 0x0000000000000040ULL
+
+/* Buffer for one READ_HCI packet copy, kept off the 24 KB ARM64 kernel stack.
+ * The per-device ReadScratch is handed out to exactly one caller at a time (atomic exchange of
+ * ReadScratchBusy 0 -> 1, released only by ReleaseReadBuf). A concurrent READ_HCI that finds it busy
+ * gets a non-paged pool buffer instead, so no caller ever waits and no buffer is ever shared. */
+static uint8_t *AcquireReadBuf(PS23BTHX_EXT ext) {
+    if (__atomic_exchange_n(&ext->ReadScratchBusy, 1, __ATOMIC_ACQUIRE) == 0) return ext->ReadScratch;
+    return (uint8_t *)ExAllocatePool2(POOL_FLAG_NON_PAGED, MAX_PKT_BYTES, S23BTHX_POOL_TAG);
+}
+static void ReleaseReadBuf(PS23BTHX_EXT ext, uint8_t *buf) {
+    if (buf == ext->ReadScratch) __atomic_store_n(&ext->ReadScratchBusy, 0, __ATOMIC_RELEASE);
+    else if (buf) ExFreePoolWithTag(buf, S23BTHX_POOL_TAG);
+}
 
 /* ============================================================================
  * Low-Level MMIO & Delay Helpers
@@ -1506,9 +1524,10 @@ static BOOLEAN RingPop(HCI_PKT_RING *r, uint8_t *out, uint32_t cap, uint32_t *le
 }
 
 static VOID S23BthxCancelIrp(PDEVICE_OBJECT devObj, PIRP irp) {
-    (void)devObj;
     IoReleaseCancelSpinLock(irp->CancelIrql);
-    PS23BTHX_EXT ext = g_ActiveExt;
+    /* devObj is the device the IRP is queued on (our filter DO = current stack location), so this is the
+     * extension that owns the queues: no global needed, and correct with more than one instance. */
+    PS23BTHX_EXT ext = devObj ? (PS23BTHX_EXT)devObj->DeviceExtension : NULL;
     if (ext) {
         KIRQL oldIrql = KeAcquireSpinLockRaiseToDpc(&ext->IoLock);
         (void)(QueueRemove(&ext->TxQueue, irp) ||
@@ -1884,18 +1903,26 @@ static NTSTATUS S23BthxDispatchIoctl(PDEVICE_OBJECT fdo, PIRP irp) {
             return STATUS_INVALID_PARAMETER;
         }
 
-        uint8_t pktCopy[MAX_PKT_BYTES];
+        uint8_t *pktCopy = AcquireReadBuf(ext);
+        if (!pktCopy) {
+            irp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
+            irp->IoStatus.Information = 0;
+            IofCompleteRequest(irp, IO_NO_INCREMENT);
+            IoReleaseRemoveLockEx(&ext->RemoveLock, irp, sizeof(IO_REMOVE_LOCK));
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
         uint32_t pktLen = 0;
         BOOLEAN havePkt = FALSE;
 
         KIRQL oldIrql = KeAcquireSpinLockRaiseToDpc(&ext->IoLock);
         HCI_PKT_RING *r = (pktType == HciPacketEvent) ? &ext->EvtRing : &ext->AclRing;
-        if (r->Count > 0U && RingPop(r, pktCopy, sizeof(pktCopy), &pktLen)) {
+        if (r->Count > 0U && RingPop(r, pktCopy, MAX_PKT_BYTES, &pktLen)) {
             havePkt = TRUE;
         } else {
             IRP_QUEUE *q = (pktType == HciPacketEvent) ? &ext->EvtQueue : &ext->AclQueue;
             if (q->Count >= MAX_PENDING_IRP || ext->Stopping) {
                 KeReleaseSpinLock(&ext->IoLock, oldIrql);
+                ReleaseReadBuf(ext, pktCopy);
                 irp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
                 irp->IoStatus.Information = 0;
                 IofCompleteRequest(irp, IO_NO_INCREMENT);
@@ -1906,6 +1933,7 @@ static NTSTATUS S23BthxDispatchIoctl(PDEVICE_OBJECT fdo, PIRP irp) {
             IoSetCancelRoutine(irp, S23BthxCancelIrp);
             if (irp->Cancel && IoSetCancelRoutine(irp, NULL) != NULL) {
                 KeReleaseSpinLock(&ext->IoLock, oldIrql);
+                ReleaseReadBuf(ext, pktCopy);
                 irp->IoStatus.Status = STATUS_CANCELLED;
                 irp->IoStatus.Information = 0;
                 IofCompleteRequest(irp, IO_NO_INCREMENT);
@@ -1914,6 +1942,7 @@ static NTSTATUS S23BthxDispatchIoctl(PDEVICE_OBJECT fdo, PIRP irp) {
             }
             QueuePush(q, irp);
             KeReleaseSpinLock(&ext->IoLock, oldIrql);
+            ReleaseReadBuf(ext, pktCopy);
             IoReleaseRemoveLockEx(&ext->RemoveLock, irp, sizeof(IO_REMOVE_LOCK));
             return STATUS_PENDING;
         }
@@ -1921,10 +1950,12 @@ static NTSTATUS S23BthxDispatchIoctl(PDEVICE_OBJECT fdo, PIRP irp) {
 
         if (havePkt) {
             CompleteReadIrpWithPacket(irp, (UCHAR)pktType, pktCopy, pktLen);
+            ReleaseReadBuf(ext, pktCopy);
             NTSTATUS cst = irp->IoStatus.Status;
             IoReleaseRemoveLockEx(&ext->RemoveLock, irp, sizeof(IO_REMOVE_LOCK));
             return cst;
         }
+        ReleaseReadBuf(ext, pktCopy);
         break;
     }
 
@@ -2071,7 +2102,6 @@ static NTSTATUS S23BthxPnp(PDEVICE_OBJECT fdo, PIRP irp) {
     if (mn == IRP_MN_REMOVE_DEVICE) {
         IoReleaseRemoveLockAndWaitEx(&ext->RemoveLock, irp, sizeof(IO_REMOVE_LOCK));
         S23BthxStopHw(ext);
-        if (g_ActiveExt == ext) g_ActiveExt = NULL;
         irp->IoStatus.Status = STATUS_SUCCESS;
         IoSkipCurrentIrpStackLocation(irp);
         NTSTATUS st = IofCallDriver(ext->LowerDevice, irp);
@@ -2155,7 +2185,6 @@ static NTSTATUS S23BthxAddDevice(PDRIVER_OBJECT drv, PDEVICE_OBJECT pdo) {
     /* Mirror lower device buffering & power flags cleanly */
     fiDo->Flags |= (ext->LowerDevice->Flags & (DO_POWER_PAGABLE)) | 0;
     fiDo->Flags &= ~DO_DEVICE_INITIALIZING;
-    g_ActiveExt = ext;
     LogStr("s23bthx AddDevice OK\r\n");
     FlushLogFile();
     return STATUS_SUCCESS;

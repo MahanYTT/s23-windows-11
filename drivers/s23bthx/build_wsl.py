@@ -9,6 +9,8 @@ nt_def = """LIBRARY ntoskrnl.exe
 EXPORTS
   MmMapIoSpace
   MmUnmapIoSpace
+  ExAllocatePool2
+  ExFreePoolWithTag
   PsCreateSystemThread
   PsTerminateSystemThread
   ObReferenceObjectByHandle
