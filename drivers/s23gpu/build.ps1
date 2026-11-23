@@ -1,15 +1,77 @@
+# Builds s23gpu.sys (ARM64 WDDM KMD), the user-mode test tools and the signed driver package.
+#
+# Every tool path is auto-detected; each can be overridden by a parameter or an environment variable:
+#   -MsvcToolsDir  / S23_MSVC_TOOLS_DIR   ...\VC\Tools\MSVC\<ver>        (default: vswhere, newest VS with the ARM64 toolset)
+#   -KitsRoot      / S23_KITS_ROOT        ...\Windows Kits\10\           (default: registry KitsRoot10)
+#   -WdkVersion    / S23_WDK_VERSION      SDK/WDK version folder          (default: 10.0.26100.0)
+#   -CertThumbprint/ S23_CERT_THUMBPRINT  test-signing certificate        (default: the CN=S23TouchTest2020 cert below)
+#   -MesaWslDir    / S23_MESA_WSL_DIR     Mesa checkout inside WSL        (default: $HOME/mesa_s23 of the WSL user)
+#   -NtoskrnlRef   / S23_NTOSKRNL_REF     the phone's ntoskrnl.exe for verify_pe.py import checks
+#   -HalRef        / S23_HAL_REF          the phone's hal.dll for verify_pe.py import checks
+# If detection fails, the original development-machine paths are used as a fallback.
+param(
+    [string]$MsvcToolsDir   = $env:S23_MSVC_TOOLS_DIR,
+    [string]$KitsRoot       = $env:S23_KITS_ROOT,
+    [string]$WdkVersion     = $(if ($env:S23_WDK_VERSION) { $env:S23_WDK_VERSION } else { '10.0.26100.0' }),
+    [string]$CertThumbprint = $(if ($env:S23_CERT_THUMBPRINT) { $env:S23_CERT_THUMBPRINT } else { '05DBD92557F4FC52EF2A5E5955789D8EED637C68' }),
+    [string]$MesaWslDir     = $env:S23_MESA_WSL_DIR,
+    [string]$NtoskrnlRef    = $(if ($env:S23_NTOSKRNL_REF) { $env:S23_NTOSKRNL_REF } else { 'C:\Users\Mahan\.gemini\antigravity\brain\69c04d84-af7a-419e-9781-d650ca2201d9\scratch\ntoskrnl_phone.exe' }),
+    [string]$HalRef         = $(if ($env:S23_HAL_REF) { $env:S23_HAL_REF } else { 'C:\Users\Mahan\.gemini\antigravity\brain\69c04d84-af7a-419e-9781-d650ca2201d9\scratch\hal.dll' })
+)
 $ErrorActionPreference = 'Stop'
 
-$dir      = 'C:\Users\Mahan\Documents\windows-on-android\s23_dm1q\drivers\s23gpu'
+function Find-MsvcToolsDir {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path $vswhere) {
+        $vs = $null
+        try { $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath 2>$null | Select-Object -First 1 } catch {}
+        if ($vs) {
+            $verFile = Join-Path $vs 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt'
+            if (Test-Path $verFile) {
+                $tools = Join-Path $vs ('VC\Tools\MSVC\' + (Get-Content $verFile -TotalCount 1).Trim())
+                if (Test-Path (Join-Path $tools 'bin\Hostx64\arm64\cl.exe')) { return $tools }
+            }
+        }
+    }
+    return 'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207'
+}
+
+function Find-KitsRoot {
+    try {
+        $root = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots' -Name KitsRoot10 -ErrorAction Stop).KitsRoot10
+        if ($root -and (Test-Path $root)) { return $root }
+    } catch {}
+    return 'C:\Program Files (x86)\Windows Kits\10\'
+}
+
+# Windows path -> WSL path (wslpath when available, else the default /mnt/<drive> automount)
+function ConvertTo-WslPath([string]$Path) {
+    $full = [System.IO.Path]::GetFullPath($Path)
+    try {
+        $p = & wsl -e wslpath -a -u $full 2>$null
+        if (-not $LASTEXITCODE -and $p) { return ($p | Select-Object -First 1).Trim() }
+    } catch {}
+    return '/mnt/' + $full.Substring(0, 1).ToLowerInvariant() + $full.Substring(2).Replace('\', '/')
+}
+
+if (-not $MsvcToolsDir) { $MsvcToolsDir = Find-MsvcToolsDir }
+if (-not $KitsRoot)     { $KitsRoot     = Find-KitsRoot }
+if (-not $MesaWslDir) {
+    $wslHome = $null
+    try { $wslHome = (& wsl -e sh -c 'echo $HOME' 2>$null | Select-Object -First 1) } catch {}
+    $MesaWslDir = if ($wslHome) { $wslHome.Trim() + '/mesa_s23' } else { '/home/mahan/mesa_s23' }
+}
+
+$dir      = $PSScriptRoot
 $outDir   = Join-Path $dir 'out'
 $pkgDir   = Join-Path $dir 'pkg'
-$msvcBin  = 'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\bin\Hostx64\arm64'
-$msvcInc  = 'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include'
-$msvcLib  = 'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\lib\arm64'
-$wdkInc   = 'C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0'
-$wdkLib   = 'C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0'
-$wdkBinX86 = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x86'
-$wdkBinX64 = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64'
+$msvcBin  = Join-Path $MsvcToolsDir 'bin\Hostx64\arm64'
+$msvcInc  = Join-Path $MsvcToolsDir 'include'
+$msvcLib  = Join-Path $MsvcToolsDir 'lib\arm64'
+$wdkInc   = Join-Path $KitsRoot "Include\$WdkVersion"
+$wdkLib   = Join-Path $KitsRoot "Lib\$WdkVersion"
+$wdkBinX86 = Join-Path $KitsRoot "bin\$WdkVersion\x86"
+$wdkBinX64 = Join-Path $KitsRoot "bin\$WdkVersion\x64"
 
 $cl       = Join-Path $msvcBin 'cl.exe'
 $link     = Join-Path $msvcBin 'link.exe'
@@ -17,14 +79,22 @@ $armasm   = Join-Path $msvcBin 'armasm64.exe'
 $dumpbin  = Join-Path $msvcBin 'dumpbin.exe'
 $inf2cat  = Join-Path $wdkBinX86 'inf2cat.exe'
 $signtool = Join-Path $wdkBinX64 'signtool.exe'
-$thumb    = '05DBD92557F4FC52EF2A5E5955789D8EED637C68'
+$thumb    = $CertThumbprint
+
+foreach ($tool in $cl, $link, $armasm, $dumpbin, $inf2cat, $signtool) {
+    if (-not (Test-Path $tool)) { throw "Build tool not found: $tool (set -MsvcToolsDir / -KitsRoot / -WdkVersion)" }
+}
+Write-Host "MSVC: $MsvcToolsDir"
+Write-Host "Kits: $KitsRoot ($WdkVersion)"
+Write-Host "Mesa: $MesaWslDir (WSL)"
 
 New-Item -ItemType Directory -Force -Path $outDir, $pkgDir | Out-Null
 Remove-Item -Recurse -Force (Join-Path $outDir '*'), (Join-Path $pkgDir '*') -ErrorAction SilentlyContinue
+$outWsl = ConvertTo-WslPath $outDir
 
-$wslMesaDll = '/home/mahan/mesa_s23/build_d3d10/src/gallium/targets/d3d10umd/libgallium_d3d10.dll'
+$wslMesaDll = "$MesaWslDir/build_d3d10/src/gallium/targets/d3d10umd/libgallium_d3d10.dll"
 $mesaUmd = Join-Path $outDir 'mesa_d3d10_arm64.dll'
-wsl bash -lc "test -f '$wslMesaDll' && cp '$wslMesaDll' '/mnt/c/Users/Mahan/Documents/windows-on-android/s23_dm1q/drivers/s23gpu/out/mesa_d3d10_arm64.dll'" 2>$null
+wsl bash -lc "test -f '$wslMesaDll' && cp '$wslMesaDll' '$outWsl/mesa_d3d10_arm64.dll'" 2>$null
 if ($LASTEXITCODE) { throw "Failed to copy Mesa UMD from WSL ($wslMesaDll)" }
 
 Write-Host '=== Assembling scm_arm64.asm ==='
@@ -75,9 +145,9 @@ if ($LASTEXITCODE) { throw "cl.exe s23disp_only failed: $LASTEXITCODE" }
 Write-Host "Using Mesa Freedreno UMD: $mesaUmd"
 Copy-Item $mesaUmd (Join-Path $outDir 's23gpu_umd.dll') -Force
 
-$wslWglDll = '/home/mahan/mesa_s23/build_d3d10/src/gallium/targets/wgl/libgallium_wgl.dll'
-$wslGlDll  = '/home/mahan/mesa_s23/build_d3d10/src/gallium/targets/libgl-gdi/opengl32.dll'
-wsl bash -lc "if test -f '$wslWglDll' && test -f '$wslGlDll'; then cp '$wslWglDll' '/mnt/c/Users/Mahan/Documents/windows-on-android/s23_dm1q/drivers/s23gpu/out/libgallium_wgl.dll' && cp '$wslGlDll' '/mnt/c/Users/Mahan/Documents/windows-on-android/s23_dm1q/drivers/s23gpu/out/opengl32.dll'; fi" 2>$null
+$wslWglDll = "$MesaWslDir/build_d3d10/src/gallium/targets/wgl/libgallium_wgl.dll"
+$wslGlDll  = "$MesaWslDir/build_d3d10/src/gallium/targets/libgl-gdi/opengl32.dll"
+wsl bash -lc "if test -f '$wslWglDll' && test -f '$wslGlDll'; then cp '$wslWglDll' '$outWsl/libgallium_wgl.dll' && cp '$wslGlDll' '$outWsl/opengl32.dll'; fi" 2>$null
 if (Test-Path (Join-Path $outDir 'libgallium_wgl.dll')) {
     & $signtool sign /fd SHA256 /sha1 $thumb (Join-Path $outDir 'libgallium_wgl.dll') (Join-Path $outDir 'opengl32.dll')
     if ($LASTEXITCODE) { throw "signtool OpenGL DLLs failed: $LASTEXITCODE" }
@@ -85,9 +155,9 @@ if (Test-Path (Join-Path $outDir 'libgallium_wgl.dll')) {
 
 $outX64Dir = Join-Path $outDir 'x64'
 New-Item -ItemType Directory -Force -Path $outX64Dir | Out-Null
-$wslWglX64 = '/home/mahan/mesa_s23/build_x64/src/gallium/targets/wgl/libgallium_wgl.dll'
-$wslGlX64  = '/home/mahan/mesa_s23/build_x64/src/gallium/targets/libgl-gdi/opengl32.dll'
-wsl bash -lc "if test -f '$wslWglX64' && test -f '$wslGlX64'; then cp '$wslWglX64' '/mnt/c/Users/Mahan/Documents/windows-on-android/s23_dm1q/drivers/s23gpu/out/x64/libgallium_wgl.dll' && cp '$wslGlX64' '/mnt/c/Users/Mahan/Documents/windows-on-android/s23_dm1q/drivers/s23gpu/out/x64/opengl32.dll'; fi" 2>$null
+$wslWglX64 = "$MesaWslDir/build_x64/src/gallium/targets/wgl/libgallium_wgl.dll"
+$wslGlX64  = "$MesaWslDir/build_x64/src/gallium/targets/libgl-gdi/opengl32.dll"
+wsl bash -lc "if test -f '$wslWglX64' && test -f '$wslGlX64'; then cp '$wslWglX64' '$outWsl/x64/libgallium_wgl.dll' && cp '$wslGlX64' '$outWsl/x64/opengl32.dll'; fi" 2>$null
 if (Test-Path (Join-Path $outX64Dir 'libgallium_wgl.dll')) {
     & $signtool sign /fd SHA256 /sha1 $thumb (Join-Path $outX64Dir 'libgallium_wgl.dll') (Join-Path $outX64Dir 'opengl32.dll')
     if ($LASTEXITCODE) { throw "signtool x64 OpenGL DLLs failed: $LASTEXITCODE" }
@@ -113,7 +183,7 @@ Write-Host '=== Verifying PE Headers, Imports & Catalog ==='
 & $dumpbin /imports (Join-Path $pkgDir 's23gpu.sys') | Select-String -Pattern '\.sys|\.exe|\.dll'
 
 & $dumpbin /headers (Join-Path $outDir 's23gpu_test.exe') (Join-Path $outDir 's23gpu_install.exe') (Join-Path $outDir 's23gpu_d3d11_test.exe') (Join-Path $pkgDir 's23gpu_umd.dll') | Select-String -Pattern 'machine|Dump of file'
-python (Join-Path $dir '..\s23gpuprobe\verify_pe.py') (Join-Path $pkgDir 's23gpu.sys') 'C:\Users\Mahan\.gemini\antigravity\brain\69c04d84-af7a-419e-9781-d650ca2201d9\scratch\ntoskrnl_phone.exe' 'C:\Users\Mahan\.gemini\antigravity\brain\69c04d84-af7a-419e-9781-d650ca2201d9\scratch\hal.dll'
+python (Join-Path $dir '..\s23gpuprobe\verify_pe.py') (Join-Path $pkgDir 's23gpu.sys') $NtoskrnlRef $HalRef
 if ($LASTEXITCODE) { throw "verify_pe.py failed: $LASTEXITCODE" }
 
 $sigs = Get-AuthenticodeSignature (Join-Path $pkgDir 's23gpu.sys'), (Join-Path $pkgDir 's23gpu_umd.dll'), (Join-Path $pkgDir 's23gpu.cat')
