@@ -67,3 +67,14 @@ jobs:
           python3 scripts/ci/check_driver_stack.py \
             drivers/s23batt/out/s23batt.sys drivers/s23bthx/out/s23bthx.sys \
             drivers/s23keys/out/s23keys.sys drivers/s23touch/out/s23touch.sys
+
+  c-host-tests:
+    name: Host C tests for s23gpu pure logic (ASan + UBSan)
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - name: VA allocator, msm_validate.h, CreateAllocation range check
+        run: python3 tests/c/run_c_tests.py --sanitize --cc ${{ matrix.cc }}
