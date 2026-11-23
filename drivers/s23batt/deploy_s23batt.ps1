@@ -2,9 +2,9 @@ $ProgressPreference = 'SilentlyContinue'
 $ErrorActionPreference = 'Stop'
 $env:RM9_WINUSB = '1'
 
-$dir = 'C:\Users\Mahan\Documents\windows-on-android\s23_dm1q\drivers\s23batt'
+$dir = $PSScriptRoot
 $pkgDir = Join-Path $dir 'pkg'
-$s23link = 'C:\Users\Mahan\Documents\windows-on-android\s23_dm1q\s23link.py'
+$s23link = Join-Path (Split-Path -Parent (Split-Path -Parent $dir)) 's23link.py'
 
 Write-Host '=== Checking S23 USB link ==='
 & python $s23link ping
