@@ -1,0 +1,55 @@
+$ErrorActionPreference = 'Stop'
+
+$dir       = $PSScriptRoot
+$outDir    = Join-Path $dir 'out'
+$msvcDir   = 'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207'
+$msvcBin   = Join-Path $msvcDir 'bin\Hostx64\arm64'
+$msvcInc   = Join-Path $msvcDir 'include'
+$msvcLib   = Join-Path $msvcDir 'lib\arm64'
+$wdkInc    = 'C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0'
+$wdkLib    = 'C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0'
+$wdkBinX64 = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64'
+
+$cl        = Join-Path $msvcBin 'cl.exe'
+$link      = Join-Path $msvcBin 'link.exe'
+$armasm    = Join-Path $msvcBin 'armasm64.exe'
+$signtool  = Join-Path $wdkBinX64 'signtool.exe'
+$thumb     = '05DBD92557F4FC52EF2A5E5955789D8EED637C68'
+$ntPhone   = 'C:\Users\Mahan\.gemini\antigravity\brain\69c04d84-af7a-419e-9781-d650ca2201d9\scratch\ntoskrnl_phone.exe'
+$halPhone  = 'C:\Users\Mahan\.gemini\antigravity\brain\69c04d84-af7a-419e-9781-d650ca2201d9\scratch\phone_dlls\hal.dll'
+$verifyPy  = Join-Path $dir '..\s23gpuprobe\verify_pe.py'
+
+New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+Remove-Item -Recurse -Force (Join-Path $outDir '*') -ErrorAction SilentlyContinue
+
+Write-Host '=== Assembling scm_arm64.asm ==='
+& $armasm -o (Join-Path $outDir 'scm_arm64.obj') (Join-Path $dir 'scm_arm64.asm')
+if ($LASTEXITCODE) { throw "armasm64 failed: $LASTEXITCODE" }
+
+Write-Host '=== Compiling s23modem_xprt.c (ARM64 Kernel) ==='
+$kmDefs = @('/D_ARM64_=1', '/DARM64=1', '/D_WIN64=1', '/DWINNT=1', '/D_WIN32_WINNT=0x0A00', '/DNTDDI_VERSION=0x0A000010', '/DPOOL_ZERO_DOWN_LEVEL_SUPPORT=1')
+$kmInc  = @("/I$wdkInc\km", "/I$wdkInc\km\crt", "/I$wdkInc\shared", "/I$dir")
+& $cl /nologo /c /kernel /Zl /GS- /W3 /WX /Oi /O2 @kmDefs @kmInc "/Fo$outDir\" (Join-Path $dir 's23modem_xprt.c')
+if ($LASTEXITCODE) { throw "cl.exe s23modem_xprt.c failed: $LASTEXITCODE" }
+
+Write-Host '=== Linking s23modem_xprt.sys ==='
+$sysOut = Join-Path $outDir 's23modem_xprt.sys'
+& $link /NOLOGO /NODEFAULTLIB /DRIVER /SUBSYSTEM:NATIVE,10.00 /MACHINE:ARM64 /ENTRY:DriverEntry /FIXED:NO /DYNAMICBASE /TSAWARE:NO /RELEASE /OPT:REF /OPT:ICF /MERGE:_TEXT=.text "/OUT:$sysOut" (Join-Path $outDir 's23modem_xprt.obj') (Join-Path $outDir 'scm_arm64.obj') (Join-Path $wdkLib 'km\arm64\ntoskrnl.lib') (Join-Path $wdkLib 'km\arm64\hal.lib') (Join-Path $wdkLib 'km\arm64\libcntpr.lib')
+if ($LASTEXITCODE) { throw "link.exe s23modem_xprt.sys failed: $LASTEXITCODE" }
+
+Write-Host '=== Signing s23modem_xprt.sys ==='
+& $signtool sign /fd SHA256 /sha1 $thumb $sysOut
+if ($LASTEXITCODE) { throw "signtool failed: $LASTEXITCODE" }
+
+Write-Host '=== Verifying PE & S23 ntoskrnl.exe imports ==='
+& python $verifyPy $sysOut $ntPhone $halPhone
+if ($LASTEXITCODE) { throw "verify_pe.py failed: $LASTEXITCODE" }
+
+Write-Host '=== Building s23modemd.exe (ARM64 User-Mode Static CRT) ==='
+$umInc = @("/I$msvcInc", "/I$wdkInc\um", "/I$wdkInc\shared", "/I$wdkInc\ucrt", "/I$dir")
+$umLibPaths = @("/LIBPATH:$msvcLib", "/LIBPATH:$wdkLib\um\arm64", "/LIBPATH:$wdkLib\ucrt\arm64")
+$exeOut = Join-Path $outDir 's23modemd.exe'
+& $cl /nologo /MT /O2 /W3 /WX @umInc (Join-Path $dir 's23modemd.c') "/Fo$outDir\s23modemd.obj" /link /MACHINE:ARM64 @umLibPaths kernel32.lib "/OUT:$exeOut"
+if ($LASTEXITCODE) { throw "cl.exe s23modemd.exe failed: $LASTEXITCODE" }
+
+Write-Host "BUILT & VERIFIED: $sysOut and $exeOut"
