@@ -43,8 +43,11 @@ static VOID Blt(const S23GPU_CMD *C)
     PMDL ms = NULL, md = NULL;
     PUCHAR s, d;
     ULONG i, n = C->NumRects ? C->NumRects : 1u;
-    LONG dx = C->SrcRect.left - C->DstRect.left;
-    LONG dy = C->SrcRect.top - C->DstRect.top;
+    /* 64-bit clipping math: with hostile rectangles (e.g. DstRect.left = INT32_MIN) the 32-bit
+     * differences and "-dx" overflowed, the clip let rows like y = INT32_MIN through and
+     * RtlCopyMemory wrote far outside the allocation. Results are unchanged for in-range values. */
+    LONGLONG dx = (LONGLONG)C->SrcRect.left - (LONGLONG)C->DstRect.left;
+    LONGLONG dy = (LONGLONG)C->SrcRect.top - (LONGLONG)C->DstRect.top;
 
     if (C->Src == NULL || C->Dst == NULL) {
         return;
@@ -74,26 +77,27 @@ static VOID Blt(const S23GPU_CMD *C)
         if (srcSizeH < srcMaxH) srcMaxH = srcSizeH;
 
         for (i = 0; i < n; i++) {
-            RECT r = C->NumRects ? C->Rects[i] : C->DstRect;
-            LONG w;
+            const RECT *rr = C->NumRects ? &C->Rects[i] : &C->DstRect;
+            LONGLONG left = rr->left, top = rr->top, right = rr->right, bottom = rr->bottom;
+            LONGLONG w;
 
-            if (r.left < 0) r.left = 0;
-            if (r.top < 0) r.top = 0;
-            if (r.right > dstMaxW) r.right = dstMaxW;
-            if (r.bottom > dstMaxH) r.bottom = dstMaxH;
-            if (r.left + dx < 0) r.left = -dx;
-            if (r.top + dy < 0) r.top = -dy;
-            if (r.right + dx > srcMaxW) r.right = srcMaxW - dx;
-            if (r.bottom + dy > srcMaxH) r.bottom = srcMaxH - dy;
-            w = r.right - r.left;
-            if (w <= 0 || r.bottom <= r.top) {
+            if (left < 0) left = 0;
+            if (top < 0) top = 0;
+            if (right > dstMaxW) right = dstMaxW;
+            if (bottom > dstMaxH) bottom = dstMaxH;
+            if (left + dx < 0) left = -dx;
+            if (top + dy < 0) top = -dy;
+            if (right + dx > srcMaxW) right = srcMaxW - dx;
+            if (bottom + dy > srcMaxH) bottom = srcMaxH - dy;
+            w = right - left;
+            if (w <= 0 || bottom <= top) {
                 continue;
             }
             {
-                LONG y;
-                for (y = r.top; y < r.bottom; y++) {
-                    RtlCopyMemory(d + (SIZE_T)y * C->Dst->Desc.pitch + (SIZE_T)r.left * 4u,
-                                  s + (SIZE_T)(y + dy) * C->Src->Desc.pitch + (SIZE_T)(r.left + dx) * 4u,
+                LONGLONG y;
+                for (y = top; y < bottom; y++) {
+                    RtlCopyMemory(d + (SIZE_T)y * C->Dst->Desc.pitch + (SIZE_T)left * 4u,
+                                  s + (SIZE_T)(y + dy) * C->Src->Desc.pitch + (SIZE_T)(left + dx) * 4u,
                                   (SIZE_T)w * 4u);
                 }
             }

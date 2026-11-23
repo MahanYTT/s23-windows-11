@@ -14,8 +14,8 @@ jobs:
     name: Repo hygiene (no binaries / firmware)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - run: python scripts/ci/check_repo_hygiene.py
@@ -25,8 +25,8 @@ jobs:
     # s23link.py uses ctypes.wintypes / WinDLL, so the tests run on Windows
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: Byte-compile every tracked .py file
@@ -42,7 +42,7 @@ jobs:
       matrix:
         cc: [gcc, clang]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: VA allocator, msm_validate.h, CreateAllocation range check
         run: python3 tests/c/run_c_tests.py --sanitize --cc ${{ matrix.cc }}
 
@@ -50,7 +50,7 @@ jobs:
     name: Shell scripts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: shellcheck (errors only)
         run: |
           mapfile -d '' files < <(git ls-files -z '*.sh')
@@ -60,7 +60,7 @@ jobs:
     name: ACPI SSDT syntax (iasl)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install acpica-tools
         run: |
           sudo apt-get update
@@ -82,7 +82,7 @@ jobs:
     name: ARM64 drivers build + stack check (clang, no hardware)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install LLVM 18 and aarch64 binutils
         run: |
           sudo apt-get update
@@ -105,7 +105,7 @@ jobs:
     name: ARM64 helper/probe drivers build + stack check (clang, no hardware)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install LLVM 18 and aarch64 binutils
         run: |
           sudo apt-get update
