@@ -67,3 +67,29 @@ jobs:
           python3 scripts/ci/check_driver_stack.py \
             drivers/s23batt/out/s23batt.sys drivers/s23bthx/out/s23bthx.sys \
             drivers/s23keys/out/s23keys.sys drivers/s23touch/out/s23touch.sys
+
+  aux-drivers:
+    name: ARM64 helper/probe drivers build + stack check (clang, no hardware)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install LLVM 18 and aarch64 binutils
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-18 lld-18 llvm-18 binutils-aarch64-linux-gnu
+          echo /usr/lib/llvm-18/bin >> "$GITHUB_PATH"
+      # drivers/s23audprobe and drivers/s23audio are deliberately not built here (live work in progress).
+      - name: Build helper and probe drivers (same flags as local WSL builds)
+        run: |
+          for d in s23perf s23disp_diag s23aclfix s23aclsvc s23pilprobe s23pcieprobe s23sensprobe s23btprobe s23gpuprobe; do
+            echo "::group::$d"
+            python3 "drivers/$d/build_wsl.py"
+            echo "::endgroup::"
+          done
+      - name: __chkstk / stack frame check (kernel drivers only; s23aclsvc.exe is a user-mode service)
+        run: |
+          python3 scripts/ci/check_driver_stack.py \
+            drivers/s23perf/out/s23perf.sys drivers/s23disp_diag/out/s23disp_diag.sys \
+            drivers/s23aclfix/out/s23aclfix.sys drivers/s23pilprobe/out/s23pilprobe.sys \
+            drivers/s23pcieprobe/out/s23pcieprobe.sys drivers/s23sensprobe/out/s23sensprobe.sys \
+            drivers/s23btprobe/out/s23btprobe.sys drivers/s23gpuprobe/out/s23gpuprobe.sys
