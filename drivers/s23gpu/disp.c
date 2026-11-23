@@ -848,13 +848,14 @@ VOID DispPresentRects(S23GPU_ALLOCATION *Dst, const UCHAR *DstPixels, const RECT
 
             for (i = 0; i < Count; i++) {
                 RECT r = Rects[i];
-                LONG w;
+                LONGLONG w;
 
                 if (r.left < 0) r.left = 0;
                 if (r.top < 0) r.top = 0;
                 if (r.right > maxW) r.right = maxW;
                 if (r.bottom > maxH) r.bottom = maxH;
-                w = r.right - r.left;
+                /* 64-bit: e.g. left = 1, right = INT32_MIN overflowed to a huge positive width */
+                w = (LONGLONG)r.right - (LONGLONG)r.left;
                 if (w <= 0 || r.bottom <= r.top) {
                     continue;
                 }
