@@ -19,21 +19,201 @@ This repository contains the ARM64 kernel drivers, UEFI DXE patches, ACPI SSDTs,
 
 ## Status
 
-| Area | Driver / Path | Status | Highlights |
-|---|---|---|---|
-| **Display & GPU** (Adreno 740) | [`drivers/s23gpu/`](drivers/s23gpu/) | ✅ Working (Experimental) | WDDM 2.0 display + 3D KMD, `1080×2340 @ 120 Hz` with high-resolution VSync, native brightness & Night Light, Mesa Freedreno D3D11 (`d3d10umd`) and **OpenGL 4.6** WGL ICD (ARM64 + x64), live **GPU utilization** and **TSENS GPU temperature** in Task Manager. |
-| **Battery & fast charging** | [`drivers/s23batt/`](drivers/s23batt/) | ✅ Working | Battery miniclass driver for the Maxim **MAX77705** fuel gauge (`@0x36`) and charger (`@0x69`): 3.0 A input limit, 2.5 A CC fast charge, 4.4 V float, watchdog handling, abnormal-off recovery, calibrated battery temperature. |
-| **Touchscreen** | [`drivers/s23touch/`](drivers/s23touch/) | ✅ Working | HID multitouch minidriver for the STM **FTS2BA61Y** on QUP1 SE4 GENI SPI (`0x00A90000`, IRQ `gpio25`). |
-| **Physical keys** | [`drivers/s23keys/`](drivers/s23keys/) | ✅ Working (Power button needs investigation) | HID minidriver for Power / Volume Up / Volume Down, read-only via the SPMI PMIC arbiter observer. |
-| **Bluetooth 5.3 + BLE** | [`drivers/s23bthx/`](drivers/s23bthx/) | ✅ Working | `BthMini` extensible-transport lower filter for the **QCA6490** on `UART14` (QUP2 SE6, `3.2 Mbaud`, IBS), Classic + BLE, A2DP-sized ACL buffers. |
-| **USB-C PC link** | [`s23link.py`](s23link.py) | ✅ Working | WinUSB remote shell and file transfer between PC and phone (`ping`, `ver`, `exec`, `put`, `get`, `reboot`). |
-| **Audio** (ADSP AudioReach, Dual CS35L43) | [`drivers/s23audio/`](drivers/s23audio/), [`drivers/s23audprobe/`](drivers/s23audprobe/) | ✅ Working | Native ARM64 PortCls WaveRT + Topology driver (`ROOT\S23AUDIO` / `ACPI\S23AUD01`) with lazy ADSP PIL, GLink/GPRv2/PRM, Gunyah-safe APPS-SMMU bypass, and dual CS35L43 speaker amps (`Speakers (Samsung Galaxy S23 Stereo)` verified via WASAPI). |
-| **Wi-Fi 6E** (QCA6490 PCIe, `PCI\VEN_17CB&DEV_1103`) | [`wifi_research/`](wifi_research/), [`drivers/s23pcieprobe/`](drivers/s23pcieprobe/) | ✅ Working | Live with internet: UEFI PCIe0 bring-up + `qcwlan8280.sys` + the S23 board data file `bdwlan.elf`. `wifi_research/` holds the bring-up and install docs (UEFI DXE, ACPI SSDT, package builder); `s23pcieprobe` is the diagnostic probe. |
-| **5G modem / PIL / CPU perf** | [`modem_5g_research/`](modem_5g_research/) ([index](modem_5g_research/README.md)), [`drivers/s23pilprobe/`](drivers/s23pilprobe/), [`drivers/s23perf/`](drivers/s23perf/) | 🔬 Research | Autonomous bring-up blueprint, SMEM/IMEM/PIL telemetry, inert subsystem SSDTs, EPSS CPUfreq and TSENS probes. |
-| **Native USB-C** (dual-role, PD 3.0, DP Alt-Mode) | [`usb_research/`](usb_research/) | 🔬 Research | Specification for native USB-C on Windows: MAX77705 OPCODE mailbox, UCM/URS driver split, DWC3/eUSB2/QMP PHY transitions, DP Alt-Mode via WDDM. |
-| **UEFI display fix** | [`display_research/`](display_research/) | ✅ Working | `S23DisplayFixDxe` (DISP_CC gating, DSI0 wake, tear-counter heal) flashed in the UEFI image. |
+**Demonstrated:** native Windows 11 Pro 24H2 ARM64 (`10.0.26100`) on UFS, 120 Hz AMOLED display with native brightness & Night Light, experimental Adreno 740 WDDM 2.0 acceleration (Mesa Freedreno D3D11 + OpenGL 4.6), multitouch, volume keys, Wi-Fi 6E with internet, Bluetooth 5.3 + BLE, stereo ADSP AudioReach + dual CS35L43 audio, MAX77705 battery reporting and wired fast charging, and WinUSB PC link.  
+**Still unfinished:** 5G cellular / eSIM (`Snapdragon X70`), native USB-C dual-role Host/OTG + PD 3.0 + DP Alt-Mode, power-button sleep/wake and system suspend/resume (S0ix), haptics (`CS40L26A`), motion/light/proximity sensors, cameras, GNSS, NFC, TPM/Secure Boot, and a portable public installer/UEFI workflow.
+
+| Area | Status | Notes |
+|---|---|---|
+| UEFI / ACPI | **WORKS ✅** | Custom UEFI boot image on `sda25` with `S23DisplayFixDxe` ([`display_research/`](display_research/)), PCIe0 bring-up and ACPI SSDTs; boots WinPE and full Windows 11 Pro 24H2. |
+| CPU | **WORKS ✅** | Native ARM64 execution across all 8 cores on Snapdragon 8 Gen 2 for Galaxy (`SM8550-AC`); EPSS CPUfreq & TSENS telemetry probed ([`drivers/s23perf/`](drivers/s23perf/)). Production DVFS/thermal policies are not finished. |
+| RAM | **WORKS ✅** | Usable Windows memory map with reserved subsystem carve-outs for daily desktop and GPU workloads; full stress and suspend-retention qualification still pending. |
+| UFS / installation | **WORKS ✅** | Installed Windows 11 boots directly from 4 KiB-sector UFS partition `sda43` (`/dev/block/by-name/win`) with Android LUNs isolated (`SanPolicy = 4`); public reproducible installer still pending. |
+| Display | **WORKS ✅** | Native `1080×2340 @ 120 Hz` AMOLED presentation with high-resolution VSync, native brightness slider and Night Light ([`drivers/s23gpu/`](drivers/s23gpu/), [`display_research/`](display_research/)). Display idle-off/sleep-wake hardening still pending. |
+| GPU / WDDM acceleration | **WORKS ✅** | Experimental Adreno 740 WDDM 2.0 display + 3D KMD ([`drivers/s23gpu/`](drivers/s23gpu/)): GMU + SQE + ZAP + KGSL-SMMU, Mesa Freedreno D3D11 (`d3d10umd`) and **OpenGL 4.6** WGL ICD (ARM64 + x64), live Task Manager GPU utilization & TSENS temperature. Broad stability/Vulkan hardening still pending. |
+| Touchscreen | **WORKS ✅** | STM `FTS2BA61Y` HID multitouch minidriver on QUP1 SE4 GENI SPI (`0x00A90000`, IRQ `gpio25`, [`drivers/s23touch/`](drivers/s23touch/)). Everyday multitouch works; suspend/resume qualification pending. |
+| Physical buttons | **PARTIAL 🟡** | Read-only SPMI PMIC arbiter HID minidriver ([`drivers/s23keys/`](drivers/s23keys/)): Volume Up / Volume Down work natively; Power button display-off/wake behavior still needs investigation. |
+| Wi-Fi 6E | **WORKS ✅** | Live with internet on `QCA6490` PCIe0 (`PCI\VEN_17CB&DEV_1103`): UEFI RC bring-up + Qualcomm `qcwlan8280.sys` + S23 `bdwlan.elf` ([`wifi_research/`](wifi_research/), [`drivers/s23pcieprobe/`](drivers/s23pcieprobe/)). |
+| Bluetooth 5.3 + BLE | **WORKS ✅** | `BthMini` extensible-transport lower filter for `QCA6490` on `UART14` (`3.2 Mbaud`, IBS, [`drivers/s23bthx/`](drivers/s23bthx/)): Classic + BLE, A2DP-sized ACL buffers. Suspend/resume & HFP/SCO qualification pending. |
+| Audio | **WORKS ✅** | Native ARM64 PortCls WaveRT + Topology driver (`ROOT\S23AUDIO` / `ACPI\S23AUD01`, [`drivers/s23audio/`](drivers/s23audio/)): lazy ADSP PIL (`PAS 36` + `PAS 1`), GLink/GPRv2/PRM, Gunyah-safe APPS-SMMU bypass, dual Cirrus Logic `CS35L43` stereo playback verified via WASAPI. Mic capture & Halo DSP calibration pending. |
+| Battery reporting | **WORKS ✅** | Maxim `MAX77705` fuel gauge (`@0x36`) Windows battery miniclass driver (`battc.sys`, [`drivers/s23batt/`](drivers/s23batt/)): validated percentage, voltage, current rate and calibrated battery temperature. |
+| Charging | **WORKS ✅** | Maxim `MAX77705` charger (`@0x69`, [`drivers/s23batt/`](drivers/s23batt/)): 3.0 A input limit, 2.5 A CC wired fast charge, 4.4 V float, watchdog handling and abnormal-off recovery. Dynamic USB-PD/PPS (`PCA9481`) & wireless charging (`S2MIW04`) not yet wired. |
+| USB-C / PC link | **PARTIAL 🟡** | WinUSB remote shell & file transfer works ([`s23link.py`](s23link.py)); native USB-C architecture & host-tested MAX77705 OPCODE / PD 3.0 codec ready ([`usb_research/`](usb_research/)). Shared `SE8` PMIC arbiter, Host/OTG (`s23urs.sys`), USB-PD (`UcmCx`) & DP Alt-Mode not yet implemented. |
+| 5G cellular / eSIM | **IN PROGRESS 🛠️** | `Snapdragon X70` stock MPSS/IPA firmware ground-truth, autonomous bring-up blueprint, inert SSDTs & host-tested QMI/QMUX codec complete ([`modem_5g_research/`](modem_5g_research/), [`drivers/s23pilprobe/`](drivers/s23pilprobe/)). Live MPSS PIL boot, `rmtfs`, physical SIM + eSIM (`UIM`/`MBBCx`/`lpasvc`) and IPA v5.5 data bring-up in progress. |
+| Power management | **PARTIAL 🟡** | Working awake profile for daily development and testing; system suspend/resume (Modern Standby / S0ix), display sleep-wake, and idle RPMh/thermal policies are not finished. |
+| Haptics | **IN PROGRESS 🛠️** | Cirrus Logic `CS40L26A` verified on live I2C (`QUPv3_I2C_HUB SE3 @0x40`, Device ID `0x0040A260`, [`drivers/s23sensprobe/`](drivers/s23sensprobe/), [`audio_sensors_research/`](audio_sensors_research/)). Firmware load and Windows waveform driver not yet built. |
+| Motion / light / proximity sensors | **NOT WORKING ❌** | SSC bus / Windows sensor class integration not implemented yet. |
+| Cameras | **NOT WORKING ❌** | Camera sensor / ISP bring-up and Windows AVStream integration not started. |
+| GNSS (GPS) | **NOT WORKING ❌** | Windows location / GNSS integration not started. |
+| NFC | **NOT WORKING ❌** | Windows NFC class driver integration not started. |
+| TPM / production boot security | **NOT WORKING ❌** | Runs with `testsigning on`; Windows TPM and production Secure Boot are not implemented. |
 
 Driver versions are tracked in each driver's `.inf` (`DriverVer`) and in the commit history (`git log --oneline`).
+
+<details>
+<summary><strong>Detailed development checkpoints</strong></summary>
+
+### UEFI / ACPI — 4/6 complete
+
+- [x] OEM boot-chain integration (`sda25` UEFI boot image, Project Mu / `dm1q`).
+- [x] Custom DXE (`S23DisplayFixDxe`, PCIe0 bring-up) and ACPI SSDT resources.
+- [x] Windows boot-manager handoff (`SanPolicy = 4`, `testsigning on`).
+- [x] WinPE and full Windows 11 Pro 24H2 (`10.0.26100`) boot.
+- [ ] Portable public UEFI build/reconstruction workflow.
+- [ ] Cold-start and recovery hardening.
+
+### CPU — 2/4 complete
+
+- [x] Native ARM64 execution on Snapdragon 8 Gen 2 for Galaxy (`SM8550-AC`).
+- [x] All 8 logical processors enumerated; EPSS CPUfreq & TSENS telemetry probed ([`drivers/s23perf/`](drivers/s23perf/)).
+- [ ] Production Windows DVFS / EPSS frequency-scaling driver.
+- [ ] Idle and thermal-policy qualification.
+
+### RAM — 2/4 complete
+
+- [x] Usable Windows memory map with reserved subsystem carve-outs.
+- [x] Native allocations used by the working desktop & GPU.
+- [ ] Full-capacity / stress qualification.
+- [ ] Memory retention across suspend.
+
+### UFS / installation — 3/5 complete
+
+- [x] 4 KiB-sector UFS filesystem integration (`sda43` `/dev/block/by-name/win`).
+- [x] Windows-compatible GPT partition layout (Android LUNs isolated via `SanPolicy = 4`, `sdb`/`sde` untouched).
+- [x] Installed Windows 11 boots directly from internal storage.
+- [ ] Reproducible public installation/servicing workflow.
+- [ ] Power-loss and storage-performance qualification.
+
+### Display — 4/5 complete
+
+- [x] Native `1080×2340 @ 120 Hz` presentation with high-resolution VSync ([`drivers/s23gpu/`](drivers/s23gpu/) + `S23DisplayFixDxe`).
+- [x] Usable Windows desktop scaling.
+- [x] Accelerated WDDM 2.0 presentation & dirty-rect / direct-flip scanout.
+- [x] Native Windows brightness slider & Night Light support.
+- [ ] Full display sleep/wake lifecycle (RTC/idle-off black-screen hardening).
+
+### GPU / WDDM acceleration — 8/9 complete
+
+- [x] Kernel resource/ownership foundations ([`drivers/s23gpu/`](drivers/s23gpu/)).
+- [x] GMU CM3 firmware and HFI acknowledgements (`gmu_gen70200.bin`).
+- [x] KGSL-SMMU 3-level 4 KiB page tables & GPU VA allocator (host-tested with ASan/UBSan).
+- [x] ZAP (`PAS 13`) auth & reset + SQE firmware boot (`a740_sqe.fw`).
+- [x] CP Ring0 IB1 command submission, interrupts & fence completion.
+- [x] WDDM 2.0 display + 3D KMD integration with live Task Manager GPU utilization & TSENS temperature.
+- [x] Mesa Freedreno D3D11 (`d3d10umd`) & **OpenGL 4.6** WGL ICD (ARM64 + x64).
+- [x] Hardware-accelerated application rendering & desktop presentation.
+- [ ] Broad game/app stability, Vulkan ICD & full production hardening.
+
+### Touchscreen — 3/4 complete
+
+- [x] STM `FTS2BA61Y` GENI SPI transport (`0x00A90000`, IRQ `gpio25`) & report decoding ([`drivers/s23touch/`](drivers/s23touch/)).
+- [x] Native Windows HID multitouch minidriver.
+- [x] Sustained everyday multitouch demonstrated.
+- [ ] General suspend/resume & palm-rejection qualification.
+
+### Physical buttons — 2/3 complete
+
+- [x] Read-only SPMI PMIC arbiter HID minidriver ([`drivers/s23keys/`](drivers/s23keys/)).
+- [x] Volume Up / Volume Down working natively in Windows.
+- [ ] Power-button display-off / wake behavior (needs investigation).
+
+### Wi-Fi 6E — 6/6 complete
+
+- [x] PCIe0 RC enumeration (`0x01C00000` -> `PCI\VEN_17CB&DEV_1103`) & UEFI bring-up ([`wifi_research/`](wifi_research/)).
+- [x] Qualcomm `qcwlan8280.sys` WHQL driver & `wlanfw20.mbn` + S23 `bdwlan.elf` loading.
+- [x] Sustained MHI/firmware responses & credits.
+- [x] Network scanning, authentication & WPA2/WPA3 association.
+- [x] DHCP, DNS and live internet traffic.
+- [x] Everyday Wi-Fi 6E networking verified on device.
+
+### Bluetooth 5.3 + BLE — 3/4 complete
+
+- [x] `BthMini` extensible-transport filter ([`drivers/s23bthx/`](drivers/s23bthx/)) on `UART14` (`3.2 Mbaud`, IBS).
+- [x] Classic Bluetooth + BLE scanning & device pairing.
+- [x] A2DP-sized ACL buffers & peripheral traffic.
+- [ ] Full suspend/resume & HFP/SCO qualification.
+
+### Audio — 3/4 complete
+
+- [x] ADSP split-ELF PIL (`PAS 36` + `PAS 1`), GLink/GPRv2/PRM & Gunyah-safe APPS-SMMU DMA ([`drivers/s23audio/`](drivers/s23audio/)).
+- [x] Native ARM64 PortCls WaveRT + Topology audio endpoint (`Speakers (Samsung Galaxy S23 Stereo)`).
+- [x] Dual Cirrus Logic `CS35L43` stereo speaker playback verified via WASAPI.
+- [ ] Microphone capture & Halo DSP speaker-protection calibration.
+
+### Battery reporting — 4/4 complete
+
+- [x] Maxim `MAX77705` fuel gauge (`@0x36`) acquisition ([`drivers/s23batt/`](drivers/s23batt/)).
+- [x] Installed Windows battery miniclass driver (`battc.sys`).
+- [x] Validated percentage, voltage, current rate & calibrated battery temperature.
+- [x] Sustained normal-Windows lifecycle.
+
+### Charging — 3/4 complete
+
+- [x] Maxim `MAX77705` charger (`@0x69`) write-unlock & watchdog handling ([`drivers/s23batt/`](drivers/s23batt/)).
+- [x] Sustained normal-Windows wired fast charging (3.0 A input / 2.5 A CC / 4.4 V float) & abnormal-off recovery.
+- [x] Positive net charging current verified under Windows load.
+- [ ] Dynamic USB-PD 3.0 / PPS (`PCA9481`) negotiation & wireless charging (`S2MIW04`).
+
+### USB-C / PC link — 3/6 complete
+
+- [x] USB peripheral enumeration & WinUSB remote shell / file transfer ([`s23link.py`](s23link.py)).
+- [x] Guarded remote-control & file-deploy workflow with WinUSB retry/backoff.
+- [x] Native USB-C architecture spec & host-tested MAX77705 OPCODE / PD 3.0 codec ([`usb_research/`](usb_research/)).
+- [ ] Race-free `SE8` PMIC bus arbiter (`s23pmic.sys`) shared with `s23batt.sys`.
+- [ ] Dynamic Dual-Role Host/OTG (`s23urs.sys`, external USB peripherals/hubs).
+- [ ] Native USB-PD 3.0 (`s23usbc.sys` `UcmCx`) & 4K60 DisplayPort Alt-Mode.
+
+### 5G cellular / eSIM — 2/6 complete
+
+- [x] Stock MPSS / `modem_dtb` / IPA v5.5 firmware ground-truth verified ([`modem_5g_research/FIRMWARE_GROUND_TRUTH.md`](modem_5g_research/FIRMWARE_GROUND_TRUTH.md)).
+- [x] Architecture blueprint, inert SSDTs & host-tested QMI/QMUX TLV codec ([`modem_5g_research/qmi_codec.py`](modem_5g_research/qmi_codec.py)).
+- [ ] MPSS split-ELF PAS boot (`PAS 0x26` + `PAS 4`) & QRTR service discovery (`s23mdmprobe`).
+- [ ] RAM-sandboxed `rmtfs` + physical SIM & eSIM (eUICC) QMI `UIM` control.
+- [ ] 5G NSA/SA / LTE network registration & IPA v5.5 / `NetAdapterCx` packet data.
+- [ ] Native Windows 11 Cellular & eSIM UI (`MBBCx` + `MBIMEx 3.0` + `lpasvc`).
+
+### Power management — 1/5 complete
+
+- [x] Working awake profile for daily development & testing.
+- [ ] System suspend/resume (Modern Standby / S0ix).
+- [ ] Display / power-button sleep-wake lifecycle.
+- [ ] Idle clock and RPMh rail policies.
+- [ ] Platform thermal / EPSS performance policies.
+
+### Haptics — 1/3 complete
+
+- [x] Live I2C probe verified (`QUPv3_I2C_HUB SE3 @0x40`, Device ID `0x0040A260`, [`drivers/s23sensprobe/`](drivers/s23sensprobe/)).
+- [ ] Firmware loading & waveform playback driver.
+- [ ] Windows haptic feedback integration.
+
+### Motion / light / proximity sensors — 0/3 complete
+
+- [ ] SSC / sensor bus transport & Windows sensor class integration.
+- [ ] Validated accelerometer / gyro / ALS / proximity readings.
+- [ ] Auto-rotation & adaptive brightness policy integration.
+
+### Cameras — 0/3 complete
+
+- [ ] Camera sensor / ISP initialization.
+- [ ] Windows camera / AVStream integration.
+- [ ] Validated photo & video capture.
+
+### GNSS (GPS) — 0/2 complete
+
+- [ ] Windows location / GNSS integration.
+- [ ] Validated positioning.
+
+### NFC — 0/2 complete
+
+- [ ] Windows NFC class driver integration.
+- [ ] Functional tag / transaction reads.
+
+### TPM / production boot security — 0/3 complete
+
+- [ ] Working Windows TPM integration.
+- [ ] Production Secure Boot configuration.
+- [ ] Qualification without `testsigning on`.
+
+</details>
 
 ---
 
