@@ -21,7 +21,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
 GPU = os.path.join(ROOT, "drivers", "s23gpu")
 
-TESTS = ["test_va_alloc.c", "test_msm_validate.c", "test_alloc_range.c"]
+TESTS = ["test_va_alloc.c", "test_msm_validate.c", "test_alloc_range.c", "test_disp_clip.c"]
 
 
 def read(path):
@@ -35,6 +35,21 @@ def between(text, start, end, what):
     if a < 0 or b < 0:
         raise SystemExit(f"extract: markers for {what} not found ({start!r} .. {end!r})")
     return text[a:b]
+
+
+def function(text, signature, what):
+    """Text of the function starting with `signature` up to its matching closing brace."""
+    a = text.find(signature)
+    if a < 0:
+        raise SystemExit(f"extract: {what} ({signature!r}) not found")
+    b = text.index("{", a)
+    depth = 0
+    for i in range(b, len(text)):
+        depth += text[i] == "{"
+        depth -= text[i] == "}"
+        if depth == 0:
+            return text[a:i + 1] + "\n"
+    raise SystemExit(f"extract: unbalanced braces in {what}")
 
 
 def extract(outdir):
@@ -53,6 +68,22 @@ def extract(outdir):
         f.write("/* generated from drivers/s23gpu/s23gpu.h + hw.c by tests/c/run_c_tests.py */\n")
         f.write("\n".join(defs) + "\n")
         f.write(node + "static VA_NODE *g_VaFreeHead = NULL;\n\n" + funcs)
+
+    # Blt / Fill / PagingFill (eng.c), CopyRowWithLut + DispPresentRects (disp.c) and the types they use
+    eng = read(os.path.join(GPU, "eng.c"))
+    disp = read(os.path.join(GPU, "disp.c"))
+    types = (between(hdr, "typedef struct _S23GPU_BO {", "typedef struct _S23GPU_ADAPTER {", "S23GPU_BO/ALLOCATION")
+             + between(hdr, "#define S23GPU_CMD_NOP", "/* log.c */", "S23GPU_CMD"))
+    hdr_line = "/* generated from drivers/s23gpu (s23gpu.h, eng.c, disp.c) by tests/c/run_c_tests.py */\n"
+    with open(os.path.join(outdir, "disp_clip_types.inc"), "w", encoding="utf-8") as f:
+        f.write(hdr_line + types + "\n")
+    with open(os.path.join(outdir, "disp_clip_funcs.inc"), "w", encoding="utf-8") as f:
+        f.write(hdr_line)
+        f.write(function(disp, "static VOID CopyRowWithLut(ULONG *Dst, const ULONG *Src, ULONG Pixels)", "CopyRowWithLut"))
+        f.write(function(disp, "VOID DispPresentRects(S23GPU_ALLOCATION *Dst, const UCHAR *DstPixels, const RECT *Rects, ULONG Count)", "DispPresentRects"))
+        for sig in ("static VOID Blt(const S23GPU_CMD *C)", "static VOID Fill(const S23GPU_CMD *C)",
+                    "static VOID PagingFill(const S23GPU_CMD *C)"):
+            f.write(function(eng, sig, sig))
 
     # TgCreateAllocation BO range check (regression guard for the 64-bit bo_offset + size fix)
     m = re.search(r"if \((al->Bo == NULL \|\|\s*[^{]*?)\)\s*\{\s*\n\s*if \(al->Bo != NULL\)", ddi)
