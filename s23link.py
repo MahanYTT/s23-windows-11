@@ -8,15 +8,81 @@
 import ctypes, os, socket, struct, sys, time, uuid, zlib
 from ctypes import wintypes as W
 
+USAGE = '''usage: s23link.py [--tcp PORT] <command> [args]
+  ping                      round-trip test
+  ver                       agent version
+  exec [-t SEC] <cmd...>    run `cmd /c <cmd>` on the phone (default timeout 60 s)
+  put <local> <remote>      upload a file
+  get <remote> <local>      download a file
+  reboot                    reboot the phone
+  wait                      wait up to 1 h for the phone, then ping
+  serve [--net]             USB relay daemon on 127.0.0.1:%d
+environment:
+  RM9_WINUSB=1              force the WinUSB transport
+  RM9_OPEN_TIMEOUT=SEC      how long to retry a busy WinUSB handle (default 5)'''
+
 MAGIC = 0x5239
 MAXDATA = 16000
 DAEMON_PORT = 47100
 DEV_GUID = '{A523F001-729B-4A0E-9C14-B7117D33A817}'
 VIDPID = ('vid_1209&pid_0004', 'vid_1209&pid_0003', 'vid_1209&pid_0002', 'vid_1209&pid_0001')
 
+# Win32 errors that CreateFile / WinUsb_Initialize return while the previous owner of the exclusive
+# WinUSB handle is still being torn down (Windows needs ~2 s after a quick s23link.py re-run).
+ERROR_FILE_NOT_FOUND = 2
+ERROR_ACCESS_DENIED = 5
+ERROR_GEN_FAILURE = 31
+ERROR_SHARING_VIOLATION = 32
+ERROR_DEVICE_NOT_CONNECTED = 1167
+TRANSIENT_OPEN_ERRORS = frozenset((ERROR_FILE_NOT_FOUND, ERROR_ACCESS_DENIED, ERROR_GEN_FAILURE,
+                                   ERROR_SHARING_VIOLATION, ERROR_DEVICE_NOT_CONNECTED))
+OPEN_TIMEOUT_S = 5.0
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
 
 class RemoteError(Exception):
     pass
+
+
+class TransientOpenError(RemoteError):
+    """opening the device failed with an error that usually clears up by itself (see TRANSIENT_OPEN_ERRORS)"""
+    def __init__(self, msg, code):
+        super().__init__(msg)
+        self.code = code
+
+
+def open_timeout():
+    """RM9_OPEN_TIMEOUT (seconds) or OPEN_TIMEOUT_S; invalid or negative values fall back to the default"""
+    try:
+        t = float(os.environ.get('RM9_OPEN_TIMEOUT', OPEN_TIMEOUT_S))
+    except ValueError:
+        return OPEN_TIMEOUT_S
+    return t if t >= 0 else OPEN_TIMEOUT_S
+
+
+def retry_transient(fn, timeout_s, sleep=time.sleep, clock=time.monotonic, first_delay=0.1, max_delay=1.0):
+    """Call fn() until it returns, retrying TransientOpenError with exponential backoff (first_delay, doubling,
+    capped at max_delay) for at most timeout_s seconds.  Any other exception propagates immediately.
+    On timeout the last error is re-raised as a plain RemoteError, so this never loops forever."""
+    deadline = clock() + timeout_s
+    delay = first_delay
+    attempt = 1
+    while True:
+        try:
+            return fn()
+        except TransientOpenError as e:
+            left = deadline - clock()
+            if left <= 0:
+                raise RemoteError('%s (gave up after %d attempt%s in %.1f s)'
+                                  % (e, attempt, '' if attempt == 1 else 's', timeout_s)) from e
+            sleep(min(delay, left))
+            delay = min(delay * 2, max_delay)
+            attempt += 1
+
+
+def _timeout_ms(timeout_s):
+    """seconds -> WinUSB/Win32 milliseconds; never 0, because PIPE_TRANSFER_TIMEOUT=0 means 'wait forever'"""
+    return max(1, int(timeout_s * 1000))
 
 
 # ---------------------------------------------------------------- WinUSB transport
@@ -38,7 +104,7 @@ class SP_DEVICE_INTERFACE_DATA(ctypes.Structure):
 
 
 class WinUsbTransport:
-    def __init__(self, guid=DEV_GUID):
+    def __init__(self, guid=DEV_GUID, open_timeout_s=None):
         self.setupapi = ctypes.WinDLL('setupapi', use_last_error=True)
         self.k32 = ctypes.WinDLL('kernel32', use_last_error=True)
         self.wu = ctypes.WinDLL('winusb', use_last_error=True)
@@ -62,18 +128,8 @@ class WinUsbTransport:
         self.hdl = None
         self.iface = ctypes.c_void_p()
         self.rbuf = ctypes.create_string_buffer(65536)
-        self.path = self._find()
-        if not self.path:
-            raise RemoteError('RM9 USB device not found (WinUSB interface for %s)' % '/'.join(VIDPID))
-        hdl = k.CreateFileW(self.path, 0xC0000000, 3, None, 3, 0x40000080, None)   # RW, share RW, OPEN_EXISTING, NORMAL
-        if hdl in (None, ctypes.c_void_p(-1).value):
-            raise RemoteError('CreateFile failed %d (%s)' % (ctypes.get_last_error(), self.path))
-        self.hdl = hdl
-        if not w.WinUsb_Initialize(hdl, ctypes.byref(self.iface)):
-            err = ctypes.get_last_error()
-            k.CloseHandle(hdl)
-            self.hdl = None
-            raise RemoteError('WinUsb_Initialize failed %d' % err)
+        self.path = None
+        retry_transient(self._open, open_timeout() if open_timeout_s is None else open_timeout_s)
         t = W.ULONG(5000)
         one = ctypes.c_ubyte(1)
         for ep in (0x01, 0x81):
@@ -83,9 +139,36 @@ class WinUsbTransport:
             w.WinUsb_ResetPipe(self.iface, ep)
         w.WinUsb_FlushPipe(self.iface, 0x81)
 
+    def _open(self):
+        """one attempt: find the interface, open it and initialize WinUSB.  Raises TransientOpenError for
+        errors worth retrying (handle still held by a previous process, device re-enumerating)."""
+        k, w = self.k32, self.wu
+        self.path = self._find()
+        if not self.path:
+            raise RemoteError('RM9 USB device not found (WinUSB interface for %s)' % '/'.join(VIDPID))
+        hdl = k.CreateFileW(self.path, 0xC0000000, 3, None, 3, 0x40000080, None)   # RW, share RW, OPEN_EXISTING, NORMAL|OVERLAPPED
+        if hdl in (None, INVALID_HANDLE_VALUE):
+            err = ctypes.get_last_error()
+            msg = 'CreateFile failed %d (%s)' % (err, self.path)
+            if err in TRANSIENT_OPEN_ERRORS:
+                raise TransientOpenError(msg, err)
+            raise RemoteError(msg)
+        iface = ctypes.c_void_p()
+        if not w.WinUsb_Initialize(hdl, ctypes.byref(iface)):
+            err = ctypes.get_last_error()
+            k.CloseHandle(hdl)
+            msg = 'WinUsb_Initialize failed %d' % err
+            if err in TRANSIENT_OPEN_ERRORS:
+                raise TransientOpenError(msg, err)
+            raise RemoteError(msg)
+        self.hdl = hdl
+        self.iface = iface
+
     def _find(self):
         s = self.setupapi
         hdev = s.SetupDiGetClassDevsW(ctypes.byref(self.guid), None, None, 0x12)   # PRESENT | DEVICEINTERFACE
+        if hdev in (None, INVALID_HANDLE_VALUE):
+            return None
         found = []
         i = 0
         while True:
@@ -115,7 +198,7 @@ class WinUsbTransport:
 
     def recv(self, timeout_s):
         """one transfer = one frame; returns bytes or None on timeout"""
-        t = W.ULONG(int(timeout_s * 1000))
+        t = W.ULONG(_timeout_ms(timeout_s))
         self.wu.WinUsb_SetPipePolicy(self.iface, 0x81, 3, 4, ctypes.byref(t))
         got = W.ULONG(0)
         if not self.wu.WinUsb_ReadPipe(self.iface, 0x81, self.rbuf, 65536, ctypes.byref(got), None):
@@ -224,7 +307,7 @@ class UsbdkTransport:
             raise RemoteError('bulk OUT timeout')
 
     def recv(self, timeout_s):
-        n = self._xfer(False, 0x81, self.rbuf, 65536, int(timeout_s * 1000))
+        n = self._xfer(False, 0x81, self.rbuf, 65536, _timeout_ms(timeout_s))
         if n is None:
             return None
         return self.rbuf.raw[:n]
@@ -344,25 +427,35 @@ class Link:
             if typ == 0x82:
                 out += pl
             elif typ == 0x83:
-                return struct.unpack('<i', pl)[0], out
+                if len(pl) < 4:
+                    raise RemoteError('exec: truncated exit-code frame (%d bytes)' % len(pl))
+                return struct.unpack_from('<i', pl, 0)[0], out
             elif typ == 0x8F:
                 raise RemoteError(pl.decode('utf-8', 'replace'))
 
     def put(self, local, remote, progress=None):
         rp = remote.encode()
+        room = MAXDATA - 2 - len(rp)     # payload = u16 path length + path + data chunk
+        if room <= 0:
+            # f.read(<=0) would read nothing or, for a negative size, the whole file into one oversized frame
+            raise RemoteError('put: remote path too long (%d bytes, max %d)' % (len(rp), MAXDATA - 3))
         size = os.path.getsize(local)
         done = 0
         with open(local, 'rb') as f:
             first = True
             while True:
-                chunk = f.read(MAXDATA - 2 - len(rp))
+                chunk = f.read(room)
                 if not chunk and not first:
                     break
                 rid = self._send(3, struct.pack('<H', len(rp)) + rp + chunk, 1 if first else 0)
                 first = False
                 typ, pl = self._recv(rid, 30)
+                if typ == 0x8F:
+                    raise RemoteError('put failed: %s' % pl.decode('utf-8', 'replace'))
+                if typ != 0x80 or len(pl) < 4:
+                    raise RemoteError('put failed: unexpected reply type 0x%02x (%d bytes)' % (typ, len(pl)))
                 st = struct.unpack_from('<i', pl, 0)[0]
-                if typ != 0x80 or st != 0:
+                if st != 0:
                     raise RemoteError('put failed: %s' % pl[4:].decode('utf-8', 'replace'))
                 done += len(chunk)
                 if progress:
@@ -381,7 +474,9 @@ class Link:
                     f.write(pl)
                     total += len(pl)
                 elif typ == 0x85:
-                    n = struct.unpack('<Q', pl)[0]
+                    if len(pl) < 8:
+                        raise RemoteError('get: truncated end frame (%d bytes)' % len(pl))
+                    n = struct.unpack_from('<Q', pl, 0)[0]
                     if n != total:
                         raise RemoteError('size mismatch %d != %d' % (n, total))
                     return total
@@ -593,45 +688,66 @@ def main(argv):
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     except Exception:
         pass
+    def usage(msg=None):
+        if msg:
+            print('error: ' + msg, file=sys.stderr)
+        print(USAGE % DAEMON_PORT, file=sys.stderr if msg else sys.stdout)
+        return 2
+
     tcp = None
-    if len(argv) > 1 and argv[0] == '--tcp':
+    if argv and argv[0] == '--tcp':
+        if len(argv) < 2 or not argv[1].isdigit():
+            return usage('--tcp needs a port number')
         tcp = int(argv[1])
         argv = argv[2:]
     if not argv:
-        print(__doc__ or 'usage: rm9link.py ping|ver|exec|put|get|reboot|wait')
-        return 2
+        return usage()
     cmd, rest = argv[0], argv[1:]
+    if cmd in ('-h', '--help', 'help'):
+        return usage()
+    if cmd not in ('serve', 'wait', 'ping', 'ver', 'exec', 'put', 'get', 'reboot'):
+        return usage('unknown command %s' % cmd)
+    to = 60
+    if cmd == 'exec':
+        if rest and rest[0] == '-t':
+            if len(rest) < 2 or not rest[1].isdigit():
+                return usage('exec -t needs a timeout in seconds')
+            to, rest = int(rest[1]), rest[2:]
+        if not rest:
+            return usage('exec needs a command')
+    if cmd in ('put', 'get') and len(rest) != 2:
+        return usage('%s needs exactly two paths' % cmd)
+    if cmd == 'put' and not os.path.isfile(rest[0]):
+        return usage('local file not found: %s' % rest[0])
     if cmd == 'serve':
         serve(net='--net' in rest)
         return 0
     wait = 0
     if cmd == 'wait':
         wait, cmd = 3600, 'ping'
-    with Link(tcp=tcp, wait=wait) as L:
-        if cmd == 'ping':
-            print('pong %.1f ms' % (L.ping() * 1000))
-        elif cmd == 'ver':
-            print(L.ver())
-        elif cmd == 'exec':
-            to = 60
-            if rest and rest[0] == '-t':
-                to, rest = int(rest[1]), rest[2:]
-            code, out = L.exec(' '.join(rest), to)
-            sys.stdout.write(out.decode('utf-8', 'replace'))
-            return code
-        elif cmd == 'put':
-            t0 = time.time()
-            n = L.put(rest[0], rest[1])
-            print('%d bytes in %.2f s' % (n, time.time() - t0))
-        elif cmd == 'get':
-            t0 = time.time()
-            n = L.get(rest[0], rest[1])
-            print('%d bytes in %.2f s' % (n, time.time() - t0))
-        elif cmd == 'reboot':
-            print(L.reboot())
-        else:
-            print('unknown command', cmd)
-            return 2
+    try:
+        with Link(tcp=tcp, wait=wait) as L:
+            if cmd == 'ping':
+                print('pong %.1f ms' % (L.ping() * 1000))
+            elif cmd == 'ver':
+                print(L.ver())
+            elif cmd == 'exec':
+                code, out = L.exec(' '.join(rest), to)
+                sys.stdout.write(out.decode('utf-8', 'replace'))
+                return code
+            elif cmd == 'put':
+                t0 = time.time()
+                n = L.put(rest[0], rest[1])
+                print('%d bytes in %.2f s' % (n, time.time() - t0))
+            elif cmd == 'get':
+                t0 = time.time()
+                n = L.get(rest[0], rest[1])
+                print('%d bytes in %.2f s' % (n, time.time() - t0))
+            elif cmd == 'reboot':
+                print(L.reboot())
+    except (RemoteError, OSError) as e:
+        print('s23link: %s' % e, file=sys.stderr)
+        return 1
     return 0
 
 
