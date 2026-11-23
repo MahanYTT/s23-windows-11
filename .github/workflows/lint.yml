@@ -1,0 +1,69 @@
+name: lint
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  hygiene:
+    name: Repo hygiene (no binaries / firmware)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python scripts/ci/check_repo_hygiene.py
+
+  python:
+    name: Python syntax + unit tests
+    # s23link.py uses ctypes.wintypes / WinDLL, so the tests run on Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Byte-compile every tracked .py file
+        shell: bash
+        run: git ls-files -z '*.py' | xargs -0 python -m py_compile
+      - name: Unit tests (no hardware)
+        run: python -m unittest discover -s tests -v
+
+  shellcheck:
+    name: Shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck (errors only)
+        run: |
+          mapfile -d '' files < <(git ls-files -z '*.sh')
+          if [ "${#files[@]}" -gt 0 ]; then shellcheck --severity=error "${files[@]}"; fi
+
+  drivers:
+    name: ARM64 drivers build + stack check (clang, no hardware)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install LLVM 18 and aarch64 binutils
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-18 lld-18 llvm-18 binutils-aarch64-linux-gnu
+          echo /usr/lib/llvm-18/bin >> "$GITHUB_PATH"
+      - name: Build s23batt, s23bthx, s23keys, s23touch (same flags as local WSL builds)
+        run: |
+          for d in s23batt s23bthx s23keys s23touch; do
+            echo "::group::$d"
+            python3 "drivers/$d/build_wsl.py"
+            echo "::endgroup::"
+          done
+      - name: __chkstk / stack frame check
+        run: |
+          python3 scripts/ci/check_driver_stack.py \
+            drivers/s23batt/out/s23batt.sys drivers/s23bthx/out/s23bthx.sys \
+            drivers/s23keys/out/s23keys.sys drivers/s23touch/out/s23touch.sys
