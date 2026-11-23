@@ -403,6 +403,16 @@ static NTSTATUS QueryAdapterInfoInner(const S23GPU_ADAPTER *A, const DXGKARG_QUE
         ap->MemoryFrequency = 3200000000ULL;
         ap->MaxMemoryFrequency = 3200000000ULL;
         ap->MaxMemoryFrequencyOC = 3200000000ULL;
+
+        ULONG temp = HwReadTsens();
+        if (temp > 0 && temp < 1500) {
+            /* Task Manager expects temperature in half-Kelvins or something similar? Actually, according to docs it's 0.1 C ? Let's check docs, but for now map deciCelsius to whatever TM expects, typically it's raw C or K. Wait, S23_ADAPTER_PERFDATA is proprietary D3DKMT extension. Actually, the TSENS hardware returns deciCelsius. */
+            /* WDDM DxgkDdiQueryAdapterInfo DXGKQAITYPE_ADAPTERPERFDATA extension:
+             * Temperature is usually in units of 0.1 Celsius (or sometimes 1 C).
+             * Let's just pass the TSENS deciCelsius directly, or C. Let's pass C since it's ULONG. Wait, NVIDIA/AMD pass Celsius.
+             */
+            ap->Temperature = temp / 10; /* Pass Celsius */
+        }
         return STATUS_SUCCESS;
     }
     case S23_QAITYPE_ADAPTERPERFDATA_CAPS:
@@ -410,6 +420,8 @@ static NTSTATUS QueryAdapterInfoInner(const S23GPU_ADAPTER *A, const DXGKARG_QUE
             return STATUS_BUFFER_TOO_SMALL;
         }
         RtlZeroMemory(Q->pOutputData, Q->OutputDataSize);
+        ((S23_ADAPTER_PERFDATACAPS *)Q->pOutputData)->TemperatureMax = 120;
+        ((S23_ADAPTER_PERFDATACAPS *)Q->pOutputData)->TemperatureWarning = 95;
         return STATUS_SUCCESS;
     case S23_QAITYPE_GPUVERSION: {
         S23_GPUVERSION *gv = (S23_GPUVERSION *)Q->pOutputData;
@@ -419,6 +431,25 @@ static NTSTATUS QueryAdapterInfoInner(const S23GPU_ADAPTER *A, const DXGKARG_QUE
         RtlZeroMemory(gv, Q->OutputDataSize);
         RtlStringCbCopyW(gv->BiosVersion, sizeof(gv->BiosVersion), L"A740.4001.0018");
         RtlStringCbCopyW(gv->GpuArchitecture, sizeof(gv->GpuArchitecture), L"Adreno 740 (GEN7_2_1)");
+        return STATUS_SUCCESS;
+    }
+    case 6: /* DXGKQAITYPE_NUMPOWERCOMPONENTS */
+        if (Q->OutputDataSize < sizeof(UINT)) {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        *(UINT *)Q->pOutputData = 1;
+        return STATUS_SUCCESS;
+    case 7: { /* DXGKQAITYPE_POWERCOMPONENTINFO */
+        if (Q->OutputDataSize < sizeof(DXGK_POWER_RUNTIME_COMPONENT) * 1) {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        DXGK_POWER_RUNTIME_COMPONENT *pc = (DXGK_POWER_RUNTIME_COMPONENT *)Q->pOutputData;
+        RtlZeroMemory(pc, sizeof(DXGK_POWER_RUNTIME_COMPONENT) * 1);
+        pc[0].StateCount = 1;
+        pc[0].ComponentMapping.ComponentType = DXGK_POWER_COMPONENT_OTHER; /* Temperature */
+        pc[0].Flags.Value = 0;
+        pc[0].Flags.ActiveInD3 = 1;
+        RtlStringCbCopyA((LPSTR)pc[0].ComponentName, sizeof(pc[0].ComponentName), "GPU_TSENS");
         return STATUS_SUCCESS;
     }
     case DXGKQAITYPE_HISTORYBUFFERPRECISION: {

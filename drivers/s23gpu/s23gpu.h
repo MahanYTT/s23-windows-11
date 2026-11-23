@@ -135,6 +135,7 @@ VOID      HwRefundGpuBusyUs(ULONG Us);
 BOOLEAN   HwWaitFenceEx(ULONG Fence, ULONG TimeoutMs, BOOLEAN WedgeOnTimeout);
 BOOLEAN   HwWaitFence(ULONG Fence, ULONG TimeoutMs);
 NTSTATUS  HwSubmit(const ULONGLONG *IbIova, const ULONG *IbDwords, ULONG Count, PULONG Fence);
+ULONG     HwReadTsens(VOID);
 
 ULONGLONG VaAlloc(SIZE_T Size);
 BOOLEAN   VaReserve(ULONGLONG Va, SIZE_T Size);

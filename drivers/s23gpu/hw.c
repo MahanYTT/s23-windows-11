@@ -32,6 +32,8 @@
 #define SZ_CMD_DB         0x00020000UL
 #define PA_ZAP_REGION     0x9B09A000ULL
 #define SZ_ZAP_REGION     0x00002000UL
+#define PA_TSENS2         0x0C273000ULL
+#define SZ_TSENS2         0x00001000UL
 
 /* GCC / GPUCC / GMU / RSCC / PDC / KGSL register offsets */
 #define GCC_GPLL0_MODE             0x00000U
@@ -160,6 +162,7 @@ static volatile UCHAR * g_Pdc = NULL;
 static volatile UCHAR * g_Smmu = NULL;
 static volatile UCHAR * g_Gmu = NULL;
 static volatile UCHAR * g_Kgsl = NULL;
+static volatile UCHAR * g_Tsens2 = NULL;
 
 /* System GPU pools (<64 GB MmNonCached) */
 static PVOID             g_GmuPoolVa = NULL;
@@ -1009,7 +1012,8 @@ static BOOLEAN BootPowerAndGmuLocked(PUCHAR fwBuf)
     g_Rscc   = MapIo(PA_RSCC, SZ_RSCC);
     g_Pdc    = MapIo(PA_GMU_PDC, SZ_GMU_PDC);
     g_Smmu   = MapIo(PA_KGSL_SMMU, SZ_KGSL_SMMU);
-    if (!g_Gmu || !g_CxMisc || !g_Rscc || !g_Pdc || !g_Smmu) return FALSE;
+    g_Tsens2 = MapIo(PA_TSENS2, SZ_TSENS2);
+    if (!g_Gmu || !g_CxMisc || !g_Rscc || !g_Pdc || !g_Smmu || !g_Tsens2) return FALSE;
     if (R32(g_Gmu, GMU_CM3_SYSRESET) != 1u || (R32(g_Smmu, CB2_OFF) & 1u) != 0) {
         LogPrint("hw: GMU or CB2 not clean at start (rst=%x cb2=%x)\n",
                  R32(g_Gmu, GMU_CM3_SYSRESET), R32(g_Smmu, CB2_OFF));
@@ -1577,6 +1581,7 @@ static VOID HwStopLocked(VOID)
     UnmapIo(&g_Rscc, SZ_RSCC);     UnmapIo(&g_CxMisc, SZ_CX_MISC);
     UnmapIo(&g_Gpucc, SZ_GPUCC);   UnmapIo(&g_Gcc, SZ_GCC);
     UnmapIo(&g_Rsc, SZ_APPS_RSC_DRV2); UnmapIo(&g_CmdDb, SZ_CMD_DB);
+    UnmapIo(&g_Tsens2, SZ_TSENS2);
     g_HwWedged = FALSE;
 }
 
@@ -2014,4 +2019,24 @@ VOID TgFreePages(PMDL Mdl, PVOID KernelVa, SIZE_T Size, ULONGLONG Iova)
     if (KernelVa != NULL) MmUnmapLockedPages(KernelVa, Mdl);
     MmFreePagesFromMdl(Mdl);
     ExFreePool(Mdl);
+}
+
+ULONG HwReadTsens(VOID)
+{
+    /* Poll TSENS2 sensor 1 (gpuss-0) or sensor 5 (gpuss-4) */
+    if (g_Tsens2 == NULL) return 0;
+    ULONG ctrl = R32(g_Tsens2, 0x0C224004u - 0x0C224000u); /* SROT CTRL */
+    if ((ctrl & 1u) == 0) return 0;
+
+    for (ULONG i = 0; i < 50; i++) {
+        /* TSENS_TM_SN_STATUS for sensor 5 (gpuss-4) */
+        ULONG status = R32(g_Tsens2, 0x1000u + 0x0A0u + 5u * 4u);
+        if (status & (1u << 21)) {
+            LONG raw = (LONG)(status & 0xFFFu);
+            if (raw & 0x800) raw |= ~0xFFF;
+            return (ULONG)raw; /* return in deciCelsius */
+        }
+        StallUs(100u);
+    }
+    return 0;
 }
