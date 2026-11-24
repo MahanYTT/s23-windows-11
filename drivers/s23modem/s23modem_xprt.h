@@ -14,6 +14,10 @@
 #define IOCTL_S23MODEM_QRTR_RX      0x0022200CU
 #define IOCTL_S23MODEM_SMEM_READ    0x00222010U
 #define IOCTL_S23MODEM_READ_TLMM    0x00222014U
+#define IOCTL_S23MODEM_FLUSH_RX     0x00222018U
+#define IOCTL_S23MODEM_IPA_INIT     0x0022201CU
+#define IOCTL_S23MODEM_IPA_TX_PKT   0x00222020U
+#define IOCTL_S23MODEM_IPA_RX_PKT   0x00222024U
 
 #define S23MODEM_MAX_SERVERS        64U
 #define S23MODEM_MAX_QRTR_PAYLOAD   4096U
@@ -56,4 +60,46 @@ typedef struct _S23MODEM_QRTR_PKT {
     unsigned int PayloadLen;
     unsigned char Payload[S23MODEM_MAX_QRTR_PAYLOAD];
 } S23MODEM_QRTR_PKT;
+
+typedef struct _S23MODEM_IPA_STATUS {
+    unsigned int       IpaClkVoted;
+    unsigned int       SmmuMapped;
+    unsigned int       SmmuCbIdx;
+    unsigned int       SmmuGfsr;
+    unsigned int       IpaFwLoaded;
+    unsigned int       IpaVersion;
+    unsigned int       IpaCompHwVer;
+    unsigned int       IpaCompCfg;
+    unsigned int       IpaRoute;
+    unsigned int       IpaSharedMemRaw;
+    unsigned int       SramSizeBytes;
+    unsigned int       SramRestrictedBytes;
+    unsigned int       GsiCfg;
+    unsigned int       GsiStatus;
+    unsigned int       GsiSwVer;
+    unsigned int       GsiParam2;
+    unsigned int       GsiParam4;
+    unsigned int       Smem497Pa;
+    unsigned int       CmdChStarted;
+    unsigned int       LanRxChStarted;
+    unsigned int       WanTxChStarted;
+    unsigned int       WanRxChStarted;
+    unsigned int       QmiIpaIndRegRx;
+    unsigned int       QmiIpaInitModemResp;
+    unsigned int       QmiIpaMasterCompleteSent;
+    unsigned int       QmiIpaModemCompleteRx;
+    unsigned int       QmiIpaFilterRuleRx;
+    unsigned int       TxPackets;
+    unsigned int       RxPackets;
+    unsigned int       WanTxRpLsb;
+    unsigned int       WanRxRpLsb;
+    unsigned int       LanRxRpLsb;
+    unsigned int       GsiErrorLog;
+} S23MODEM_IPA_STATUS;
+
+typedef struct _S23MODEM_IPA_PKT {
+    unsigned int       Length;
+    unsigned int       TimeoutMs;
+    unsigned char      Data[2048];
+} S23MODEM_IPA_PKT;
 #pragma pack(pop)

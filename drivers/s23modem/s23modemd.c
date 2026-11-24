@@ -66,7 +66,7 @@ static int QmiTransaction(HANDLE hDev, const S23MODEM_STATUS_INFO *st,
 
     uint16_t txid = g_NextTxId++;
     if (g_NextTxId == 0U) g_NextTxId = 1U;
-    uint32_t myPort = CLIENT_PORT_BASE + (txid & 0x07FFU);
+    uint32_t myPort = CLIENT_PORT_BASE + (svc & 0xFFU);
 
     S23MODEM_QRTR_PKT tx;
     ZeroMemory(&tx, sizeof(tx));
@@ -90,7 +90,8 @@ static int QmiTransaction(HANDLE hDev, const S23MODEM_STATUS_INFO *st,
         return 0;
     }
 
-    for (int attempt = 0; attempt < 4; attempt++) {
+    ULONGLONG tStart = GetTickCount64();
+    for (int attempt = 0; attempt < 64 && (GetTickCount64() - tStart) < 2500ULL; attempt++) {
         S23MODEM_QRTR_PKT rx;
         ZeroMemory(&rx, sizeof(rx));
         rx.TimeoutMs = 500U;
@@ -103,8 +104,6 @@ static int QmiTransaction(HANDLE hDev, const S23MODEM_STATUS_INFO *st,
         uint16_t rMsgId = Le16(rx.Payload + 3U);
         uint16_t rLen   = Le16(rx.Payload + 5U);
         if (7U + (uint32_t)rLen > rx.PayloadLen) rLen = (uint16_t)(rx.PayloadLen - 7U);
-        printf("    [RX] srcPort=0x%04x dstPort=0x%04x len=%u flags=0x%02x txid=0x%04x msgId=0x%04x (want txid=0x%04x msg=0x%04x)\n",
-               rx.SrcPort, rx.DstPort, rx.PayloadLen, rFlags, rTxId, rMsgId, txid, msgId);
 
         /* Skip async indications (flags == 0x04) while waiting for response (flags == 0x02) */
         if (rFlags == 0x02U && rTxId == txid && rMsgId == msgId) {
@@ -192,17 +191,19 @@ static void DumpRawTlvs(const char *label, const uint8_t *tlvs, uint16_t tlvLen)
 }
 
 static void QueryTlmmPins(HANDLE hDev) {
-    printf("=== [SoC TLMM Pin Audit] SIM & eUICC GPIO Pin Status ===\n");
+    printf("=== [SoC TLMM Pin Audit] SN220 NFC/eUICC & UIM GPIO Pin Status ===\n");
     static const struct { unsigned int gpio; const char *name; } testPins[] = {
-        { 26U,  "GPIO26  uim1_present (eSIM/SIM2 detect)" },
-        { 27U,  "GPIO27  uim0_present (SIM1 tray detect)" },
-        { 66U,  "GPIO66  nfc/eSE ven-gpio" },
-        { 130U, "GPIO130 uim0_data" },
-        { 131U, "GPIO131 uim0_clk" },
-        { 132U, "GPIO132 uim0_reset" },
-        { 134U, "GPIO134 uim1_data" },
-        { 135U, "GPIO135 uim1_clk" },
-        { 136U, "GPIO136 uim1_reset" }
+        { 15U,  "GPIO15  pn547,clk_req-gpio" },
+        { 16U,  "GPIO16  nfc_i2c_sda (i2chub0_se0)" },
+        { 17U,  "GPIO17  nfc_i2c_scl (i2chub0_se0)" },
+        { 63U,  "GPIO63  pn547,irq-gpio" },
+        { 66U,  "GPIO66  pn547,ven-gpio" },
+        { 130U, "GPIO130 uim0_data (MPSS)" },
+        { 131U, "GPIO131 uim0_clk  (MPSS)" },
+        { 132U, "GPIO132 uim0_reset (MPSS)" },
+        { 134U, "GPIO134 uim1_data (MPSS)" },
+        { 135U, "GPIO135 uim1_clk  (MPSS)" },
+        { 136U, "GPIO136 uim1_reset (MPSS)" }
     };
     for (size_t i = 0; i < sizeof(testPins) / sizeof(testPins[0]); i++) {
         S23MODEM_TLMM_PIN pin;
@@ -389,18 +390,31 @@ static int PdcLoadConfigFromFile(HANDLE hDev, const S23MODEM_STATUS_INFO *st,
     return 1;
 }
 
+static int UimPowerDownSlot(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t slot) {
+    printf("=== [QMI UIM 0x0B] UIM_POWER_DOWN (0x0030 slot=%u) ===\n", slot);
+    uint8_t req[4] = { 0x01U, 1U, 0U, slot };
+    uint8_t tlvs[256];
+    uint16_t tlvLen = 0, qRes = 0, qErr = 0;
+    if (QmiTransaction(hDev, st, QMI_SVC_UIM, 0x0030U, req, sizeof(req), tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+        printf("  UIM_POWER_DOWN(slot=%u) -> res=%u err=0x%x\n", slot, qRes, qErr);
+        return (qRes == 0U);
+    }
+    printf("  UIM_POWER_DOWN(slot=%u) timed out\n", slot);
+    return 0;
+}
+
 static int UimPowerUpSlot(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t slot) {
-    printf("=== [QMI UIM 0x0B] UIM_POWER_UP (slot=%u) ===\n", slot);
+    printf("=== [QMI UIM 0x0B] UIM_POWER_UP (0x0031 slot=%u) ===\n", slot);
     uint8_t req[8];
     uint32_t rpos = 0U;
     /* TLV 0x01: u8 slot */
     req[rpos++] = 0x01U; req[rpos++] = 1U; req[rpos++] = 0U; req[rpos++] = slot;
-    /* TLV 0x10: u8 power_up_mode (0 = default) */
-    req[rpos++] = 0x10U; req[rpos++] = 1U; req[rpos++] = 0U; req[rpos++] = 0U;
+    /* TLV 0x10: u8 ignore_hotswap_switch = 1 */
+    req[rpos++] = 0x10U; req[rpos++] = 1U; req[rpos++] = 0U; req[rpos++] = 1U;
 
     uint8_t tlvs[256];
     uint16_t tlvLen = 0, qRes = 0, qErr = 0;
-    if (QmiTransaction(hDev, st, QMI_SVC_UIM, 0x0025U, req, (uint16_t)rpos, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+    if (QmiTransaction(hDev, st, QMI_SVC_UIM, 0x0031U, req, (uint16_t)rpos, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
         printf("  UIM_POWER_UP(slot=%u) -> res=%u err=0x%x\n", slot, qRes, qErr);
         DumpRawTlvs("UIM_POWER_UP", tlvs, tlvLen);
         return (qRes == 0U);
@@ -409,8 +423,29 @@ static int UimPowerUpSlot(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t s
     return 0;
 }
 
+static int UimGetAtr(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t slot) {
+    uint8_t req[4] = { 0x01U, 1U, 0U, slot };
+    uint8_t tlvs[256];
+    uint16_t tlvLen = 0, qRes = 0, qErr = 0;
+    if (QmiTransaction(hDev, st, QMI_SVC_UIM, 0x0041U, req, sizeof(req), tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+        uint16_t ln10 = 0;
+        const uint8_t *v10 = FindTlv(tlvs, tlvLen, 0x10U, &ln10);
+        if (qRes == 0U && v10 && ln10 >= 1U) {
+            uint8_t atrLen = v10[0];
+            if (1U + atrLen <= ln10 && atrLen > 0U) {
+                char hex[96] = {0};
+                FormatHex(v10 + 1U, atrLen, hex, sizeof(hex));
+                printf("  [UIM_GET_ATR slot=%u] ATR (%u bytes) = %s\n", slot, atrLen, hex);
+                return 1;
+            }
+        }
+        printf("  [UIM_GET_ATR slot=%u] res=%u err=0x%x tlvLen=%u\n", slot, qRes, qErr, tlvLen);
+    }
+    return 0;
+}
+
 static void UimGetConfiguration(HANDLE hDev, const S23MODEM_STATUS_INFO *st) {
-    printf("=== [QMI UIM 0x0B] UIM_GET_CONFIGURATION (0x002E) ===\n");
+    printf("=== [QMI UIM 0x0B] UIM_GET_CONFIGURATION (0x003A) ===\n");
     uint8_t req[7];
     uint32_t rpos = 0U;
     /* TLV 0x10: u32 config_mask (0x1F = all) */
@@ -420,7 +455,7 @@ static void UimGetConfiguration(HANDLE hDev, const S23MODEM_STATUS_INFO *st) {
 
     uint8_t tlvs[1024];
     uint16_t tlvLen = 0, qRes = 0, qErr = 0;
-    if (QmiTransaction(hDev, st, QMI_SVC_UIM, 0x002EU, req, (uint16_t)rpos, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+    if (QmiTransaction(hDev, st, QMI_SVC_UIM, 0x003AU, req, (uint16_t)rpos, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
         printf("  UIM_GET_CONFIGURATION -> res=%u err=0x%x tlvLen=%u\n", qRes, qErr, tlvLen);
         DumpRawTlvs("UIM_GET_CONFIGURATION", tlvs, tlvLen);
     }
@@ -537,7 +572,7 @@ static void QueryUimSlotsAndCards(HANDLE hDev, const S23MODEM_STATUS_INFO *st, u
                 if (off + 1U > ln12) break;
                 uint8_t eidLen = v12[off++];
                 if (off + eidLen > ln12) break;
-                if (eidLen > 0U) DecodeBcdSwap(v12 + off, eidLen, eidStrArr[i], sizeof(eidStrArr[i]));
+                if (eidLen > 0U) FormatHex(v12 + off, eidLen, eidStrArr[i], sizeof(eidStrArr[i]));
                 off += eidLen;
             }
         }
@@ -737,8 +772,10 @@ static int UimTransceiveApdu(HANDLE hDev, const S23MODEM_STATUS_INFO *st,
             *outFullLen += dataBytes;
         }
         if (sw1 == 0x61U) {
-            /* Issue GET RESPONSE (CLA = channelId & 0x03, INS = 0xC0, P1 = 0, P2 = 0, Le = sw2) */
-            uint8_t getResp[5] = { (uint8_t)(cmdApdu[0] & 0x03U), 0xC0U, 0x00U, 0x00U, sw2 };
+            /* Issue GET RESPONSE preserving ISO 7816-4 logical channel CLA */
+            uint8_t getCla = (channelId < 4U) ? (uint8_t)(channelId & 0x03U)
+                                              : (uint8_t)(0x40U | ((channelId - 4U) & 0x0FU));
+            uint8_t getResp[5] = { getCla, 0xC0U, 0x00U, 0x00U, sw2 };
             chunkLen = 0;
             if (!UimSendApduRaw(hDev, st, slot, channelId, getResp, 5U, chunk, sizeof(chunk), &chunkLen) || chunkLen < 2U) {
                 return 0;
@@ -749,6 +786,98 @@ static int UimTransceiveApdu(HANDLE hDev, const S23MODEM_STATUS_INFO *st,
         outFullRsp[(*outFullLen)++] = sw2;
         return 1;
     }
+    return 0;
+}
+
+static uint8_t EsimPropCla(uint8_t channelId) {
+    return (channelId < 4U) ? (uint8_t)(0x80U | (channelId & 0x03U))
+                            : (uint8_t)(0xC0U | ((channelId - 4U) & 0x0FU));
+}
+
+static void EncodeIccidBcdSwap(const char *iccidHex, uint8_t outBcd[10]) {
+    memset(outBcd, 0xFF, 10U);
+    uint32_t len = (uint32_t)strlen(iccidHex);
+    if (len > 20U) len = 20U;
+    for (uint32_t i = 0; i < len; i += 2U) {
+        uint8_t d1 = (iccidHex[i] >= '0' && iccidHex[i] <= '9') ? (uint8_t)(iccidHex[i] - '0') : 0x0FU;
+        uint8_t d2 = (i + 1U < len && iccidHex[i + 1U] >= '0' && iccidHex[i + 1U] <= '9') ? (uint8_t)(iccidHex[i + 1U] - '0') : 0x0FU;
+        outBcd[i / 2U] = (uint8_t)((d2 << 4) | d1);
+    }
+}
+
+/* GSMA SGP.22 ES10c EnableProfileRequest (BF31): [A0: [5A: 10B ICCID]] [81: 01 FF (refreshFlag=TRUE)] */
+static int EsimEnableProfile(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t slot, uint8_t channelId, const char *iccidHex) {
+    uint8_t iccidBcd[10];
+    EncodeIccidBcdSwap(iccidHex, iccidBcd);
+
+    uint8_t cmd[32];
+    uint32_t pos = 0;
+    cmd[pos++] = EsimPropCla(channelId); cmd[pos++] = 0xE2U; cmd[pos++] = 0x91U; cmd[pos++] = 0x00U;
+    cmd[pos++] = 20U; /* Lc */
+    cmd[pos++] = 0xBFU; cmd[pos++] = 0x31U; cmd[pos++] = 17U;
+    cmd[pos++] = 0xA0U; cmd[pos++] = 12U;
+    cmd[pos++] = 0x5AU; cmd[pos++] = 10U;
+    memcpy(cmd + pos, iccidBcd, 10U); pos += 10U;
+    cmd[pos++] = 0x81U; cmd[pos++] = 0x01U; cmd[pos++] = 0xFFU; /* refreshFlag = TRUE */
+    cmd[pos++] = 0x00U; /* Le */
+
+    uint8_t rsp[512]; uint32_t rspLen = 0;
+    if (UimTransceiveApdu(hDev, st, slot, channelId, cmd, (uint16_t)pos, rsp, sizeof(rsp), &rspLen) && rspLen >= 2U) {
+        uint8_t sw1 = rsp[rspLen - 2U], sw2 = rsp[rspLen - 1U];
+        printf("  [eSIM EnableProfile] ICCID %s -> rspLen=%u SW=%02X%02X\n", iccidHex, rspLen, sw1, sw2);
+        return (sw1 == 0x90U && sw2 == 0x00U);
+    }
+    printf("  [eSIM EnableProfile] ICCID %s -> Failed (timeout/error)\n", iccidHex);
+    return 0;
+}
+
+/* GSMA SGP.22 ES10c DisableProfileRequest (BF32): [A0: [5A: 10B ICCID]] [81: 01 FF (refreshFlag=TRUE)] */
+static int EsimDisableProfile(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t slot, uint8_t channelId, const char *iccidHex) {
+    uint8_t iccidBcd[10];
+    EncodeIccidBcdSwap(iccidHex, iccidBcd);
+
+    uint8_t cmd[32];
+    uint32_t pos = 0;
+    cmd[pos++] = EsimPropCla(channelId); cmd[pos++] = 0xE2U; cmd[pos++] = 0x91U; cmd[pos++] = 0x00U;
+    cmd[pos++] = 20U; /* Lc */
+    cmd[pos++] = 0xBFU; cmd[pos++] = 0x32U; cmd[pos++] = 17U;
+    cmd[pos++] = 0xA0U; cmd[pos++] = 12U;
+    cmd[pos++] = 0x5AU; cmd[pos++] = 10U;
+    memcpy(cmd + pos, iccidBcd, 10U); pos += 10U;
+    cmd[pos++] = 0x81U; cmd[pos++] = 0x01U; cmd[pos++] = 0xFFU; /* refreshFlag = TRUE */
+    cmd[pos++] = 0x00U; /* Le */
+
+    uint8_t rsp[512]; uint32_t rspLen = 0;
+    if (UimTransceiveApdu(hDev, st, slot, channelId, cmd, (uint16_t)pos, rsp, sizeof(rsp), &rspLen) && rspLen >= 2U) {
+        uint8_t sw1 = rsp[rspLen - 2U], sw2 = rsp[rspLen - 1U];
+        printf("  [eSIM DisableProfile] ICCID %s -> rspLen=%u SW=%02X%02X\n", iccidHex, rspLen, sw1, sw2);
+        return (sw1 == 0x90U && sw2 == 0x00U);
+    }
+    printf("  [eSIM DisableProfile] ICCID %s -> Failed (timeout/error)\n", iccidHex);
+    return 0;
+}
+
+/* GSMA SGP.22 ES10c DeleteProfileRequest (BF33): CHOICE { [5A: 10B ICCID] } */
+static int EsimDeleteProfile(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t slot, uint8_t channelId, const char *iccidHex) {
+    uint8_t iccidBcd[10];
+    EncodeIccidBcdSwap(iccidHex, iccidBcd);
+
+    uint8_t cmd[32];
+    uint32_t pos = 0;
+    cmd[pos++] = EsimPropCla(channelId); cmd[pos++] = 0xE2U; cmd[pos++] = 0x91U; cmd[pos++] = 0x00U;
+    cmd[pos++] = 15U; /* Lc */
+    cmd[pos++] = 0xBFU; cmd[pos++] = 0x33U; cmd[pos++] = 12U;
+    cmd[pos++] = 0x5AU; cmd[pos++] = 10U;
+    memcpy(cmd + pos, iccidBcd, 10U); pos += 10U;
+    cmd[pos++] = 0x00U; /* Le */
+
+    uint8_t rsp[512]; uint32_t rspLen = 0;
+    if (UimTransceiveApdu(hDev, st, slot, channelId, cmd, (uint16_t)pos, rsp, sizeof(rsp), &rspLen) && rspLen >= 2U) {
+        uint8_t sw1 = rsp[rspLen - 2U], sw2 = rsp[rspLen - 1U];
+        printf("  [eSIM DeleteProfile] ICCID %s -> rspLen=%u SW=%02X%02X\n", iccidHex, rspLen, sw1, sw2);
+        return (sw1 == 0x90U && sw2 == 0x00U);
+    }
+    printf("  [eSIM DeleteProfile] ICCID %s -> Failed (timeout/error)\n", iccidHex);
     return 0;
 }
 
@@ -784,7 +913,8 @@ static int ReadBerTlv(const uint8_t *buf, uint32_t len, uint32_t *ioPos,
     return 1;
 }
 
-static void QueryEsimEuiccViaApdu(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t slot) {
+static void QueryEsimEuiccViaApdu(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t slot,
+                                  const char *enableIccid, const char *disableIccid, const char *deleteIccid) {
     printf("=== [GSMA SGP.22 ES10c eUICC APDU Query on Logical Slot %u] ===\n", slot);
     /* GSMA SGP.22 ISD-R AID: A0 00 00 05 59 10 10 FF FF FF FF 89 00 00 01 00 */
     static const uint8_t isdrAid[16] = {
@@ -800,8 +930,13 @@ static void QueryEsimEuiccViaApdu(HANDLE hDev, const S23MODEM_STATUS_INFO *st, u
     uint8_t rsp[4096];
     uint32_t rspLen = 0U;
 
-    /* 1. ES10c GetEID: 80 E2 91 00 06 BF 3E 03 5C 01 5A 00 */
-    uint8_t cmdGetEid[12] = { 0x80U, 0xE2U, 0x91U, 0x00U, 0x06U, 0xBFU, 0x3EU, 0x03U, 0x5CU, 0x01U, 0x5AU, 0x00U };
+    /* Execute requested CLI actions before reading the final state */
+    if (enableIccid) EsimEnableProfile(hDev, st, slot, chId, enableIccid);
+    if (disableIccid) EsimDisableProfile(hDev, st, slot, chId, disableIccid);
+    if (deleteIccid) EsimDeleteProfile(hDev, st, slot, chId, deleteIccid);
+
+    /* 1. ES10c GetEID: <CLA> E2 91 00 06 BF 3E 03 5C 01 5A 00 */
+    uint8_t cmdGetEid[12] = { EsimPropCla(chId), 0xE2U, 0x91U, 0x00U, 0x06U, 0xBFU, 0x3EU, 0x03U, 0x5CU, 0x01U, 0x5AU, 0x00U };
     if (UimTransceiveApdu(hDev, st, slot, chId, cmdGetEid, sizeof(cmdGetEid), rsp, sizeof(rsp), &rspLen) && rspLen >= 2U) {
         uint8_t sw1 = rsp[rspLen - 2U], sw2 = rsp[rspLen - 1U];
         uint32_t pos = 0, tag = 0, vlen = 0;
@@ -821,8 +956,8 @@ static void QueryEsimEuiccViaApdu(HANDLE hDev, const S23MODEM_STATUS_INFO *st, u
         }
     }
 
-    /* 2. ES10c GetProfilesInfo: 80 E2 91 00 03 BF 2D 00 00 */
-    uint8_t cmdGetProf[9] = { 0x80U, 0xE2U, 0x91U, 0x00U, 0x03U, 0xBFU, 0x2DU, 0x00U, 0x00U };
+    /* 2. ES10c GetProfilesInfo: <CLA> E2 91 00 03 BF 2D 00 00 */
+    uint8_t cmdGetProf[9] = { EsimPropCla(chId), 0xE2U, 0x91U, 0x00U, 0x03U, 0xBFU, 0x2DU, 0x00U, 0x00U };
     if (UimTransceiveApdu(hDev, st, slot, chId, cmdGetProf, sizeof(cmdGetProf), rsp, sizeof(rsp), &rspLen) && rspLen >= 2U) {
         uint8_t sw1 = rsp[rspLen - 2U], sw2 = rsp[rspLen - 1U];
         uint32_t pos = 0, tag = 0, vlen = 0;
@@ -992,14 +1127,66 @@ static void QueryNasAndWds(HANDLE hDev, const S23MODEM_STATUS_INFO *st) {
 }
 
 static void QueryIpaStatus(HANDLE hDev, const S23MODEM_STATUS_INFO *st) {
-    UNREFERENCED_PARAMETER(hDev);
-    printf("=== [QMI IPA 0x31] Hardware Packet Accelerator (IPA v5.5) Status ===\n");
+    printf("=== [QMI IPA 0x31] Hardware Packet Accelerator (IPA v5.5 + GSI v5.5) Status ===\n");
     uint32_t dstNode = 0, dstPort = 0;
     if (FindQrtrServer(st, QMI_SVC_IPA, &dstNode, &dstPort)) {
         printf("  QMI IPA (0x31) Server active @ node=%u port=0x%04x\n", dstNode, dstPort);
     } else {
         printf("  QMI IPA (0x31) Server not announced yet\n");
     }
+
+    S23MODEM_IPA_STATUS ipaSt;
+    ZeroMemory(&ipaSt, sizeof(ipaSt));
+    DWORD ipaBytes = 0;
+    BOOL ipaOk = DeviceIoControl(hDev, IOCTL_S23MODEM_IPA_INIT, NULL, 0, &ipaSt, sizeof(ipaSt), &ipaBytes, NULL);
+    printf("  [M3a HW]   ClkVoted=%u SmmuMapped=%u(CB=%u sGFSR=0x%x) FwLoaded=%u Smem497Pa=0x%08x (ok=%d)\n",
+           ipaSt.IpaClkVoted, ipaSt.SmmuMapped, ipaSt.SmmuCbIdx, ipaSt.SmmuGfsr,
+           ipaSt.IpaFwLoaded, ipaSt.Smem497Pa, ipaOk ? 1 : 0);
+    printf("  [M3a IPA]  IPA_VERSION=0x%08x COMP_HW=0x%08x COMP_CFG=0x%08x ROUTE=0x%08x\n",
+           ipaSt.IpaVersion, ipaSt.IpaCompHwVer, ipaSt.IpaCompCfg, ipaSt.IpaRoute);
+    printf("  [M3a SRAM] SHARED_MEM_RAW=0x%08x SramSize=0x%x (%u B) Restricted=0x%x (%u B)\n",
+           ipaSt.IpaSharedMemRaw, ipaSt.SramSizeBytes, ipaSt.SramSizeBytes,
+           ipaSt.SramRestrictedBytes, ipaSt.SramRestrictedBytes);
+    printf("  [M3a GSI]  GSI_STATUS=0x%08x GSI_CFG=0x%08x SW_VER=0x%08x PARAM2=0x%08x PARAM4=0x%08x\n",
+           ipaSt.GsiStatus, ipaSt.GsiCfg, ipaSt.GsiSwVer, ipaSt.GsiParam2, ipaSt.GsiParam4);
+    printf("  [M3b/c CH] CmdCh(12)=%u LanRx(14)=%u WanTx(11/EP2)=%u WanRx(1/EP24)=%u\n",
+           ipaSt.CmdChStarted, ipaSt.LanRxChStarted, ipaSt.WanTxChStarted, ipaSt.WanRxChStarted);
+    printf("  [M3c QMI]  IndReg(0x20)=%u InitModemResp(0x21)=%u MasterInd(0x22)=%u ModemCmplt(0x35)=%u FltRules(0x23)=%u\n",
+           ipaSt.QmiIpaIndRegRx, ipaSt.QmiIpaInitModemResp, ipaSt.QmiIpaMasterCompleteSent,
+           ipaSt.QmiIpaModemCompleteRx, ipaSt.QmiIpaFilterRuleRx);
+    printf("  [M3c DATA] TxPackets=%u RxPackets=%u WanTxRP=0x%08x WanRxRP=0x%08x LanRxRP=0x%08x GsiErr=0x%x\n",
+           ipaSt.TxPackets, ipaSt.RxPackets,
+           ipaSt.WanTxRpLsb, ipaSt.WanRxRpLsb, ipaSt.LanRxRpLsb, ipaSt.GsiErrorLog);
+}
+
+static void RunIpaLoopbackTest(HANDLE hDev, const S23MODEM_STATUS_INFO *st) {
+    QueryIpaStatus(hDev, st);
+    S23MODEM_IPA_STATUS stBefore, stAfter;
+    ZeroMemory(&stBefore, sizeof(stBefore));
+    ZeroMemory(&stAfter, sizeof(stAfter));
+    DWORD rb = 0;
+    DeviceIoControl(hDev, IOCTL_S23MODEM_IPA_INIT, NULL, 0, &stBefore, sizeof(stBefore), &rb, NULL);
+
+    S23MODEM_IPA_PKT pkt;
+    ZeroMemory(&pkt, sizeof(pkt));
+    /* Minimal valid 28-byte IPv4 UDP packet (10.0.0.1 -> 10.0.0.2) */
+    static const uint8_t kDummyIpv4[28] = {
+        0x45, 0x00, 0x00, 0x1C, 0x12, 0x34, 0x00, 0x00,
+        0x40, 0x11, 0x00, 0x00, 10, 0, 0, 1,
+        10, 0, 0, 2,
+        0x30, 0x39, 0x30, 0x39, 0x00, 0x08, 0x00, 0x00
+    };
+    pkt.Length = sizeof(kDummyIpv4);
+    memcpy(pkt.Data, kDummyIpv4, sizeof(kDummyIpv4));
+
+    BOOL txOk = DeviceIoControl(hDev, IOCTL_S23MODEM_IPA_TX_PKT, &pkt, sizeof(pkt), NULL, 0, &rb, NULL);
+    Sleep(30);
+    DeviceIoControl(hDev, IOCTL_S23MODEM_IPA_INIT, NULL, 0, &stAfter, sizeof(stAfter), &rb, NULL);
+    printf("  [IPA TX TEST] ok=%d TxPkts=%u->%u WanTxRP=0x%08x->0x%08x LanRxRP=0x%08x->0x%08x GsiErr=0x%x sGFSR=0x%x\n",
+           txOk ? 1 : 0, stBefore.TxPackets, stAfter.TxPackets,
+           stBefore.WanTxRpLsb, stAfter.WanTxRpLsb,
+           stBefore.LanRxRpLsb, stAfter.LanRxRpLsb,
+           stAfter.GsiErrorLog, stAfter.SmmuGfsr);
 }
 
 int main(int argc, char **argv) {
@@ -1034,6 +1221,10 @@ int main(int argc, char **argv) {
     QueryTlmmPins(hDev);
 
     int doLoadPdc = 0;
+    const char *enableIccid = NULL;
+    const char *disableIccid = NULL;
+    const char *deleteIccid = NULL;
+
     /* Parse CLI options: --switch-slot <logical> <physical> or --load-pdc */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--switch-slot") == 0 && i + 2 < argc) {
@@ -1044,6 +1235,36 @@ int main(int argc, char **argv) {
             i += 2;
         } else if (strcmp(argv[i], "--load-pdc") == 0) {
             doLoadPdc = 1;
+        } else if (strcmp(argv[i], "--enable") == 0 && i + 1 < argc) {
+            enableIccid = argv[++i];
+        } else if (strcmp(argv[i], "--disable") == 0 && i + 1 < argc) {
+            disableIccid = argv[++i];
+        } else if (strcmp(argv[i], "--delete") == 0 && i + 1 < argc) {
+            deleteIccid = argv[++i];
+        } else if (strcmp(argv[i], "--ipa-only") == 0) {
+            QueryIpaStatus(hDev, &st);
+            CloseHandle(hDev);
+            return 0;
+        } else if (strcmp(argv[i], "--ipa-test") == 0) {
+            RunIpaLoopbackTest(hDev, &st);
+            CloseHandle(hDev);
+            return 0;
+        } else if (strcmp(argv[i], "--crash-info") == 0) {
+            char buf[2048];
+            DWORD rb = 0;
+            uint32_t ids[3] = { 611U, 421U, 425U };
+            printf("SsrReason='%s'\n", st.SsrReason);
+            for (int k = 0; k < 3; k++) {
+                ZeroMemory(buf, sizeof(buf));
+                if (DeviceIoControl(hDev, IOCTL_S23MODEM_SMEM_READ, &ids[k], 4, buf, sizeof(buf) - 1, &rb, NULL)) {
+                    buf[rb] = '\0';
+                    printf("SMEM[%u] (%lu B): %s\n", ids[k], rb, buf);
+                } else {
+                    printf("SMEM[%u] err=%lu\n", ids[k], GetLastError());
+                }
+            }
+            CloseHandle(hDev);
+            return 0;
         }
     }
 
@@ -1073,23 +1294,36 @@ int main(int argc, char **argv) {
     }
 
     uint8_t euiccLogSlot = 0U, euiccPhysSlot = 0U;
+    UimGetConfiguration(hDev, &st);
     QueryUimSlotsAndCards(hDev, &st, &euiccLogSlot, &euiccPhysSlot);
 
-    /* If eUICC physical slot (e.g. Physical Slot 2) is inactive, optionally query or switch to it to read eUICC EID & profiles */
-    if (euiccLogSlot != 0U) {
-        QueryEsimEuiccViaApdu(hDev, &st, euiccLogSlot);
-    } else if (euiccPhysSlot != 0U) {
-        printf("  [eSIM] Physical Slot %u is inactive; switching Logical Slot 1 -> Physical Slot %u to query eUICC ISD-R...\n",
-               euiccPhysSlot, euiccPhysSlot);
-        if (SwitchUimSlot(hDev, &st, 1U, euiccPhysSlot)) {
+    /*
+     * SM-S911B (dm1q) verified from modem.b19/b24 (DM1_DUALSIMEUR_ONEBIN):
+     *   - Physical Slot 1 = pSIM1 (Logical Slot 1)
+     *   - Physical Slot 2 = pSIM2 (Logical Slot 2 in P-SIM mode(2,2))
+     *   - Physical Slot 3 = Embedded eSIM/eUICC inside NXP SN220 (fixed to Logical Slot 2 in eSIM mode(2,3)!)
+     */
+    if (euiccLogSlot == 0U) {
+        printf("  [eSIM] Switching Logical Slot 2 -> Physical Slot 3 (SM-S911B eSIM mode(2,3))...\n");
+        if (SwitchUimSlot(hDev, &st, 2U, 3U)) {
+            Sleep(2000);
+            QueryUimSlotsAndCards(hDev, &st, &euiccLogSlot, &euiccPhysSlot);
+        }
+        if (euiccLogSlot == 0U) {
+            /* Try explicit power-cycle on Logical Slot 2 (QMI UIM 0x0030 / 0x0031) */
+            UimPowerDownSlot(hDev, &st, 2U);
+            Sleep(300);
+            UimPowerUpSlot(hDev, &st, 2U);
             Sleep(1500);
             QueryUimSlotsAndCards(hDev, &st, &euiccLogSlot, &euiccPhysSlot);
-            QueryEsimEuiccViaApdu(hDev, &st, 1U);
         }
-    } else {
-        /* Try both logical slot 1 and 2 for ISD-R */
-        QueryEsimEuiccViaApdu(hDev, &st, 1U);
     }
+
+    UimGetAtr(hDev, &st, 1U);
+    UimGetAtr(hDev, &st, 2U);
+
+    uint8_t targetEsimSlot = (euiccLogSlot != 0U) ? euiccLogSlot : 2U;
+    QueryEsimEuiccViaApdu(hDev, &st, targetEsimSlot, enableIccid, disableIccid, deleteIccid);
 
     QueryNasAndWds(hDev, &st);
     QueryIpaStatus(hDev, &st);

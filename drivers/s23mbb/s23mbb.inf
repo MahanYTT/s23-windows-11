@@ -1,0 +1,80 @@
+[Version]
+Signature   = "$Windows NT$"
+Class       = Net
+ClassGUID   = {4d36e972-e325-11ce-bfc1-08002be10318}
+Provider    = %MfgName%
+DriverVer   = 11/24/2026,1.0.0.1
+CatalogFile = s23mbb.cat
+PnpLockdown = 1
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+s23mbb.sys = 1,,
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[Manufacturer]
+%MfgName% = S23Mbb, NTarm64
+
+[S23Mbb.NTarm64]
+%S23Mbb.DeviceDesc% = s23mbb.ndi, ROOT\S23MBB
+%S23Mbb.DeviceDesc% = s23mbb.ndi, ACPI\S23MBB01
+
+[s23mbb.ndi.NT]
+AddReg             = s23mbb.Reg
+CopyFiles          = s23mbb.CopyFiles
+Characteristics    = 0x4       ; NCF_PHYSICAL
+BusType            = 1         ; Internal
+*IfType            = 243       ; IF_TYPE_WWANPP
+*MediaType         = 9         ; NdisMediumWirelessWan
+*PhysicalMediaType = 8         ; NdisPhysicalMediumWirelessWan
+EnableDhcp         = 0
+
+[s23mbb.CopyFiles]
+s23mbb.sys,,,0x0100
+
+[s23mbb.Reg]
+HKR, Ndi,                         Service,                         0, "s23mbb"
+HKR, Ndi\Interfaces,              UpperRange,                      0, "flpp4, flpp6"
+HKR, Ndi\Interfaces,              LowerRange,                      0, "ppip"
+HKR, ,                            AllowDriverToOverrideDeviceName, 0x00010001, 1
+HKR, NetworkInterface,            *IfConnectorPresent,             0x00010001, 1
+HKR, NetworkInterface,            *ConnectionType,                 0x00010001, 1
+HKR, NetworkInterface,            *DirectionType,                  0x00010001, 0
+HKR, NetworkInterface,            *AccessType,                     0x00010001, 2
+HKR, NetworkInterface,            *HardwareLoopback,               0x00010001, 0
+HKR, ,                            NumberOfNetworkInterfaces,       0x00010001, 17
+
+[s23mbb.ndi.NT.Services]
+AddService = s23mbb, 0x00000002, s23mbb.Service, s23mbb.EventLog
+
+[s23mbb.Service]
+DisplayName    = %S23Mbb.SvcDesc%
+ServiceType    = 1             ; SERVICE_KERNEL_DRIVER
+StartType      = 3             ; SERVICE_DEMAND_START
+ErrorControl   = 1             ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %13%\s23mbb.sys
+LoadOrderGroup = NDIS
+Dependencies   = s23modem_xprt
+
+[s23mbb.EventLog]
+AddReg = s23mbb.EventLog.Reg
+
+[s23mbb.EventLog.Reg]
+HKR, , EventMessageFile, 0x00020000, "%%SystemRoot%%\System32\netevent.dll"
+HKR, , TypesSupported,   0x00010001, 7
+
+[s23mbb.ndi.NT.Wdf]
+KmdfService = s23mbb, s23mbb_wdfsect
+
+[s23mbb_wdfsect]
+KmdfLibraryVersion = 1.33
+
+[Strings]
+MfgName           = "Samsung Galaxy S23 WoA"
+DiskName          = "S23 Native 5G MBB Driver Disk"
+S23Mbb.DeviceDesc = "Samsung Galaxy S23 Snapdragon X70 5G Modem"
+S23Mbb.SvcDesc    = "Samsung Galaxy S23 MBBCx Mobile Broadband Driver"

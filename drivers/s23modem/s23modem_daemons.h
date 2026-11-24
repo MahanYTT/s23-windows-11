@@ -11,10 +11,12 @@
 #define QRTR_PORT_PD_MAPPER     0x00004002U
 #define QRTR_PORT_TQFTPSERV     0x00004003U
 #define QRTR_PORT_PD_MAPPER_V0  0x00004004U
+#define QRTR_PORT_IPA_A5        0x00004005U
 
 #define QMI_SVC_RMTFS           0x000EU  /* 14 */
 #define QMI_SVC_PD_MAPPER       0x0040U  /* 64 */
 #define QRTR_SVC_TQFTPSERV      0x1000U  /* 4096 */
+#define QMI_SVC_IPA_A5          0x0031U  /* 49 */
 
 #define EFS_PART_COUNT          4U
 #define EFS_MAX_PART_BYTES      0x00300000U /* 3 MiB */
@@ -107,13 +109,14 @@ static __declspec(noinline) BOOLEAN QrtrSendPacket(MDM_GLINK_CTX *g, uint32_t pk
                                                    const void *pay, uint32_t payLen);
 
 static __declspec(noinline) VOID QrtrAnnounceApServers(MDM_GLINK_CTX *g, uint32_t dstNode) {
-    static const struct { uint32_t svc; uint32_t inst; uint32_t port; const char *name; } srvs[4] = {
+    static const struct { uint32_t svc; uint32_t inst; uint32_t port; const char *name; } srvs[5] = {
         { QMI_SVC_RMTFS,      1U,     QRTR_PORT_RMTFS,        "rmtfs (14 v1:0)" },
         { QMI_SVC_PD_MAPPER,  0x101U, QRTR_PORT_PD_MAPPER,    "pd-mapper (64 v1:1)" },
         { QMI_SVC_PD_MAPPER,  1U,     QRTR_PORT_PD_MAPPER_V0, "pd-mapper (64 v1:0)" },
-        { QRTR_SVC_TQFTPSERV, 1U,     QRTR_PORT_TQFTPSERV,    "tqftpserv (4096 v1:0)" }
+        { QRTR_SVC_TQFTPSERV, 1U,     QRTR_PORT_TQFTPSERV,    "tqftpserv (4096 v1:0)" },
+        { QMI_SVC_IPA_A5,     0x101U, QRTR_PORT_IPA_A5,       "ipa-a5 (49 v1:1)" }
     };
-    for (ULONG i = 0; i < 4U; i++) {
+    for (ULONG i = 0; i < 5U; i++) {
         uint8_t ctrl[20]; RtlZeroMemory(ctrl, sizeof(ctrl));
         uint32_t cmd = QRTR_TYPE_NEW_SERVER, node = 1U;
         RtlCopyMemory(ctrl + 0U,  &cmd,          4U);

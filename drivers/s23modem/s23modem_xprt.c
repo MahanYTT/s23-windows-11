@@ -745,6 +745,7 @@ static __declspec(noinline) BOOLEAN LoadElfSplitSegments(PCWSTR dirPrefix, PCWST
                                FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN,
                                FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
     if (!NT_SUCCESS(st)) {
+        LogFmt("[PIL] ZwCreateFile(%S) failed st=0x%08x\r\n", pathBuf, st);
         ExFreePoolWithTag(pathBuf, S23_MDM_TAG);
         return FALSE;
     }
@@ -799,6 +800,8 @@ static __declspec(noinline) BOOLEAN LoadElfSplitSegments(PCWSTR dirPrefix, PCWST
     ULONGLONG r0 = ~0ULL, r1 = 0;
     (void)ScmCall64(0x42000201ULL, 2ULL | (2ULL << 6), pasId, metaPa, 0ULL, 0ULL, &r0, &r1);
     if (r0 != 0 || r1 != 0) {
+        LogFmt("[PIL] PAS_INIT_IMAGE(pas=%llu metaPa=0x%llx len=%lu) failed r0=0x%llx r1=0x%llx\r\n",
+               pasId, metaPa, mdtLen, r0, r1);
         MmFreeContiguousMemorySpecifyCache(metaVa, metaBytes, MmNonCached);
         ExFreePoolWithTag(mdt, S23_MDM_TAG);
         ExFreePoolWithTag(pathBuf, S23_MDM_TAG);
@@ -807,6 +810,8 @@ static __declspec(noinline) BOOLEAN LoadElfSplitSegments(PCWSTR dirPrefix, PCWST
     if (reloc) {
         (void)ScmCall64(0x42000202ULL, 3ULL, pasId, carvePa, maxPa - minPa, 0ULL, &r0, &r1);
         if (r0 != 0 || r1 != 0) {
+            LogFmt("[PIL] PAS_MEM_SETUP(pas=%llu pa=0x%llx sz=0x%llx) failed r0=0x%llx r1=0x%llx\r\n",
+                   pasId, carvePa, maxPa - minPa, r0, r1);
             MmFreeContiguousMemorySpecifyCache(metaVa, metaBytes, MmNonCached);
             ExFreePoolWithTag(mdt, S23_MDM_TAG);
             ExFreePoolWithTag(pathBuf, S23_MDM_TAG);
@@ -874,9 +879,9 @@ static __declspec(noinline) BOOLEAN LoadElfSplitSegments(PCWSTR dirPrefix, PCWST
 /* ============================================================================
  * Persistent GLink + QRTR Transport Engine & Client RX Ring
  * ========================================================================== */
-#define MAX_GLINK_INTENTS   16U
+#define MAX_GLINK_INTENTS   24U
 #define GLINK_INTENT_SIZE   18432U
-#define MAX_REMOTE_INTENTS  64U
+#define MAX_REMOTE_INTENTS  128U
 #define RX_RING_SLOTS       64U
 
 typedef struct _MDM_GLINK_CTX {
@@ -955,6 +960,7 @@ static VOID EnqueueClientQrtrPkt(uint32_t pktType, uint32_t srcNode, uint32_t sr
 }
 
 #include "s23modem_daemons.h"
+#include "s23modem_ipa.h"
 
 static uint32_t GlinkRxAvail(MDM_GLINK_CTX *g) {
     if (!g->rx_fifo || g->rx_len == 0U) return 0U;
@@ -1047,6 +1053,59 @@ static VOID GlinkAdvertiseIntents(MDM_GLINK_CTX *g, uint32_t cnt, uint32_t reqSz
 
 static VOID GlinkPollRx(MDM_GLINK_CTX *g);
 
+static VOID GlinkAddRemoteIntent(MDM_GLINK_CTX *g, uint32_t id, uint32_t sz) {
+    for (uint32_t i = 0; i < g->riid_cnt; i++) {
+        if (g->riid_id[i] == id) {
+            g->riid_sz[i] = sz;
+            g->riid_used[i] = FALSE;
+            return;
+        }
+    }
+    if (g->riid_cnt < MAX_REMOTE_INTENTS) {
+        uint32_t idx = g->riid_cnt++;
+        g->riid_id[idx] = id;
+        g->riid_sz[idx] = sz;
+        g->riid_used[idx] = FALSE;
+        return;
+    }
+    /* Table full: evict first retired/in-use slot so new remote intents are never dropped */
+    for (uint32_t i = 0; i < g->riid_cnt; i++) {
+        if (g->riid_used[i]) {
+            g->riid_id[i] = id;
+            g->riid_sz[i] = sz;
+            g->riid_used[i] = FALSE;
+            return;
+        }
+    }
+}
+
+static VOID GlinkHandleRemoteRxDone(MDM_GLINK_CTX *g, uint32_t id, BOOLEAN reuse) {
+    for (uint32_t i = 0; i < g->riid_cnt; i++) {
+        if (g->riid_id[i] == id) {
+            if (reuse) {
+                g->riid_used[i] = FALSE;
+            } else {
+                uint32_t last = g->riid_cnt - 1U;
+                g->riid_id[i]   = g->riid_id[last];
+                g->riid_sz[i]   = g->riid_sz[last];
+                g->riid_used[i] = g->riid_used[last];
+                g->riid_cnt--;
+            }
+            return;
+        }
+    }
+}
+
+typedef struct _GLINK_DEFERRED_TX {
+    uint8_t *Data;
+    uint32_t Length;
+} GLINK_DEFERRED_TX;
+
+static GLINK_DEFERRED_TX g_DefTx[16];
+static uint32_t          g_DefTxHead = 0U;
+static uint32_t          g_DefTxTail = 0U;
+static BOOLEAN           g_InDefTxDrain = FALSE;
+
 static BOOLEAN GlinkTxData(MDM_GLINK_CTX *g, const void *pay, uint32_t len) {
     uint32_t tot = (16U + len + 7U) & ~7U;
     /* Wait for TX FIFO space and pump RX_DONE_W_REUSE / INTENT messages if needed */
@@ -1068,40 +1127,25 @@ static BOOLEAN GlinkTxData(MDM_GLINK_CTX *g, const void *pay, uint32_t len) {
     }
     if (slot < 0) {
         uint32_t reqSz = (len < 2048U) ? 2048U : len;
-        GlinkSendMsg8(g, GLINK_CMD_RX_INTENT_REQ, g->rcid, reqSz);
-        for (ULONG w = 0; w < 400U; w++) {
-            /* Scan RX FIFO for RX_DONE_W_REUSE or INTENT if already inside GlinkPollRx */
+        /* GLINK_CMD_RX_INTENT_REQ carries our local channel ID (lcid) as param1 */
+        GlinkSendMsg8(g, GLINK_CMD_RX_INTENT_REQ, g->lcid, reqSz);
+        if (g->in_poll_rx) {
+            /* Defer transmission until GlinkPollRx finishes draining queued TX_DATA before the incoming INTENT */
+            uint32_t next = (g_DefTxHead + 1U) % 16U;
+            if (next != g_DefTxTail) {
+                uint8_t *cp = (uint8_t *)ExAllocatePool2(POOL_FLAG_NON_PAGED, len, S23_MDM_TAG);
+                if (cp) {
+                    RtlCopyMemory(cp, pay, len);
+                    g_DefTx[g_DefTxHead].Data   = cp;
+                    g_DefTx[g_DefTxHead].Length = len;
+                    g_DefTxHead = next;
+                    return TRUE;
+                }
+            }
+        }
+        for (ULONG w = 0; w < 1500U; w++) {
             if (!g->in_poll_rx) {
                 GlinkPollRx(g);
-            } else if (GlinkRxAvail(g) >= 8U) {
-                uint8_t msg[8];
-                GlinkRxPeek(g, msg, 0U, 8U);
-                uint16_t cmd = Le16(msg + 0), p1 = Le16(msg + 2);
-                uint32_t p2  = Le32(msg + 4);
-                if (cmd == GLINK_CMD_RX_DONE || cmd == GLINK_CMD_RX_DONE_W_REUSE) {
-                    GlinkRxAdv(g, 8U);
-                    if (p1 == g->rcid) {
-                        for (uint32_t i = 0; i < g->riid_cnt; i++) {
-                            if (g->riid_id[i] == p2) {
-                                if (cmd == GLINK_CMD_RX_DONE_W_REUSE) g->riid_used[i] = FALSE;
-                                break;
-                            }
-                        }
-                    }
-                } else if (cmd == GLINK_CMD_INTENT && GlinkRxAvail(g) >= 8U + p2 * 8U) {
-                    for (uint32_t i = 0; i < p2; i++) {
-                        uint8_t pair[8];
-                        GlinkRxPeek(g, pair, 8U + i * 8U, 8U);
-                        uint32_t sz = Le32(pair + 0), id = Le32(pair + 4);
-                        if (p1 == g->rcid && g->riid_cnt < MAX_REMOTE_INTENTS) {
-                            uint32_t idx = g->riid_cnt++;
-                            g->riid_id[idx] = id; g->riid_sz[idx] = sz; g->riid_used[idx] = FALSE;
-                        }
-                    }
-                    GlinkRxAdv(g, 8U + p2 * 8U);
-                } else if (cmd == GLINK_CMD_RX_INTENT_REQ_ACK || cmd == GLINK_CMD_READ_NOTIF) {
-                    GlinkRxAdv(g, 8U);
-                }
             }
             for (uint32_t i = 0; i < g->riid_cnt; i++) {
                 if (!g->riid_used[i] && g->riid_sz[i] >= len) { slot = (int32_t)i; break; }
@@ -1235,6 +1279,8 @@ static VOID HandleQrtrPayload(MDM_GLINK_CTX *g, const uint8_t *buf, uint32_t len
             HandlePdMapperQmi(g, dstPort, srcNode, srcPort, pay, paySz);
         } else if (dstPort == QRTR_PORT_TQFTPSERV || (dstPort >= 0x4020U && dstPort <= 0x407FU)) {
             HandleTqftpPacket(g, dstPort, srcNode, srcPort, pay, paySz);
+        } else if (dstPort == QRTR_PORT_IPA_A5) {
+            HandleIpaA5Qmi(g, srcNode, srcPort, pay, paySz);
         } else {
             EnqueueClientQrtrPkt(QRTR_TYPE_DATA, srcNode, srcPort, dstNode, dstPort, pay, paySz);
         }
@@ -1296,17 +1342,17 @@ static VOID GlinkPollRx(MDM_GLINK_CTX *g) {
                 uint8_t pair[8];
                 GlinkRxPeek(g, pair, 8U + i * 8U, 8U);
                 uint32_t sz = Le32(pair + 0), id = Le32(pair + 4);
-                if (p1 == g->rcid && g->riid_cnt < MAX_REMOTE_INTENTS) {
-                    uint32_t idx = g->riid_cnt++;
-                    g->riid_id[idx] = id; g->riid_sz[idx] = sz; g->riid_used[idx] = FALSE;
+                if (p1 == g->rcid) {
+                    GlinkAddRemoteIntent(g, id, sz);
                 }
             }
             GlinkRxAdv(g, 8U + p2 * 8U);
         } else if (cmd == GLINK_CMD_RX_INTENT_REQ) {
             GlinkRxAdv(g, 8U);
             if (p1 == g->rcid) {
+                uint32_t before = g->liid_cnt;
                 GlinkAdvertiseIntents(g, 1U, (p2 > 0x800U) ? p2 : 0x800U);
-                GlinkSendMsg8(g, GLINK_CMD_RX_INTENT_REQ_ACK, g->lcid, 1U);
+                GlinkSendMsg8(g, GLINK_CMD_RX_INTENT_REQ_ACK, g->lcid, (g->liid_cnt > before) ? 1U : 0U);
             } else {
                 GlinkSendMsg8(g, GLINK_CMD_RX_INTENT_REQ_ACK, p1, 0U);
             }
@@ -1319,12 +1365,7 @@ static VOID GlinkPollRx(MDM_GLINK_CTX *g) {
         } else if (cmd == GLINK_CMD_RX_DONE || cmd == GLINK_CMD_RX_DONE_W_REUSE) {
             GlinkRxAdv(g, 8U);
             if (p1 == g->rcid) {
-                for (uint32_t i = 0; i < g->riid_cnt; i++) {
-                    if (g->riid_id[i] == p2) {
-                        if (cmd == GLINK_CMD_RX_DONE_W_REUSE) g->riid_used[i] = FALSE;
-                        break;
-                    }
-                }
+                GlinkHandleRemoteRxDone(g, p2, (cmd == GLINK_CMD_RX_DONE_W_REUSE));
             }
         } else if (cmd == GLINK_CMD_TX_DATA || cmd == GLINK_CMD_TX_DATA_CONT) {
             if (av < 16U) break;
@@ -1358,48 +1399,81 @@ static VOID GlinkPollRx(MDM_GLINK_CTX *g) {
         }
     }
     g->in_poll_rx = prevInPoll;
+    if (!prevInPoll && !g_InDefTxDrain) {
+        g_InDefTxDrain = TRUE;
+        while (g_DefTxTail != g_DefTxHead) {
+            uint8_t *d = g_DefTx[g_DefTxTail].Data;
+            uint32_t l = g_DefTx[g_DefTxTail].Length;
+            g_DefTx[g_DefTxTail].Data   = NULL;
+            g_DefTx[g_DefTxTail].Length = 0U;
+            g_DefTxTail = (g_DefTxTail + 1U) % 16U;
+            if (d) {
+                (void)GlinkTxData(g, d, l);
+                ExFreePoolWithTag(d, S23_MDM_TAG);
+            }
+        }
+        g_InDefTxDrain = FALSE;
+    }
 }
 
 #define PA_TLMM_BASE            0x0F100000ULL
 #define SZ_TLMM                 0x00100000U
 
 static __declspec(noinline) VOID PowerUpSimAndEuiccRails(VOID) {
-    /* 1. Vote SIM1 (ldob9 = 2960 mV per s23_live.dts), eSIM/SIM2 (ldob10 = 1800 mV always-on), and ldob2/14 */
+    /*
+     * SM-S911B (dm1q) verified from s23_live.dts + Samsung drivers/nfc/common.c + modem.b19:
+     *  - ldob6 (pm_humu_l6) and ldob7 (pm_humu_l7) are UIM1/UIM2 rails owned directly by MPSS PAM;
+     *    AP MUST NOT hold a permanent vote on ldob6/ldob7 or MPSS cannot power-cycle UIM VDD during ATR!
+     *  - ldob14 (pm_humu_l14) is NXP SN220 NFC/eSE/eUICC PVDD (1.8 V NPM); NOT in modem.b19, AP must enable it!
+     *  - Exact Samsung SN220 boot sequence (common.c:269-289, 405-421):
+     *      1) Enable ldob14 = 1800 mV, mode 7 (NPM)
+     *      2) Wait 20 ms (VDDIO high -> 15..20 ms -> VEN high)
+     *      3) Toggle TLMM GPIO 66 (pn547,ven-gpio): HIGH (15 ms) -> LOW (15 ms) -> HIGH (20 ms)
+     *  - NEVER touch TZ-reserved GPIO 56..59 or MPSS-owned open-drain UIM pins GPIO 130..136!
+     */
     const volatile uint8_t *db = MapIo(PA_CMD_DB_BASE, SZ_CMD_DB);
     volatile uint8_t *rsc = MapIo(PA_RSC_DRV2_BASE, SZ_RSC_DRV2);
     if (db && rsc) {
-        static const struct { const char *name; uint32_t mv; } vrmVotes[] = {
-            { "ldob2",  3000U },
-            { "ldob9",  2960U },
-            { "ldob10", 1800U },
-            { "ldob14", 1800U }
-        };
-        for (ULONG i = 0; i < sizeof(vrmVotes) / sizeof(vrmVotes[0]); i++) {
-            uint32_t vaddr = CmdDbLookup(db, vrmVotes[i].name);
-            if (vaddr != 0U) {
-                (void)RpmhWriteTcs0(rsc, vaddr + 0x0U, vrmVotes[i].mv);
-                (void)RpmhWriteTcs0(rsc, vaddr + 0x8U, 7U);
-                (void)RpmhWriteTcs0(rsc, vaddr + 0x4U, 1U);
-                LogFmt("[SIM-PWR] VRM %-6s addr=0x%05x -> %u mV ON\r\n", vrmVotes[i].name, vaddr, vrmVotes[i].mv);
-            }
+        uint32_t vaddr = CmdDbLookup(db, "ldob14");
+        if (vaddr != 0U) {
+            (void)RpmhWriteTcs0(rsc, vaddr + 0x0U, 1800U);
+            (void)RpmhWriteTcs0(rsc, vaddr + 0x8U, 7U);
+            (void)RpmhWriteTcs0(rsc, vaddr + 0x4U, 1U);
+            LogFmt("[SIM-PWR] VRM ldob14 (SN220 PVDD) addr=0x%05x -> 1800 mV NPM ON\r\n", vaddr);
         }
     }
     UnmapIo(&rsc, SZ_RSC_DRV2);
     UnmapIo((volatile uint8_t **)&db, SZ_CMD_DB);
 
-    /* 2. Drive GPIO66 (pn547,ven-gpio HIGH for NFC/eSE/eUICC) and mux UIM0/UIM1 pins (GPIO130..136) to func 1 */
+    /* Spec: VDDIO high -> wait 15..20 ms -> VEN reset toggle 1 -> 0 -> 1 (15 ms each) */
+    SleepMs(20U);
+
     volatile uint8_t *tlmm = MapIo(PA_TLMM_BASE, SZ_TLMM);
     if (tlmm) {
-        Wr32(tlmm, 66U * 0x1000U, (1U << 9) | (1U << 6));
-        Wr32(tlmm, 66U * 0x1000U + 4U, 2U);
-        /* Mux GPIO130..132 (uim0) and GPIO134..136 (uim1) to func 1 (UIM) */
-        static const unsigned int uimPins[] = { 130U, 131U, 132U, 134U, 135U, 136U };
-        for (ULONG p = 0; p < sizeof(uimPins) / sizeof(uimPins[0]); p++) {
-            Wr32(tlmm, uimPins[p] * 0x1000U, (1U << 9) | (1U << 2));
+        uint32_t curCfg = Rd32(tlmm, 66U * 0x1000U);
+        uint32_t curIo  = Rd32(tlmm, 66U * 0x1000U + 4U);
+        if ((curCfg & (1U << 9)) == 0U || (curIo & 2U) == 0U) {
+            /* GPIO 66: pn547,ven-gpio (func=0, OE=1, 4mA drive, no pull) */
+            Wr32(tlmm, 66U * 0x1000U, (1U << 9) | (1U << 6));
+            Wr32(tlmm, 66U * 0x1000U + 4U, 2U);
+            __dmb(_ARM64_BARRIER_SY);
+            SleepMs(15U);
+
+            Wr32(tlmm, 66U * 0x1000U + 4U, 0U);
+            __dmb(_ARM64_BARRIER_SY);
+            SleepMs(15U);
+
+            Wr32(tlmm, 66U * 0x1000U + 4U, 2U);
+            __dmb(_ARM64_BARRIER_SY);
+            SleepMs(20U);
+
+            LogFmt("[SIM-PWR] SN220 GPIO66 VEN 1->0->1 reset sequence complete (inOut=0x%x)\r\n",
+                   Rd32(tlmm, 66U * 0x1000U + 4U));
+        } else {
+            LogFmt("[SIM-PWR] SN220 GPIO66 VEN already HIGH (inOut=0x%x), skipping toggle\r\n", curIo);
         }
         UnmapIo(&tlmm, SZ_TLMM);
     }
-    SleepMs(20U);
     LogFlush();
 }
 static __declspec(noinline) BOOLEAN EnsureMpssBootedLocked(VOID) {
@@ -1450,15 +1524,21 @@ static __declspec(noinline) BOOLEAN EnsureMpssBootedLocked(VOID) {
         const volatile uint8_t *db = MapIo(PA_CMD_DB_BASE, SZ_CMD_DB);
         volatile uint8_t *rsc = MapIo(PA_RSC_DRV2_BASE, SZ_RSC_DRV2);
         if (db && rsc) {
-            static const struct { const char *name; uint16_t minVlvl; } votes[3] = {
+            static const struct { const char *name; uint16_t minVlvl; } votes[5] = {
                 { "xo.lvl",  0x080U },
                 { "cx.lvl",  0x180U },
-                { "mss.lvl", 0x140U }
+                { "mx.lvl",  0x180U },
+                { "mxc.lvl", 0x180U },
+                { "mss.lvl", 0x180U }
             };
-            for (ULONG i = 0; i < 3U; i++) {
+            for (ULONG i = 0; i < 5U; i++) {
                 CMD_DB_ARC info;
                 if (CmdDbLookupArc(db, votes[i].name, &info) && info.Addr != 0U) {
-                    (void)RpmhWriteTcs0(rsc, info.Addr, FindArcIdx(&info, votes[i].minVlvl));
+                    uint32_t idx = FindArcIdx(&info, votes[i].minVlvl);
+                    BOOLEAN wok = RpmhWriteTcs0(rsc, info.Addr, idx);
+                    LogFmt("[RAIL] %-7s addr=0x%05x n=%u v0=0x%x v1=0x%x v2=0x%x idx=%u -> ok=%u\r\n",
+                           votes[i].name, info.Addr, info.NumVlvls,
+                           info.Vlvls[0], info.Vlvls[1], info.Vlvls[2], idx, wok ? 1U : 0U);
                 }
             }
         }
@@ -1549,10 +1629,10 @@ static __declspec(noinline) BOOLEAN EnsureMpssBootedLocked(VOID) {
         RtlCopyMemory(hctrl, &hcmd, 4U);
         (void)QrtrSendPacket(&g_mdmGlink, QRTR_TYPE_HELLO, QRTR_PORT_CTRL, 0U, QRTR_PORT_CTRL, hctrl, 20U);
 
-        /* Poll until all 48+ QMI services are discovered AND initial TFTP/RMTFS boot transfers settle (up to 15s) */
+        /* Poll until all 50+ QMI services are discovered AND initial TFTP/RMTFS boot transfers settle (up to 18s) */
         g_mdmGlink.cur_tick = 0U;
         g_mdmGlink.last_rx_tick = 0U;
-        for (ULONG w = 0; w < 1500U; w++) {
+        for (ULONG w = 0; w < 1800U; w++) {
             g_mdmGlink.cur_tick = w;
             NegotiateModemSmp2p(g_mdmGlink.smem, g_mdmGlink.ipcc);
             GlinkPollRx(&g_mdmGlink);
@@ -1560,7 +1640,7 @@ static __declspec(noinline) BOOLEAN EnsureMpssBootedLocked(VOID) {
                 g_mdmGlink.servers_announced = TRUE;
                 QrtrAnnounceApServers(&g_mdmGlink, 0U);
             }
-            if (g_mdmGlink.qrtr_srv_cnt >= 48U && !g_tftpActive && (w - g_mdmGlink.last_rx_tick) >= 150U) {
+            if (g_mdmGlink.qrtr_srv_cnt >= 50U && !g_tftpActive && (w - g_mdmGlink.last_rx_tick) >= 250U) {
                 break;
             }
             SleepMs(10U);
@@ -1568,6 +1648,7 @@ static __declspec(noinline) BOOLEAN EnsureMpssBootedLocked(VOID) {
         g_mdmGlink.mpss_booted = TRUE;
         LogFmt("[BOOT] MPSS & QRTR READY (servers=%u)\r\n", g_mdmGlink.qrtr_srv_cnt);
         LogFlush();
+        (void)IpaEnsureInitializedLocked(NULL);
         return TRUE;
     } else {
         /* MPSS is already running in SMEM: attach GLink pipes & query NEW_LOOKUP for all services */
@@ -1583,31 +1664,34 @@ static __declspec(noinline) BOOLEAN EnsureMpssBootedLocked(VOID) {
         g_mdmGlink.tx_fifo = g_mdmGlink.smem + f0o; g_mdmGlink.tx_len = f0s;
         g_mdmGlink.rx_fifo = g_mdmGlink.smem + f1o; g_mdmGlink.rx_len = f1s;
         g_mdmGlink.lcid = 1U;
-        g_mdmGlink.rcid = 1U;
+        if (g_mdmGlink.rcid == 0U) g_mdmGlink.rcid = 1U;
         g_mdmGlink.ver_acked = TRUE;
         g_mdmGlink.local_open_sent = TRUE;
         g_mdmGlink.ch_opened_local = TRUE;
         g_mdmGlink.ch_opened_remote = TRUE;
         g_mdmGlink.mpss_booted = TRUE;
-        g_mdmGlink.liid_cnt = 10U;
 
-        /* Re-open channel to trigger remote intent replenishment if needed */
+        /* Re-open channel to trigger fresh remote intents & re-advertise local intents */
         GlinkPollRx(&g_mdmGlink);
         if (g_mdmGlink.riid_cnt == 0U) {
+            g_mdmGlink.liid_cnt = 0U;
             GlinkSendMsg8(&g_mdmGlink, GLINK_CMD_CLOSE, g_mdmGlink.lcid, 0U);
             for (ULONG p = 0; p < 20U; p++) {
                 GlinkPollRx(&g_mdmGlink);
                 SleepMs(5U);
             }
+            g_mdmGlink.riid_cnt = 0U;
             g_mdmGlink.ch_opened_local = FALSE;
-            g_mdmGlink.ch_opened_remote = FALSE;
             g_mdmGlink.local_open_sent = TRUE;
             GlinkSendOpen(&g_mdmGlink, g_mdmGlink.lcid, "IPCRTR");
-            for (ULONG p = 0; p < 50U; p++) {
+            for (ULONG p = 0; p < 100U; p++) {
                 GlinkPollRx(&g_mdmGlink);
                 if (g_mdmGlink.ch_opened_local && g_mdmGlink.riid_cnt > 0U) break;
                 SleepMs(10U);
             }
+            g_mdmGlink.ch_opened_remote = TRUE;
+            GlinkAdvertiseIntents(&g_mdmGlink, 10U, 0U);
+            GlinkSendMsg8(&g_mdmGlink, GLINK_CMD_SIGNALS, g_mdmGlink.lcid, NATIVE_DTR_SIG | NATIVE_CTS_SIG);
         }
 
         /* Send QRTR NEW_LOOKUP to re-discover all live servers from MPSS */
@@ -1647,6 +1731,11 @@ static __declspec(noinline) BOOLEAN EnsureMpssBootedLocked(VOID) {
         }
         LogFmt("[BOOT] Attached to running MPSS (smp2p=0x%x servers=%u)\r\n", sv, g_mdmGlink.qrtr_srv_cnt);
         LogFlush();
+        if (!g_mdmGlink.servers_announced) {
+            g_mdmGlink.servers_announced = TRUE;
+            QrtrAnnounceApServers(&g_mdmGlink, 0U);
+        }
+        (void)IpaEnsureInitializedLocked(NULL);
         return TRUE;
     }
 }
@@ -1840,6 +1929,54 @@ static NTSTATUS S23ModemDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                 status = STATUS_INVALID_PARAMETER;
             }
         }
+    } else if (code == IOCTL_S23MODEM_FLUSH_RX) {
+        KIRQL irql;
+        KeAcquireSpinLock(&g_RxRingLock, &irql);
+        g_RxHead = 0U;
+        g_RxTail = 0U;
+        KeClearEvent(&g_RxEvent);
+        KeReleaseSpinLock(&g_RxRingLock, irql);
+        status = STATUS_SUCCESS;
+    } else if (code == IOCTL_S23MODEM_IPA_INIT) {
+        KeWaitForSingleObject(&g_GlinkLock, Executive, KernelMode, FALSE, NULL);
+        if (g_mdmGlink.mpss_booted) GlinkPollRx(&g_mdmGlink);
+        BOOLEAN ok = IpaEnsureInitializedLocked((outLen >= sizeof(S23MODEM_IPA_STATUS) && buf)
+                                                ? (S23MODEM_IPA_STATUS *)buf : NULL);
+        if (outLen >= sizeof(S23MODEM_IPA_STATUS) && buf) {
+            info = sizeof(S23MODEM_IPA_STATUS);
+            status = STATUS_SUCCESS;
+        } else {
+            status = ok ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+        }
+        KeReleaseMutex(&g_GlinkLock, FALSE);
+    } else if (code == IOCTL_S23MODEM_IPA_TX_PKT) {
+        if (inLen < sizeof(S23MODEM_IPA_PKT) || !buf) {
+            status = STATUS_INVALID_PARAMETER;
+        } else {
+            const S23MODEM_IPA_PKT *pkt = (const S23MODEM_IPA_PKT *)buf;
+            KeWaitForSingleObject(&g_GlinkLock, Executive, KernelMode, FALSE, NULL);
+            BOOLEAN ok = IpaTransmitRawIpPacketLocked(pkt->Data, pkt->Length);
+            KeReleaseMutex(&g_GlinkLock, FALSE);
+            status = ok ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+        }
+    } else if (code == IOCTL_S23MODEM_IPA_RX_PKT) {
+        if (outLen < sizeof(S23MODEM_IPA_PKT) || !buf) {
+            status = STATUS_BUFFER_TOO_SMALL;
+        } else {
+            S23MODEM_IPA_PKT *pkt = (S23MODEM_IPA_PKT *)buf;
+            uint32_t rxLen = 0U;
+            KeWaitForSingleObject(&g_GlinkLock, Executive, KernelMode, FALSE, NULL);
+            BOOLEAN got = IpaReceiveRawIpPacketLocked(pkt->Data, sizeof(pkt->Data), &rxLen);
+            KeReleaseMutex(&g_GlinkLock, FALSE);
+            if (got) {
+                pkt->Length = rxLen;
+                info = sizeof(S23MODEM_IPA_PKT);
+                status = STATUS_SUCCESS;
+            } else {
+                pkt->Length = 0U;
+                status = STATUS_TIMEOUT;
+            }
+        }
     }
 
     Irp->IoStatus.Status = status;
@@ -1868,6 +2005,29 @@ static VOID S23ModemUnload(PDRIVER_OBJECT DriverObject) {
         g_DevObj = NULL;
     }
 
+    if (g_IpaCtx.GsiMmio) {
+        static const uint32_t chs[4] = { GSI_CH_AP_MODEM_RX, GSI_CH_AP_MODEM_TX, GSI_CH_AP_COMMAND_TX, GSI_CH_AP_LAN_RX };
+        for (ULONG c = 0; c < 4U; c++) {
+            uint32_t st = (Rd32(g_IpaCtx.GsiMmio, GSI_CH_CNTXT_0_OFF(chs[c])) >> 20) & 0xFU;
+            if (st == 2U) {
+                Wr32(g_IpaCtx.GsiMmio, GSI_CH_CMD_OFF, (0x2U << 24) | chs[c]);
+                SleepMs(2U);
+            }
+            if (st != 0U) {
+                Wr32(g_IpaCtx.GsiMmio, GSI_CH_CMD_OFF, (0x9U << 24) | chs[c]);
+                SleepMs(2U);
+            }
+        }
+    }
+    if (g_IpaCtx.DmaVa) {
+        MmFreeContiguousMemorySpecifyCache(g_IpaCtx.DmaVa, 0x20000U, MmNonCached);
+        g_IpaCtx.DmaVa = NULL;
+    }
+    UnmapIo(&g_IpaCtx.IpaMmio, SZ_IPA_MMIO);
+    UnmapIo(&g_IpaCtx.GsiMmio, SZ_GSI_MMIO);
+    for (uint32_t i = 0; i < 16U; i++) {
+        if (g_DefTx[i].Data) { ExFreePoolWithTag(g_DefTx[i].Data, S23_MDM_TAG); g_DefTx[i].Data = NULL; }
+    }
     UnmapIo(&g_mdmGlink.ipcc, SZ_IPCC);
     UnmapIo(&g_mdmGlink.smem, SZ_SMEM);
     if (g_mdmGlink.liid_pool) ExFreePoolWithTag(g_mdmGlink.liid_pool, S23_MDM_TAG);
