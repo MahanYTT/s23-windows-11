@@ -594,6 +594,12 @@ static void QueryAndSetDmsOnline(HANDLE hDev, const S23MODEM_STATUS_INFO *st, in
                 }
             }
         }
+    } else if (setOnline == 2 && curMode != 1U && curMode != 3U) {
+        uint8_t req[4] = { 0x01U, 0x01U, 0x00U, 0x01U }; /* TLV 0x01: mode = 1 (LOW_POWER) */
+        if (QmiTransaction(hDev, st, QMI_SVC_DMS, 0x002EU, req, sizeof(req), tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+            printf("  SET_OPERATING_MODE(LOW_POWER) -> res=%u err=0x%x\n", qRes, qErr);
+            Sleep(500);
+        }
     }
 }
 
@@ -726,6 +732,30 @@ static void QueryUimSlotsAndCards(HANDLE hDev, const S23MODEM_STATUS_INFO *st, u
             }
         }
     }
+}
+
+
+static int UnbindGwPri(HANDLE hDev, const S23MODEM_STATUS_INFO *st) {
+    printf("=== [QMI UIM 0x0B] UIM_CHANGE_PROVISIONING_SESSION (UNBIND GW_PRI) ===\n");
+    static const uint8_t usimAid[16] = {
+        0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02, 0xFF,
+        0x33, 0xFF, 0x01, 0x89, 0x06, 0x05, 0x00, 0xFF
+    };
+    uint8_t req[32];
+    uint32_t rpos = 0U;
+    /* TLV 0x01: session_change (session_type=0 GW_PRI, activate=0) */
+    req[rpos++] = 0x01U; req[rpos++] = 2U; req[rpos++] = 0U;
+    req[rpos++] = 0x00U; req[rpos++] = 0x00U;
+    /* TLV 0x10: app_info (slot=2, aidLen=16, aid[]) */
+    req[rpos++] = 0x10U; req[rpos++] = (uint8_t)(2U + 16U); req[rpos++] = 0U;
+    req[rpos++] = 0x02U; req[rpos++] = 16U;
+    memcpy(req + rpos, usimAid, 16U); rpos += 16U;
+    uint8_t tlvs[512]; uint16_t tlvLen = 0, qRes = 0, qErr = 0;
+    if (QmiTransaction(hDev, st, QMI_SVC_UIM, 0x0038U, req, (uint16_t)rpos, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+        printf("  [UIM 0x0038 CHANGE_PROVISIONING_SESSION(GW_PRI, deactivate)] res=%u err=0x%x\n", qRes, qErr);
+        return (qRes == 0U);
+    }
+    return 0;
 }
 
 static int SwitchUimSlot(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t logicalSlot, uint32_t physicalSlot) {
@@ -943,11 +973,10 @@ static int EsimDeleteProfile(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_
     uint8_t cmd[32];
     uint32_t pos = 0;
     cmd[pos++] = EsimPropCla(channelId); cmd[pos++] = 0xE2U; cmd[pos++] = 0x91U; cmd[pos++] = 0x00U;
-    cmd[pos++] = 15U; /* Lc */
+    cmd[pos++] = 14U; /* Lc */
     cmd[pos++] = 0xBFU; cmd[pos++] = 0x33U; cmd[pos++] = 12U;
     cmd[pos++] = 0x5AU; cmd[pos++] = 10U;
     memcpy(cmd + pos, iccidBcd, 10U); pos += 10U;
-    cmd[pos++] = 0x00U; /* Le */
 
     uint8_t rsp[512]; uint32_t rspLen = 0;
     if (UimTransceiveApdu(hDev, st, slot, channelId, cmd, (uint16_t)pos, rsp, sizeof(rsp), &rspLen) && rspLen >= 2U) {
@@ -960,6 +989,26 @@ static int EsimDeleteProfile(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_
 }
 
 /* Parse BER-TLV tag and length */
+
+static int EsimEuiccMemoryReset(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t slot, uint8_t channelId) {
+    uint8_t cmd[32];
+    uint32_t pos = 0;
+    cmd[pos++] = EsimPropCla(channelId); cmd[pos++] = 0xE2U; cmd[pos++] = 0x91U; cmd[pos++] = 0x00U;
+    cmd[pos++] = 0x06U; /* Lc */
+    cmd[pos++] = 0xBFU; cmd[pos++] = 0x34U; cmd[pos++] = 0x03U;
+    cmd[pos++] = 0x82U; cmd[pos++] = 0x01U; cmd[pos++] = 0x02U; /* resetOptions: 2 = delete all profiles */
+    cmd[pos++] = 0x00U; /* Le */
+
+    uint8_t rsp[512]; uint32_t rspLen = 0;
+    if (UimTransceiveApdu(hDev, st, slot, channelId, cmd, (uint16_t)pos, rsp, sizeof(rsp), &rspLen) && rspLen >= 2U) {
+        uint8_t sw1 = rsp[rspLen - 2U], sw2 = rsp[rspLen - 1U];
+        printf("  [eSIM EUICC Memory Reset] -> rspLen=%u SW=%02X%02X\n", rspLen, sw1, sw2);
+        return (sw1 == 0x90U && sw2 == 0x00U);
+    }
+    printf("  [eSIM EUICC Memory Reset] -> Failed (timeout/error)\n");
+    return 0;
+}
+
 static int ReadBerTlv(const uint8_t *buf, uint32_t len, uint32_t *ioPos,
                       uint32_t *outTag, const uint8_t **outVal, uint32_t *outValLen) {
     uint32_t p = *ioPos;
@@ -1011,7 +1060,14 @@ static void QueryEsimEuiccViaApdu(HANDLE hDev, const S23MODEM_STATUS_INFO *st, u
     /* Execute requested CLI actions before reading the final state */
     if (enableIccid) EsimEnableProfile(hDev, st, slot, chId, enableIccid);
     if (disableIccid) EsimDisableProfile(hDev, st, slot, chId, disableIccid);
-    if (deleteIccid) EsimDeleteProfile(hDev, st, slot, chId, deleteIccid);
+    if (deleteIccid) {
+        if (strcmp(deleteIccid, "reset") == 0) {
+            EsimEuiccMemoryReset(hDev, st, slot, chId);
+        } else {
+            /* Fallback APDU: ES10c DeleteProfileRequest */
+            EsimDeleteProfile(hDev, st, slot, chId, deleteIccid);
+        }
+    }
 
     /* 1. ES10c GetEID: <CLA> E2 91 00 06 BF 3E 03 5C 01 5A 00 */
     uint8_t cmdGetEid[12] = { EsimPropCla(chId), 0xE2U, 0x91U, 0x00U, 0x06U, 0xBFU, 0x3EU, 0x03U, 0x5CU, 0x01U, 0x5AU, 0x00U };
@@ -1703,6 +1759,10 @@ int main(int argc, char **argv) {
     UimGetAtr(hDev, &st, 2U);
 
     uint8_t targetEsimSlot = (euiccLogSlot != 0U) ? euiccLogSlot : 2U;
+    UnbindGwPri(hDev, &st);
+    Sleep(500);
+    QueryAndSetDmsOnline(hDev, &st, 2);
+    Sleep(2000);
     QueryEsimEuiccViaApdu(hDev, &st, targetEsimSlot, enableIccid, disableIccid, deleteIccid);
 
     QueryNasAndWds(hDev, &st);
