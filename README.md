@@ -324,7 +324,7 @@ Proprietary Samsung/Qualcomm firmware, partition images, logs and all compiled b
 
 ## Star History
 
-<a href="https://star-history.com/#MahanYTT/s23-windows-11&Date">
+<a href="https://www.star-history.com/?repos=MahanYTT%2Fs23-windows-11&type=date&legend=top-left">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=MahanYTT/s23-windows-11&type=Date&theme=dark" />
     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=MahanYTT/s23-windows-11&type=Date" />
