@@ -473,6 +473,7 @@ static __declspec(noinline) BOOLEAN GsiAllocAndStartChannel(uint32_t chId, uint3
     }
 
     c0 = Rd32(gsi, GSI_CH_CNTXT_0_OFF(chId));
+    LogFmt("[GSI] CH[%u] ALLOC c0=0x%08x\r\n", chId, c0);
     if (((c0 >> 20) & 0xFU) != 1U) {
         LogFmt("[GSI] CH[%u] ALLOC failed cntxt0=0x%08x\r\n", chId, c0);
         return FALSE;
@@ -513,8 +514,20 @@ static __declspec(noinline) BOOLEAN GsiAllocAndStartChannel(uint32_t chId, uint3
     return TRUE;
 }
 
+static __declspec(noinline) VOID GsiReplenishEventRing(uint32_t evId, uint64_t ringPa, uint32_t ringLen) {
+    if (!g_IpaCtx.GsiMmio || ringLen < 32U) return;
+    volatile uint8_t *gsi = g_IpaCtx.GsiMmio;
+    uint32_t ringBaseLsb = (uint32_t)(ringPa & 0xFFFFFFFFULL);
+    uint32_t evRpLsb     = Rd32(gsi, GSI_EV_CNTXT_4_OFF(evId));
+    if (evRpLsb >= ringBaseLsb && evRpLsb < ringBaseLsb + ringLen) {
+        uint32_t rel = ((evRpLsb - ringBaseLsb) + ringLen - 16U) % ringLen;
+        Wr32(gsi, GSI_EV_DOORBELL_0_OFF(evId), ringBaseLsb + rel);
+    }
+}
+
 static __declspec(noinline) BOOLEAN IpaSubmitImmCmd(uint16_t opcode, const void *cmdPay, uint32_t cmdLen) {
     if (!g_IpaCtx.DmaVa || !g_IpaCtx.GsiMmio || cmdLen > 64U) return FALSE;
+    GsiReplenishEventRing(GSI_EV_TX_SHARED, g_IpaCtx.DmaPa + 0x0000ULL, 1024U);
     uint8_t *cmdSlotVa  = g_IpaCtx.DmaVa + 0x7000U;
     uint64_t cmdSlotPa  = g_IpaCtx.DmaPa + 0x7000ULL;
     GSI_TRE *ch12RingVa = (GSI_TRE *)(g_IpaCtx.DmaVa + 0x3000U);
@@ -544,10 +557,12 @@ static __declspec(noinline) BOOLEAN IpaSubmitImmCmd(uint16_t opcode, const void 
         uint32_t rpLsb = Rd32(g_IpaCtx.GsiMmio, GSI_CH_CNTXT_4_OFF(GSI_CH_AP_COMMAND_TX));
         if (rpLsb == (uint32_t)(newWpPa & 0xFFFFFFFFULL)) {
             Wr32(g_IpaCtx.GsiMmio, GSI_SRC_IEOB_IRQ_CLR_OFF, (1U << GSI_EV_TX_SHARED));
+            GsiReplenishEventRing(GSI_EV_TX_SHARED, g_IpaCtx.DmaPa + 0x0000ULL, 1024U);
             return TRUE;
         }
         KeStallExecutionProcessor(100U);
     }
+    GsiReplenishEventRing(GSI_EV_TX_SHARED, g_IpaCtx.DmaPa + 0x0000ULL, 1024U);
     LogFmt("[IPA-CMD] ImmCmd op=%u timeout (rp=0x%x want=0x%x err=0x%x)\r\n",
            opcode,
            Rd32(g_IpaCtx.GsiMmio, GSI_CH_CNTXT_4_OFF(GSI_CH_AP_COMMAND_TX)),
@@ -655,10 +670,7 @@ static __declspec(noinline) VOID SendQmiIpaInitModemDriverReq(MDM_GLINK_CTX *g) 
         req[p++] = 179U;
     }
 
-    ADD_TLV_2U32(0x24U, 0U, SZ_SMEM_IPA_FILTER_TBL);            /* smem_info { 0, 0xB000 } */
-    if (g_IpaCtx.St.Smem497Pa != 0U) {
-        ADD_TLV_2U32(0x25U, g_IpaCtx.St.Smem497Pa, 0x0800U);    /* per_stats_smem_info { pa, 2048 } */
-    }
+    ADD_TLV_2U32(0x24U, 0U, SZ_SMEM_IPA_FILTER_TBL);            /* smem_info { offset=0, size=0xB000 } */
 
     #undef ADD_TLV_U32
     #undef ADD_TLV_2U32
@@ -787,6 +799,16 @@ static __declspec(noinline) VOID HandleIpaA5Qmi(MDM_GLINK_CTX *g, uint32_t srcNo
     } else if (msgId == 0x0035U) {
         /* QMI_IPA_INIT_MODEM_DRIVER_CMPLT_REQ_V01 */
         g_IpaCtx.St.QmiIpaModemCompleteRx = 1U;
+    } else if (msgId == 0x0027U) {
+        /* QMI_IPA_CONFIG_REQ_V01: log TLVs for diagnostics */
+        uint32_t off = 0U;
+        while (off + 3U <= tlvLen) {
+            uint8_t t = tlvs[off]; uint16_t ln = Le16(tlvs + off + 1U); off += 3U;
+            if (off + ln > tlvLen) break;
+            uint32_t v0 = (ln >= 4U) ? Le32(tlvs + off) : (ln >= 1U ? tlvs[off] : 0U);
+            LogFmt("[QMI-IPA] 0x0027 TLV 0x%02x len=%u v0=0x%x\r\n", t, ln, v0);
+            off += ln;
+        }
     } else if (msgId == 0x0023U) {
         /* QMI_IPA_INSTALL_FILTER_RULE_REQ_V01: extract rule_ids from TLV 0x15 or 0x16 (each spec 173B, rule_id @ +168) */
         g_IpaCtx.St.QmiIpaFilterRuleRx++;
@@ -833,10 +855,16 @@ static __declspec(noinline) VOID HandleIpaA5Qmi(MDM_GLINK_CTX *g, uint32_t srcNo
 
 static __declspec(noinline) BOOLEAN IpaStageM3b_CoreGsiAndImmCmds(VOID) {
     if (!g_IpaCtx.St.IpaFwLoaded || !g_IpaCtx.IpaMmio || !g_IpaCtx.GsiMmio) return FALSE;
+    if (g_IpaCtx.St.CmdChStarted && g_IpaCtx.St.LanRxChStarted &&
+        g_IpaCtx.St.WanTxChStarted && g_IpaCtx.St.WanRxChStarted &&
+        g_IpaCtx.St.QmiIpaModemCompleteRx) {
+        return TRUE;
+    }
     volatile uint8_t *ipa = g_IpaCtx.IpaMmio;
     volatile uint8_t *gsi = g_IpaCtx.GsiMmio;
 
     /* 1. IPA v5.5 Core HW Init (ipa3_init_hw & ipa3_set_resorce_groups_min_max_limits) */
+    if (!g_IpaCtx.St.CmdChStarted) {
     Wr32(ipa, IPA_QSB_MAX_WRITES_OFF,      0x0000008CU);
     Wr32(ipa, IPA_QSB_MAX_READS_OFF,       0x00000000U);
     Wr32(ipa, IPA_QTIME_TIMESTAMP_CFG_OFF, 0x00180E00U);
@@ -897,6 +925,7 @@ static __declspec(noinline) BOOLEAN IpaStageM3b_CoreGsiAndImmCmds(VOID) {
     Wr32(gsi, GSI_MSI_BASE_MSB_OFF,       0U);
     Wr32(gsi, GSI_ERROR_LOG_OFF,          0U);
     Wr32(gsi, GSI_ERROR_LOG_CLR_OFF,      0xFFFFFFFFU);
+    }
 
     /* 3. Allocate 128 KiB Contiguous DMA Memory for Rings & Packet Buffers */
     if (!g_IpaCtx.DmaVa) {
@@ -908,10 +937,10 @@ static __declspec(noinline) BOOLEAN IpaStageM3b_CoreGsiAndImmCmds(VOID) {
     }
 
     if (!g_IpaCtx.St.CmdChStarted) {
-        /* 4. Allocate Event Rings 0 (TX shared), 1 (LAN RX), 2 (WAN RX) */
-        if (!GsiAllocEventRing(GSI_EV_TX_SHARED, g_IpaCtx.DmaPa + 0x0000ULL, 256U) ||
-            !GsiAllocEventRing(GSI_EV_LAN_RX,    g_IpaCtx.DmaPa + 0x1000ULL, 256U) ||
-            !GsiAllocEventRing(GSI_EV_WAN_RX,    g_IpaCtx.DmaPa + 0x2000ULL, 256U)) {
+        /* 4. Allocate Event Rings 0 (TX shared), 1 (LAN RX), 2 (WAN RX) - 64 slots (1024B) each */
+        if (!GsiAllocEventRing(GSI_EV_TX_SHARED, g_IpaCtx.DmaPa + 0x0000ULL, 1024U) ||
+            !GsiAllocEventRing(GSI_EV_LAN_RX,    g_IpaCtx.DmaPa + 0x1000ULL, 1024U) ||
+            !GsiAllocEventRing(GSI_EV_WAN_RX,    g_IpaCtx.DmaPa + 0x2000ULL, 1024U)) {
             return FALSE;
         }
 
@@ -1046,8 +1075,8 @@ static __declspec(noinline) BOOLEAN IpaStageM3b_CoreGsiAndImmCmds(VOID) {
             GSI_TRE *lanRingVa = (GSI_TRE *)(g_IpaCtx.DmaVa + 0x4000U);
             uint64_t lanRingPa = g_IpaCtx.DmaPa + 0x4000ULL;
             for (uint32_t i = 0; i < 15U; i++) {
-                lanRingVa[i].BufferPtr = g_IpaCtx.DmaPa + 0x10000ULL + (uint64_t)i * 1024ULL;
-                lanRingVa[i].BufLen    = 1024U;
+                lanRingVa[i].BufferPtr = g_IpaCtx.DmaPa + 0x18000ULL + (uint64_t)i * 2048ULL;
+                lanRingVa[i].BufLen    = 2048U;
                 lanRingVa[i].Reserved1 = 0U;
                 lanRingVa[i].Flags     = (1U << 8); /* IEOB */
                 lanRingVa[i].ReType    = 0x02U;     /* GSI_RE_XFER */
@@ -1061,9 +1090,11 @@ static __declspec(noinline) BOOLEAN IpaStageM3b_CoreGsiAndImmCmds(VOID) {
     }
 
     /* 9. Stage M3c: Configure & Start AP_MODEM_RX (EP 24 / GSI Ch 1) and AP_MODEM_TX (EP 2 / GSI Ch 11) */
-    /* Route all exception/default packets to AP_LAN_RX (EP 17) with header retained (bit 27) */
-    Wr32(ipa, IPA_ROUTE_OFF, IPA_EP_AP_LAN_RX | (IPA_EP_AP_LAN_RX << 8) | (1U << 27));
-    g_IpaCtx.St.IpaRoute = Rd32(ipa, IPA_ROUTE_OFF);
+    if (!g_IpaCtx.St.WanRxChStarted && !g_IpaCtx.St.WanTxChStarted) {
+        /* Route all exception/default packets to AP_LAN_RX (EP 17) with header retained (bit 27) */
+        Wr32(ipa, IPA_ROUTE_OFF, IPA_EP_AP_LAN_RX | (IPA_EP_AP_LAN_RX << 8) | (1U << 27));
+        g_IpaCtx.St.IpaRoute = Rd32(ipa, IPA_ROUTE_OFF);
+    }
 
     if (!g_IpaCtx.St.WanRxChStarted) {
         Wr32(ipa, IPA_ENDP_INIT_CTRL_OFF(IPA_EP_AP_MODEM_RX),     0x00000000U);
@@ -1083,8 +1114,8 @@ static __declspec(noinline) BOOLEAN IpaStageM3b_CoreGsiAndImmCmds(VOID) {
             GSI_TRE *rxRingVa = (GSI_TRE *)(g_IpaCtx.DmaVa + 0x6000U);
             uint64_t rxRingPa = g_IpaCtx.DmaPa + 0x6000ULL;
             for (uint32_t i = 0; i < 15U; i++) {
-                rxRingVa[i].BufferPtr = g_IpaCtx.DmaPa + 0xC000ULL + (uint64_t)i * 1024ULL;
-                rxRingVa[i].BufLen    = 1024U;
+                rxRingVa[i].BufferPtr = g_IpaCtx.DmaPa + 0x10000ULL + (uint64_t)i * 2048ULL;
+                rxRingVa[i].BufLen    = 2048U;
                 rxRingVa[i].Reserved1 = 0U;
                 rxRingVa[i].Flags     = (1U << 8); /* IEOB */
                 rxRingVa[i].ReType    = 0x02U;     /* GSI_RE_XFER */
@@ -1159,14 +1190,36 @@ static __declspec(noinline) BOOLEAN IpaEnsureInitializedLocked(S23MODEM_IPA_STAT
 }
 
 static __declspec(noinline) BOOLEAN IpaTransmitRawIpPacketLocked(const uint8_t *ipPkt, uint32_t ipLen) {
-    if (!ipPkt || ipLen == 0U || ipLen > 1000U) return FALSE;
+    if (!ipPkt || ipLen == 0U || ipLen > 1900U) return FALSE;
     if (!g_IpaCtx.St.WanTxChStarted && !IpaEnsureInitializedLocked(NULL)) return FALSE;
 
-    uint32_t idx = g_IpaCtx.WanTxWpIdx % 16U;
-    uint8_t *txBufVa  = g_IpaCtx.DmaVa + 0x8000U + idx * 1024U;
-    uint64_t txBufPa  = g_IpaCtx.DmaPa + 0x8000ULL + (uint64_t)idx * 1024ULL;
+    GsiReplenishEventRing(GSI_EV_TX_SHARED, g_IpaCtx.DmaPa + 0x0000ULL, 1024U);
+
+    uint32_t idx     = g_IpaCtx.WanTxWpIdx % 16U;
+    uint32_t nextIdx = (idx + 1U) % 16U;
     GSI_TRE *txRingVa = (GSI_TRE *)(g_IpaCtx.DmaVa + 0x5000U);
     uint64_t txRingPa = g_IpaCtx.DmaPa + 0x5000ULL;
+    uint32_t ringBaseLsb = (uint32_t)(txRingPa & 0xFFFFFFFFULL);
+
+    BOOLEAN hasSlot = FALSE;
+    for (ULONG w = 0; w < 50U; w++) {
+        uint32_t hwRpLsb = Rd32(g_IpaCtx.GsiMmio, GSI_CH_CNTXT_4_OFF(GSI_CH_AP_MODEM_TX));
+        uint32_t hwRpIdx = (hwRpLsb >= ringBaseLsb && hwRpLsb < ringBaseLsb + 256U)
+                               ? ((hwRpLsb - ringBaseLsb) / (uint32_t)sizeof(GSI_TRE))
+                               : nextIdx;
+        if (nextIdx != hwRpIdx) { hasSlot = TRUE; break; }
+        GsiReplenishEventRing(GSI_EV_TX_SHARED, g_IpaCtx.DmaPa + 0x0000ULL, 1024U);
+        KeStallExecutionProcessor(100U);
+    }
+    if (!hasSlot) {
+        LogFmt("[IPA-TX] Ring full wp=%u rp=0x%x err=0x%x\r\n",
+               idx, Rd32(g_IpaCtx.GsiMmio, GSI_CH_CNTXT_4_OFF(GSI_CH_AP_MODEM_TX)),
+               Rd32(g_IpaCtx.GsiMmio, GSI_ERROR_LOG_OFF));
+        return FALSE;
+    }
+
+    uint8_t *txBufVa  = g_IpaCtx.DmaVa + 0x8000U + idx * 2048U;
+    uint64_t txBufPa  = g_IpaCtx.DmaPa + 0x8000ULL + (uint64_t)idx * 2048ULL;
 
     /* Prepend 4-byte QMAP header (pad_len, mux_id = 1, be16 payload_len) padded to 4-byte boundary */
     uint32_t pad = (4U - (ipLen & 3U)) & 3U;
@@ -1189,9 +1242,10 @@ static __declspec(noinline) BOOLEAN IpaTransmitRawIpPacketLocked(const uint8_t *
     tre->Reserved2 = 0U;
     __dmb(_ARM64_BARRIER_SY);
 
-    g_IpaCtx.WanTxWpIdx = (idx + 1U) % 16U;
+    g_IpaCtx.WanTxWpIdx = nextIdx;
     uint64_t newWpPa = txRingPa + (uint64_t)g_IpaCtx.WanTxWpIdx * sizeof(GSI_TRE);
     Wr32(g_IpaCtx.GsiMmio, GSI_CH_DOORBELL_0_OFF(GSI_CH_AP_MODEM_TX), (uint32_t)(newWpPa & 0xFFFFFFFFULL));
+    GsiReplenishEventRing(GSI_EV_TX_SHARED, g_IpaCtx.DmaPa + 0x0000ULL, 1024U);
     g_IpaCtx.St.TxPackets++;
     return TRUE;
 }
@@ -1199,6 +1253,9 @@ static __declspec(noinline) BOOLEAN IpaTransmitRawIpPacketLocked(const uint8_t *
 static __declspec(noinline) BOOLEAN IpaReceiveRawIpPacketLocked(uint8_t *outBuf, uint32_t outCap, uint32_t *outLen) {
     if (outLen) *outLen = 0U;
     if (!g_IpaCtx.St.WanRxChStarted || !g_IpaCtx.GsiMmio || !g_IpaCtx.DmaVa) return FALSE;
+
+    GsiReplenishEventRing(GSI_EV_WAN_RX, g_IpaCtx.DmaPa + 0x2000ULL, 1024U);
+    GsiReplenishEventRing(GSI_EV_LAN_RX, g_IpaCtx.DmaPa + 0x1000ULL, 1024U);
 
     uint64_t rxRingPa = g_IpaCtx.DmaPa + 0x6000ULL;
     uint32_t hwRpLsb  = Rd32(g_IpaCtx.GsiMmio, GSI_CH_CNTXT_4_OFF(GSI_CH_AP_MODEM_RX));
@@ -1209,30 +1266,30 @@ static __declspec(noinline) BOOLEAN IpaReceiveRawIpPacketLocked(uint8_t *outBuf,
     if (g_IpaCtx.WanRxRpIdx == hwRpIdx) return FALSE;
 
     uint32_t idx = g_IpaCtx.WanRxRpIdx % 16U;
-    const uint8_t *rxBufVa = g_IpaCtx.DmaVa + 0xC000U + idx * 1024U;
+    const uint8_t *rxBufVa = g_IpaCtx.DmaVa + 0x10000U + idx * 2048U;
     __dmb(_ARM64_BARRIER_LD);
 
-    /* Detect raw IPv4 (IHL>=5, 0x45..0x4F) vs raw IPv6 (0x6x) vs 4B QMAP (0x00..0x03) vs 8B QMAPv5 (0x40..0x43) */
+    /* Detect 4B/8B QMAP vs raw IPv4/IPv6 cleanly */
     uint32_t ipOff = 0U, ipLen = 0U;
-    if ((rxBufVa[0] & 0xF0U) == 0x40U && (rxBufVa[0] & 0x0FU) >= 5U && (rxBufVa[2] || rxBufVa[3])) {
+    if ((rxBufVa[0] & 0x80U) == 0U && (rxBufVa[0] & 0x3FU) <= 3U && rxBufVa[1] == 1U) {
+        /* QMAP header: byte 0 = [C/D(7) | NextHdr(6) | Pad(5:0)], byte 1 = mux_id, bytes 2..3 = BE16 pkt_len */
+        uint32_t pad = rxBufVa[0] & 0x3FU;
+        uint32_t qLen = ((uint32_t)rxBufVa[2] << 8) | (uint32_t)rxBufVa[3];
+        uint32_t hdrSz = ((rxBufVa[0] & 0x40U) != 0U) ? 8U : 4U;
+        if (qLen > pad && hdrSz + qLen <= 2048U) {
+            ipOff = hdrSz;
+            ipLen = qLen - pad;
+        }
+    } else if ((rxBufVa[0] & 0xF0U) == 0x40U && (rxBufVa[0] & 0x0FU) >= 5U && (rxBufVa[2] || rxBufVa[3])) {
         ipOff = 0U;
         ipLen = ((uint32_t)rxBufVa[2] << 8) | (uint32_t)rxBufVa[3];
     } else if ((rxBufVa[0] & 0xF0U) == 0x60U) {
         ipOff = 0U;
         ipLen = 40U + (((uint32_t)rxBufVa[4] << 8) | (uint32_t)rxBufVa[5]);
-    } else {
-        /* QMAP header: byte 0 = [C/D(7) | NextHdr(6) | Pad(5:0)], byte 1 = mux_id, bytes 2..3 = BE16 pkt_len */
-        uint32_t pad = rxBufVa[0] & 0x3FU;
-        uint32_t qLen = ((uint32_t)rxBufVa[2] << 8) | (uint32_t)rxBufVa[3];
-        uint32_t hdrSz = ((rxBufVa[0] & 0x40U) != 0U) ? 8U : 4U;
-        if (qLen > pad && hdrSz + qLen <= 1024U) {
-            ipOff = hdrSz;
-            ipLen = qLen - pad;
-        }
     }
 
     BOOLEAN copied = FALSE;
-    if (ipLen >= 20U && ipOff + ipLen <= 1024U && ipLen <= outCap) {
+    if (ipLen >= 20U && ipOff + ipLen <= 2048U && ipLen <= outCap) {
         RtlCopyMemory(outBuf, rxBufVa + ipOff, ipLen);
         if (outLen) *outLen = ipLen;
         g_IpaCtx.St.RxPackets++;
@@ -1242,8 +1299,8 @@ static __declspec(noinline) BOOLEAN IpaReceiveRawIpPacketLocked(uint8_t *outBuf,
     /* Replenish RX TRE and advance ring doorbell */
     GSI_TRE *rxRingVa = (GSI_TRE *)(g_IpaCtx.DmaVa + 0x6000U);
     uint32_t wpIdx = g_IpaCtx.WanRxWpIdx % 16U;
-    rxRingVa[wpIdx].BufferPtr = g_IpaCtx.DmaPa + 0xC000ULL + (uint64_t)wpIdx * 1024ULL;
-    rxRingVa[wpIdx].BufLen    = 1024U;
+    rxRingVa[wpIdx].BufferPtr = g_IpaCtx.DmaPa + 0x10000ULL + (uint64_t)wpIdx * 2048ULL;
+    rxRingVa[wpIdx].BufLen    = 2048U;
     rxRingVa[wpIdx].Reserved1 = 0U;
     rxRingVa[wpIdx].Flags     = (1U << 8);
     rxRingVa[wpIdx].ReType    = 0x02U;
@@ -1254,5 +1311,6 @@ static __declspec(noinline) BOOLEAN IpaReceiveRawIpPacketLocked(uint8_t *outBuf,
     g_IpaCtx.WanRxWpIdx = (wpIdx + 1U) % 16U;
     uint64_t newWpPa = rxRingPa + (uint64_t)g_IpaCtx.WanRxWpIdx * sizeof(GSI_TRE);
     Wr32(g_IpaCtx.GsiMmio, GSI_CH_DOORBELL_0_OFF(GSI_CH_AP_MODEM_RX), (uint32_t)(newWpPa & 0xFFFFFFFFULL));
+    GsiReplenishEventRing(GSI_EV_WAN_RX, g_IpaCtx.DmaPa + 0x2000ULL, 1024U);
     return copied;
 }

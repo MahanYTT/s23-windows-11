@@ -18,8 +18,8 @@ This repository contains the ARM64 kernel drivers, UEFI DXE patches, ACPI SSDTs,
 
 ## Status
 
-**Demonstrated:** native Windows 11 Pro 24H2 ARM64 (`10.0.26100`) on UFS, 120 Hz AMOLED display with native brightness & Night Light, experimental Adreno 740 WDDM 2.0 acceleration (Mesa Freedreno D3D11 + OpenGL 4.6), multitouch, volume keys, Wi-Fi 6E with internet, Bluetooth 5.3 + BLE, stereo ADSP AudioReach + dual CS35L43 audio, MAX77705 battery reporting and wired fast charging, and WinUSB PC link.  
-**Still unfinished:** 5G cellular / eSIM (`Snapdragon X70`), native USB-C dual-role Host/OTG + PD 3.0 + DP Alt-Mode, power-button sleep/wake and system suspend/resume (S0ix), haptics (`CS40L26A`), motion/light/proximity sensors, cameras, GNSS, NFC, TPM/Secure Boot, and a portable public installer/UEFI workflow.
+**Demonstrated:** native Windows 11 Pro 24H2 ARM64 (`10.0.26100`) on UFS, 120 Hz AMOLED display with native brightness & Night Light, experimental Adreno 740 WDDM 2.0 acceleration (Mesa Freedreno D3D11 + OpenGL 4.6), multitouch, volume keys, Wi-Fi 6E with internet, 5G/LTE cellular data & native eSIM provisioning (`Snapdragon X70` + `IPA v5.5`), Bluetooth 5.3 + BLE, stereo ADSP AudioReach + dual CS35L43 audio, MAX77705 battery reporting and wired fast charging, and WinUSB PC link.  
+**Still unfinished:** cellular voice/SMS/IPv6 dual-stack & 5G NR tuning, native USB-C dual-role Host/OTG + PD 3.0 + DP Alt-Mode, power-button sleep/wake and system suspend/resume (S0ix), haptics (`CS40L26A`), motion/light/proximity sensors, cameras, GNSS, NFC, TPM/Secure Boot, and a portable public installer/UEFI workflow.
 
 | Area | Status | Notes |
 |---|---|---|
@@ -37,7 +37,7 @@ This repository contains the ARM64 kernel drivers, UEFI DXE patches, ACPI SSDTs,
 | Battery reporting | **WORKS ✅** | Maxim `MAX77705` fuel gauge (`@0x36`) Windows battery miniclass driver (`battc.sys`, [`drivers/s23batt/`](drivers/s23batt/)): validated percentage, voltage, current rate and calibrated battery temperature. |
 | Charging | **WORKS ✅** | Maxim `MAX77705` charger (`@0x69`, [`drivers/s23batt/`](drivers/s23batt/)): 3.0 A input limit, 2.5 A CC wired fast charge, 4.4 V float, watchdog handling and abnormal-off recovery. Dynamic USB-PD/PPS (`PCA9481`) & wireless charging (`S2MIW04`) not yet wired. |
 | USB-C / PC link | **PARTIAL 🟡** | WinUSB remote shell & file transfer works ([`s23link.py`](s23link.py)); native USB-C architecture & host-tested MAX77705 OPCODE / PD 3.0 codec ready ([`usb_research/`](usb_research/)). Shared `SE8` PMIC arbiter, Host/OTG (`s23urs.sys`), USB-PD (`UcmCx`) & DP Alt-Mode not yet implemented. |
-| 5G cellular / eSIM | **PARTIAL 🟡** | Native Snapdragon X70 MPSS split-ELF boot (`modem_dtb` PAS 38 + `modem` PAS 4), RAM-sandboxed `rmtfs`/`pd-mapper`/`tqftpserv`, GLink `"IPCRTR"`, NXP SN220 eUICC power-on + `eSIM mode(2,3)` slot routing, native Windows 11 `MBBCx 1.0 + NetAdapterCx 2.0 + MBIMEx 3.0` miniport (`s23mbb.sys` + `WwanSvc` + `wlpasvc` with live SGP.22 ES10c APDUs), and SM8550 IPA v5.5 + GSI v5.5 + QMI `IPA (0x31)` data engine verified with hardware DMA loopback ([`drivers/s23modem/`](drivers/s23modem/), [`drivers/s23mbb/`](drivers/s23mbb/)). Live on-air SIM registration & internet ping pending active SIM/eSIM profile connect test. |
+| 5G cellular / eSIM | **WORKS ✅** | Live on-air cellular internet & native Windows 11 eSIM provisioning (`Snapdragon X70` MPSS split-ELF PAS boot, RAM-sandboxed `rmtfs`/`pd-mapper`/`tqftpserv`, GLink `"IPCRTR"`, NXP SN220 eUICC `eSIM mode(2,3)` + SGP.22 ES10c `lpa:` onboarding, `s23mbb.sys` `MBBCx 1.0 + NetAdapterCx 2.0 + MBIMEx 3.0` with `GW_PRIMARY` provisioning & QMI `DPM`/`WDA`/`WDS`, and SM8550 IPA v5.5 + GSI v5.5 `2048 B` QMAP datapath, [`drivers/s23modem/`](drivers/s23modem/), [`drivers/s23mbb/`](drivers/s23mbb/)). Cold-boot auto-registration, IPv4/DNS, ping, and HTTPS verified live; voice/SMS & IPv6 dual-stack pending. |
 | Power management | **PARTIAL 🟡** | Working awake profile for daily development and testing; system suspend/resume (Modern Standby / S0ix), display sleep-wake, and idle RPMh/thermal policies are not finished. |
 | Haptics | **IN PROGRESS 🛠️** | Cirrus Logic `CS40L26A` verified on live I2C (`QUPv3_I2C_HUB SE3 @0x40`, Device ID `0x0040A260`, [`drivers/s23sensprobe/`](drivers/s23sensprobe/), [`audio_sensors_research/`](audio_sensors_research/)). Firmware load and Windows waveform driver not yet built. |
 | Motion / light / proximity sensors | **NOT WORKING ❌** | SSC bus / Windows sensor class integration not implemented yet. |
@@ -161,14 +161,14 @@ Driver versions are tracked in each driver's `.inf` (`DriverVer`) and in the com
 - [ ] Dynamic Dual-Role Host/OTG (`s23urs.sys`, external USB peripherals/hubs).
 - [ ] Native USB-PD 3.0 (`s23usbc.sys` `UcmCx`) & 4K60 DisplayPort Alt-Mode.
 
-### 5G cellular / eSIM — 5/6 complete
+### 5G cellular / eSIM — 6/6 complete
 
 - [x] Stock MPSS / `modem_dtb` / IPA v5.5 firmware ground-truth verified ([`modem_5g_research/FIRMWARE_GROUND_TRUTH.md`](modem_5g_research/FIRMWARE_GROUND_TRUTH.md)).
 - [x] Architecture blueprint, inert SSDTs & host-tested QMI/QMUX TLV codec ([`modem_5g_research/qmi_codec.py`](modem_5g_research/qmi_codec.py)).
 - [x] MPSS split-ELF PAS boot (`PAS 0x26` + `PAS 4`) & QRTR service discovery (`s23modem_xprt.sys` + `s23modemd.exe`).
 - [x] RAM-sandboxed `rmtfs` + physical SIM1 & embedded NXP SN220 eUICC (`eSIM mode(2,3)` + SGP.22 ES10c) via QMI `UIM`.
-- [x] Native Windows 11 Cellular & eSIM UI (`s23mbb.sys`: `MBBCx 1.0 + NetAdapterCx 2.0 + MBIMEx 3.0` + `WwanSvc` + `wlpasvc`) & SM8550 IPA v5.5 / GSI v5.5 (`PAS 15` + `apps-smmu` SID `0x4A0`/`0x4A2` + QMI `0x31` handshake + hardware DMA loopback).
-- [ ] Live on-air 5G/LTE packet data verification with an enabled SIM/eSIM profile.
+- [x] Native Windows 11 Cellular & eSIM UI (`s23mbb.sys`: `MBBCx 1.0 + NetAdapterCx 2.0 + MBIMEx 3.0` + `WwanSvc` + `wlpasvc`) & SM8550 IPA v5.5 / GSI v5.5 (`PAS 15` + `apps-smmu` SID `0x4A0`/`0x4A2` + QMI `0x31`/`0x2F` handshake).
+- [x] Live on-air eSIM download, cold-boot `GW_PRIMARY` registration, QMI `DPM`/`WDA`/`WDS` data call, full-MTU ping, DNS, and HTTPS verified over cellular.
 
 ### Power management — 1/5 complete
 

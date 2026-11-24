@@ -32,6 +32,7 @@
 #define QMI_SVC_WMS                 0x05U
 #define QMI_SVC_UIM                 0x0BU
 #define QMI_SVC_WDA                 0x1AU
+#define QMI_SVC_DPM                 0x2FU
 #define QMI_SVC_IPA                 0x31U
 
 /* ============================================================================
@@ -292,6 +293,13 @@ typedef struct _S23MBB_DEV_CTX {
 
     UICC_APP_CACHE          ActiveApps[4];
     UINT32                  ActiveAppCount;
+    UINT16                  GwPriVal;
+    UINT16                  GwSecVal;
+    UINT8                   Slot0FirstAid[32];
+    UINT8                   Slot0FirstAidLen;
+    UINT8                   Slot1FirstAid[32];
+    UINT8                   Slot1FirstAidLen;
+    BOOLEAN                 DpmPortOpened;
 
     /* Tracked logical channels and terminal capability TLVs */
     UICC_CHANNEL_TRACK      OpenChannels[20];
@@ -490,6 +498,7 @@ static BOOLEAN QmiCall(PS23MBB_DEV_CTX ctx, UINT32 svc, UINT16 msgId,
     for (UINT32 attempt = 0; attempt < 200U; attempt++) {
         S23MODEM_QRTR_PKT *rx = ctx->QrtrRxPkt;
         RtlZeroMemory(rx, sizeof(*rx));
+        rx->DstPort   = myPort;
         rx->TimeoutMs = 400U;
 
         WDF_MEMORY_DESCRIPTOR rxIn, rxOut;
@@ -865,7 +874,11 @@ static VOID QmiRefreshUimState(PS23MBB_DEV_CTX ctx)
     ctx->Slot1Iccid[0] = '\0';
     ctx->Slot1Eid[0]   = '\0';
     ctx->Slot1AtrLen   = 0;
-    ctx->ActiveAppCount = 0;
+    ctx->ActiveAppCount   = 0;
+    ctx->GwPriVal         = 0xFFFFU;
+    ctx->GwSecVal         = 0xFFFFU;
+    ctx->Slot0FirstAidLen = 0;
+    ctx->Slot1FirstAidLen = 0;
 
     /* 1. UIM_GET_SLOTS_STATUS (0x0047) */
     if (QmiCall(ctx, QMI_SVC_UIM, 0x0047U, NULL, 0,
@@ -936,6 +949,8 @@ static VOID QmiRefreshUimState(PS23MBB_DEV_CTX ctx)
         UINT16 ln10 = 0;
         const UINT8 *v10 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x10U, &ln10);
         if (v10 && ln10 >= 9U) {
+            ctx->GwPriVal = Le16(v10 + 0U);
+            ctx->GwSecVal = Le16(v10 + 4U);
             UINT8 numSlot = v10[8U];
             UINT32 off = 9U;
             for (UINT8 s = 0; s < numSlot && s < 2U; s++) {
@@ -951,19 +966,27 @@ static VOID QmiRefreshUimState(PS23MBB_DEV_CTX ctx)
                     ctx->Slot1AppCount = nApp;
                 }
                 for (UINT8 a = 0; a < nApp; a++) {
-                    if (off + 6U > ln10) break;
+                    if (off + 7U > ln10) break;
                     UINT8 appType = v10[off + 0U];
-                    UINT8 aidLen  = v10[off + 5U];
-                    off += 6U;
-                    if (off + aidLen + 9U > ln10) break;
+                    UINT8 aidLen  = v10[off + 6U];
+                    off += 7U;
+                    if (off + aidLen + 7U > ln10) break;
+                    UINT8 cpAid = (aidLen <= 32U) ? aidLen : 32U;
+                    if (s == 0U && ctx->Slot0FirstAidLen == 0U && cpAid > 0U) {
+                        RtlCopyMemory(ctx->Slot0FirstAid, v10 + off, cpAid);
+                        ctx->Slot0FirstAidLen = cpAid;
+                    } else if (s == 1U && ctx->Slot1FirstAidLen == 0U && cpAid > 0U) {
+                        RtlCopyMemory(ctx->Slot1FirstAid, v10 + off, cpAid);
+                        ctx->Slot1FirstAidLen = cpAid;
+                    }
                     if (s == ctx->ActiveWinSlot && ctx->ActiveAppCount < 4U) {
                         UICC_APP_CACHE *ac = &ctx->ActiveApps[ctx->ActiveAppCount++];
                         /* Map QMI UIM app_type (1=SIM, 2=USIM, 4=CSIM, 5=ISIM) -> WWAN_UICC_APP_TYPE */
                         ac->AppType = (appType == 2U) ? 4U : (appType == 1U) ? 2U : (appType == 4U) ? 5U : (appType == 5U) ? 6U : 4U;
-                        ac->AidLen  = (aidLen <= 32U) ? aidLen : 32U;
+                        ac->AidLen  = cpAid;
                         if (ac->AidLen > 0U) RtlCopyMemory(ac->Aid, v10 + off, ac->AidLen);
                     }
-                    off += aidLen + 9U;
+                    off += aidLen + 7U;
                 }
             }
         }
@@ -984,12 +1007,42 @@ static VOID QmiRefreshUimState(PS23MBB_DEV_CTX ctx)
         QmiReadImsiViaTransparent(ctx, 2U, ctx->Slot1Imsi, sizeof(ctx->Slot1Imsi));
     }
 
-    MbbLogFmt("[UIM] Refresh: Slot0(pSIM1)=%u(apps=%u) Slot1(eSIM)=%u(euicc=%u apps=%u atr=%u eid=%s)\r\n",
+    MbbLogFmt("[UIM] Refresh: Slot0(pSIM1)=%u(apps=%u) Slot1(eSIM)=%u(euicc=%u apps=%u atr=%u gwPri=0x%04x gwSec=0x%04x)\r\n",
               ctx->Slot0Present ? 1 : 0, ctx->Slot0AppCount,
               ctx->Slot1Present ? 1 : 0, ctx->Slot1IsEuicc ? 1 : 0,
               ctx->Slot1AppCount, ctx->Slot1AtrLen,
-              ctx->Slot1Eid[0] ? ctx->Slot1Eid : "-");
+              ctx->GwPriVal, ctx->GwSecVal);
     MbbLogFlush();
+}
+
+static VOID QmiEnsureGwPrimaryProvisioned(PS23MBB_DEV_CTX ctx)
+{
+    UINT8 targetSlot = (ctx->ActiveWinSlot == 1U) ? 2U : 1U;
+    UINT8 wantSlotIdx = (UINT8)(targetSlot - 1U);
+    const UINT8 *aid = (targetSlot == 2U) ? ctx->Slot1FirstAid : ctx->Slot0FirstAid;
+    UINT8 aidLen = (targetSlot == 2U) ? ctx->Slot1FirstAidLen : ctx->Slot0FirstAidLen;
+    if (aidLen == 0U || aidLen > 32U) return;
+
+    UINT8 curPriSlot = (UINT8)((ctx->GwPriVal >> 8) & 0xFFU);
+    if (ctx->GwPriVal != 0xFFFFU && curPriSlot == wantSlotIdx) return;
+
+    UINT8 req[48];
+    UINT32 p = 0U;
+    req[p++] = 0x01U; req[p++] = 2U; req[p++] = 0U;
+    req[p++] = 0x00U; req[p++] = 0x01U; /* session_type=0 (GW_PRIMARY), activate=1 */
+    req[p++] = 0x10U; req[p++] = (UINT8)(2U + aidLen); req[p++] = 0U;
+    req[p++] = targetSlot; req[p++] = aidLen;
+    RtlCopyMemory(req + p, aid, aidLen); p += aidLen;
+
+    UINT16 tlvLen = 0, qRes = 0, qErr = 0;
+    BOOLEAN ok = QmiCall(ctx, QMI_SVC_UIM, 0x0038U, req, (UINT16)p,
+                         ctx->QmiTlvBuf, 512U, &tlvLen, &qRes, &qErr);
+    MbbLogFmt("[UIM] CHANGE_PROVISIONING_SESSION(GW_PRI -> slot=%u aidLen=%u) ok=%u res=%u err=0x%x\r\n",
+              targetSlot, aidLen, ok ? 1U : 0U, qRes, qErr);
+    MbbLogFlush();
+    if (ok && qRes == 0U) {
+        QmiRefreshUimState(ctx);
+    }
 }
 
 static VOID EnsureEuiccSlotActive(PS23MBB_DEV_CTX ctx)
@@ -1066,7 +1119,9 @@ static VOID QmiInitializeModemOnOpen(PS23MBB_DEV_CTX ctx)
 
     /* Default to Slot 0 (pSIM1) if physical SIM inserted, else Slot 1 (embedded eSIM) */
     ctx->ActiveWinSlot = ctx->Slot0Present ? 0U : 1U;
-    MbbLogFmt("[INIT] Open complete: FwRev='%s' ActiveWinSlot=%u\r\n", ctx->FwRev, ctx->ActiveWinSlot);
+    QmiEnsureGwPrimaryProvisioned(ctx);
+    MbbLogFmt("[INIT] Open complete: FwRev='%s' ActiveWinSlot=%u gwPri=0x%04x\r\n",
+              ctx->FwRev, ctx->ActiveWinSlot, ctx->GwPriVal);
     MbbLogFlush();
 }
 
@@ -1810,6 +1865,15 @@ static VOID HandleMbimConnect(PS23MBB_DEV_CTX ctx, UINT32 txId, UINT32 cmdType,
                           ctx->QmiTlvBuf, 512U, &tlvLen, &qRes, &qErr);
             sess->WdsHandleV4 = 0U;
         }
+        if (sess->WdsHandleV6 != 0U) {
+            UINT8 sReq[7];
+            sReq[0] = 0x01U; sReq[1] = 4U; sReq[2] = 0U;
+            RtlCopyMemory(sReq + 3U, &sess->WdsHandleV6, 4U);
+            UINT16 tlvLen = 0, qRes = 0, qErr = 0;
+            (void)QmiCall(ctx, QMI_SVC_WDS, 0x0021U, sReq, sizeof(sReq),
+                          ctx->QmiTlvBuf, 512U, &tlvLen, &qRes, &qErr);
+            sess->WdsHandleV6 = 0U;
+        }
         sess->Active = FALSE;
         sess->HasV4  = FALSE;
         sess->HasV6  = FALSE;
@@ -1820,7 +1884,7 @@ static VOID HandleMbimConnect(PS23MBB_DEV_CTX ctx, UINT32 txId, UINT32 cmdType,
         return;
     }
 
-    /* Ensure IPA v5.5 + GSI v5.5 + QMI 0x31 data path is active, then configure WDA + WDS */
+    /* Ensure IPA v5.5 + GSI v5.5 + QMI 0x31 data path is active, then open DPM hardware port + configure WDA + WDS */
     if (ctx->XprtOpen && ctx->IpaStatus) {
         WDF_MEMORY_DESCRIPTOR ipaDesc;
         WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&ipaDesc, ctx->IpaStatus, sizeof(S23MODEM_IPA_STATUS));
@@ -1831,10 +1895,29 @@ static VOID HandleMbimConnect(PS23MBB_DEV_CTX ctx, UINT32 txId, UINT32 cmdType,
     }
 
     {
+        UINT16 tlvLen = 0, qRes = 0, qErr = 0;
+        UINT32 epType = 4U, ifaceId = 1U;
+
+        if (!ctx->DpmPortOpened) {
+            UINT32 consPipe = 2U, prodPipe = 24U;
+            UINT8 dpmReq[24];
+            UINT32 dp = 0U;
+            dpmReq[dp++] = 0x11U; dpmReq[dp++] = 17U; dpmReq[dp++] = 0U;
+            dpmReq[dp++] = 1U;
+            RtlCopyMemory(dpmReq + dp, &epType, 4U);   dp += 4U;
+            RtlCopyMemory(dpmReq + dp, &ifaceId, 4U);  dp += 4U;
+            RtlCopyMemory(dpmReq + dp, &consPipe, 4U); dp += 4U;
+            RtlCopyMemory(dpmReq + dp, &prodPipe, 4U); dp += 4U;
+            if (QmiCall(ctx, QMI_SVC_DPM, 0x0020U, dpmReq, (UINT16)dp, ctx->QmiTlvBuf, 512U, &tlvLen, &qRes, &qErr) && qRes == 0U) {
+                ctx->DpmPortOpened = TRUE;
+            }
+            MbbLogFmt("[DPM] OPEN_PORT(ep=4,if=1,cons=2,prod=24) -> res=%u err=0x%x\r\n", qRes, qErr);
+        }
+
         UINT8 wdaReq[48];
         UINT32 wp = 0;
         /* TLV 0x11: link_prot = 2 (Raw IP), TLV 0x12/0x13: UL/DL QMAP (5 = 4-byte QMAP header) */
-        UINT32 lp = 2U, agg = 5U, maxDgrams = 1U, maxSz = 1536U, epType = 4U, ifaceId = 1U;
+        UINT32 lp = 2U, agg = 5U, maxDgrams = 1U, maxSz = 1536U;
         wdaReq[wp++] = 0x11U; wdaReq[wp++] = 4U; wdaReq[wp++] = 0U; RtlCopyMemory(wdaReq + wp, &lp, 4U); wp += 4U;
         wdaReq[wp++] = 0x12U; wdaReq[wp++] = 4U; wdaReq[wp++] = 0U; RtlCopyMemory(wdaReq + wp, &agg, 4U); wp += 4U;
         wdaReq[wp++] = 0x13U; wdaReq[wp++] = 4U; wdaReq[wp++] = 0U; RtlCopyMemory(wdaReq + wp, &agg, 4U); wp += 4U;
@@ -1844,17 +1927,21 @@ static VOID HandleMbimConnect(PS23MBB_DEV_CTX ctx, UINT32 txId, UINT32 cmdType,
         wdaReq[wp++] = 0x17U; wdaReq[wp++] = 8U; wdaReq[wp++] = 0U;
         RtlCopyMemory(wdaReq + wp, &epType, 4U); wp += 4U;
         RtlCopyMemory(wdaReq + wp, &ifaceId, 4U); wp += 4U;
-        UINT16 tlvLen = 0, qRes = 0, qErr = 0;
         (void)QmiCall(ctx, QMI_SVC_WDA, 0x0020U, wdaReq, (UINT16)wp, ctx->QmiTlvBuf, 512U, &tlvLen, &qRes, &qErr);
+        MbbLogFmt("[WDA] SET_DATA_FORMAT(ep=4,if=1,qmap=5) -> res=%u err=0x%x\r\n", qRes, qErr);
 
-        /* WDS_BIND_MUX_DATA_PORT (0x00A2): ep_id (0x10) + mux_id (0x11) */
-        UINT8 bindReq[16];
+        /* WDS_BIND_MUX_DATA_PORT (0x00A2): ep_id (0x10) + mux_id (0x11) + client_type=1 (0x13) */
+        UINT8 bindReq[24];
         UINT32 bp = 0;
+        UINT32 clientType = 1U;
         bindReq[bp++] = 0x10U; bindReq[bp++] = 8U; bindReq[bp++] = 0U;
         RtlCopyMemory(bindReq + bp, &epType, 4U); bp += 4U;
         RtlCopyMemory(bindReq + bp, &ifaceId, 4U); bp += 4U;
         bindReq[bp++] = 0x11U; bindReq[bp++] = 1U; bindReq[bp++] = 0U; bindReq[bp++] = (UINT8)(1U + sid);
+        bindReq[bp++] = 0x13U; bindReq[bp++] = 4U; bindReq[bp++] = 0U;
+        RtlCopyMemory(bindReq + bp, &clientType, 4U); bp += 4U;
         (void)QmiCall(ctx, QMI_SVC_WDS, 0x00A2U, bindReq, (UINT16)bp, ctx->QmiTlvBuf, 512U, &tlvLen, &qRes, &qErr);
+        MbbLogFmt("[WDS] BIND_MUX_DATA_PORT(mux=%u) -> res=%u err=0x%x\r\n", 1U + sid, qRes, qErr);
     }
 
     UINT8 startReq[140];
@@ -1883,18 +1970,19 @@ static VOID HandleMbimConnect(PS23MBB_DEV_CTX ctx, UINT32 txId, UINT32 cmdType,
     const UINT8 *v01 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x01U, &ln01);
     sess->WdsHandleV4 = (v01 && ln01 >= 4U) ? Le32(v01) : 1U;
     sess->Active      = TRUE;
-    sess->IpType      = (req->IpType != 0U) ? req->IpType : 1U;
+    sess->IpType      = (req->IpType == 2U) ? 2U : 1U;
     RtlCopyMemory(sess->ContextType, req->ContextType, 16U);
     RtlZeroMemory(sess->ApnAscii, sizeof(sess->ApnAscii));
     if (apn[0]) RtlCopyMemory(sess->ApnAscii, apn, strlen(apn));
 
-    /* Query WDS_GET_CURRENT_SETTINGS (0x002D) for IPv4 addr/gw/dns/mtu */
+    /* Query WDS_GET_CURRENT_SETTINGS (0x002D) for IPv4 addr/gw/mask/dns/mtu */
     UINT8 getReq[7] = { 0x10U, 4U, 0U, 0x10U, 0x1FU, 0x00U, 0x00U }; /* mask: IPv4 addr+gw+dns+mtu */
     if (QmiCall(ctx, QMI_SVC_WDS, 0x002DU, getReq, sizeof(getReq),
                 ctx->QmiTlvBuf, 2048U, &tlvLen, &qRes, &qErr) && qRes == 0U) {
-        UINT16 l1e = 0, l20 = 0, l15 = 0, l16 = 0, l29 = 0;
+        UINT16 l1e = 0, l20 = 0, l21 = 0, l15 = 0, l16 = 0, l29 = 0;
         const UINT8 *v1e = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x1EU, &l1e); /* IPv4 addr (LE u32) */
         const UINT8 *v20 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x20U, &l20); /* IPv4 gw */
+        const UINT8 *v21 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x21U, &l21); /* IPv4 subnet mask */
         const UINT8 *v15 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x15U, &l15); /* DNS1 */
         const UINT8 *v16 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x16U, &l16); /* DNS2 */
         const UINT8 *v29 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x29U, &l29); /* MTU */
@@ -1903,6 +1991,12 @@ static VOID HandleMbimConnect(PS23MBB_DEV_CTX ctx, UINT32 txId, UINT32 cmdType,
             sess->V4Addr[0] = v1e[3]; sess->V4Addr[1] = v1e[2]; sess->V4Addr[2] = v1e[1]; sess->V4Addr[3] = v1e[0];
             sess->HasV4     = TRUE;
             sess->V4Prefix  = 24U;
+            if (v21 && l21 >= 4U) {
+                UINT32 mask = Le32(v21);
+                UINT32 pfx = 0U;
+                while (mask & 0x80000000U) { pfx++; mask <<= 1; }
+                if (pfx >= 1U && pfx <= 32U) sess->V4Prefix = pfx;
+            }
             if (v20 && l20 >= 4U) {
                 sess->V4Gw[0] = v20[3]; sess->V4Gw[1] = v20[2]; sess->V4Gw[2] = v20[1]; sess->V4Gw[3] = v20[0];
             } else {
@@ -1915,8 +2009,10 @@ static VOID HandleMbimConnect(PS23MBB_DEV_CTX ctx, UINT32 txId, UINT32 cmdType,
                 sess->V4Dns2[0] = v16[3]; sess->V4Dns2[1] = v16[2]; sess->V4Dns2[2] = v16[1]; sess->V4Dns2[3] = v16[0];
             }
             sess->V4Mtu = (v29 && l29 >= 4U) ? Le32(v29) : 1420U;
-            MbbLogFmt("[WDS] Connected '%s': IP=%u.%u.%u.%u MTU=%u\r\n",
-                      apn, sess->V4Addr[0], sess->V4Addr[1], sess->V4Addr[2], sess->V4Addr[3], sess->V4Mtu);
+            MbbLogFmt("[WDS] Connected '%s': IP=%u.%u.%u.%u/%u GW=%u.%u.%u.%u MTU=%u\r\n",
+                      apn, sess->V4Addr[0], sess->V4Addr[1], sess->V4Addr[2], sess->V4Addr[3],
+                      sess->V4Prefix, sess->V4Gw[0], sess->V4Gw[1], sess->V4Gw[2], sess->V4Gw[3],
+                      sess->V4Mtu);
         }
     }
     MbbLogFlush();
@@ -2065,6 +2161,7 @@ static VOID DispatchMbimCommand(PS23MBB_DEV_CTX ctx, const UINT8 *msg, UINT32 ms
                             MbbSleepMs(1200U);
                         }
                         QmiRefreshUimState(ctx);
+                        QmiEnsureGwPrimaryProvisioned(ctx);
                         MbbLogFmt("[MBIM] EXT DEVICE_SLOT_MAPPINGS SET -> ActiveWinSlot=%u\r\n", ctx->ActiveWinSlot);
                         MbbLogFlush();
                     }
@@ -2512,6 +2609,7 @@ static VOID S23MbbWorkerThreadProc(PVOID Context)
                     MbbLogFmt("[WORKER] Slot 1 dropped from eSIM mode -> re-selecting (2,3)\r\n");
                     EnsureEuiccSlotActive(ctx);
                 }
+                QmiEnsureGwPrimaryProvisioned(ctx);
                 UINT8 *indBuf = ctx->MbimRspBuf;
                 UINT32 sl = BuildSlotInfoStatusBuf(ctx, ctx->ActiveWinSlot, indBuf);
                 SendMbimIndicateStatus(ctx, UUID_MS_BASIC_CONNECT_EXT, MBIM_CID_MS_SLOT_INFO_STATUS, indBuf, sl);
@@ -2702,7 +2800,9 @@ static VOID EvtTxQueueAdvance(NETPACKETQUEUE TxQueue)
                 }
             }
         }
-        fr->BeginIndex = NetRingIncrementIndex(fr, pkt->FragmentIndex + pkt->FragmentCount - 1U);
+        if (pkt->FragmentCount > 0U) {
+            fr->BeginIndex = (pkt->FragmentIndex + pkt->FragmentCount) & fr->ElementIndexMask;
+        }
         pr->BeginIndex = NetRingIncrementIndex(pr, pr->BeginIndex);
     }
     if (queuedAny) {
@@ -2760,6 +2860,15 @@ static VOID EvtRxQueueAdvance(NETPACKETQUEUE RxQueue)
             pkt->FragmentCount = 1U;
             pkt->Ignore        = 0;
             RtlZeroMemory(&pkt->Layout, sizeof(pkt->Layout));
+            pkt->Layout.Layer2Type = NetPacketLayer2TypeNull;
+            if ((rxData[0] & 0xF0U) == 0x40U && rxLen >= 20U) {
+                UINT8 ihl = (rxData[0] & 0x0FU) * 4U;
+                pkt->Layout.Layer3Type = (ihl == 20U) ? NetPacketLayer3TypeIPv4NoOptions : NetPacketLayer3TypeIPv4WithOptions;
+                pkt->Layout.Layer3HeaderLength = ihl;
+            } else if ((rxData[0] & 0xF0U) == 0x60U && rxLen >= 40U) {
+                pkt->Layout.Layer3Type = NetPacketLayer3TypeIPv6UnspecifiedExtensions;
+                pkt->Layout.Layer3HeaderLength = 40U;
+            }
             fr->BeginIndex = NetRingIncrementIndex(fr, fi);
             pr->BeginIndex = NetRingIncrementIndex(pr, pr->BeginIndex);
         }

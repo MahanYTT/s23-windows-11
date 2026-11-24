@@ -53,11 +53,12 @@ static int FindQrtrServer(const S23MODEM_STATUS_INFO *st, uint32_t svc, uint32_t
 static uint16_t g_NextTxId = 1U;
 
 /* Send a QMI request over QRTR and wait for the matching QMI response (flags == 0x02) */
-static int QmiTransaction(HANDLE hDev, const S23MODEM_STATUS_INFO *st,
-                          uint32_t svc, uint16_t msgId,
-                          const uint8_t *reqTlvs, uint16_t reqTlvLen,
-                          uint8_t *outTlvBuf, uint32_t outTlvCap, uint16_t *outTlvLen,
-                          uint16_t *outQmiResult, uint16_t *outQmiError) {
+static int QmiTransactionEx(HANDLE hDev, const S23MODEM_STATUS_INFO *st,
+                            uint32_t svc, uint16_t msgId,
+                            const uint8_t *reqTlvs, uint16_t reqTlvLen,
+                            uint8_t *outTlvBuf, uint32_t outTlvCap, uint16_t *outTlvLen,
+                            uint16_t *outQmiResult, uint16_t *outQmiError,
+                            uint32_t timeoutMs) {
     uint32_t dstNode = 0, dstPort = 0;
     if (!FindQrtrServer(st, svc, &dstNode, &dstPort)) {
         printf("  [QMI] Service 0x%02x not registered on QRTR\n", svc);
@@ -91,12 +92,14 @@ static int QmiTransaction(HANDLE hDev, const S23MODEM_STATUS_INFO *st,
     }
 
     ULONGLONG tStart = GetTickCount64();
-    for (int attempt = 0; attempt < 64 && (GetTickCount64() - tStart) < 2500ULL; attempt++) {
+    for (int attempt = 0; attempt < 256 && (GetTickCount64() - tStart) < (ULONGLONG)timeoutMs; attempt++) {
         S23MODEM_QRTR_PKT rx;
         ZeroMemory(&rx, sizeof(rx));
+        rx.DstPort   = myPort;
         rx.TimeoutMs = 500U;
         if (!DeviceIoControl(hDev, IOCTL_S23MODEM_QRTR_RX, &rx, sizeof(rx), &rx, sizeof(rx), &retBytes, NULL)) {
-            break;
+            if ((GetTickCount64() - tStart) >= (ULONGLONG)timeoutMs) break;
+            continue;
         }
         if (rx.PayloadLen < 7U) continue;
         uint8_t  rFlags = rx.Payload[0];
@@ -105,8 +108,8 @@ static int QmiTransaction(HANDLE hDev, const S23MODEM_STATUS_INFO *st,
         uint16_t rLen   = Le16(rx.Payload + 5U);
         if (7U + (uint32_t)rLen > rx.PayloadLen) rLen = (uint16_t)(rx.PayloadLen - 7U);
 
-        /* Skip async indications (flags == 0x04) while waiting for response (flags == 0x02) */
-        if (rFlags == 0x02U && rTxId == txid && rMsgId == msgId) {
+        /* Skip async indications (flags == 0x04) and packets destined for other client ports */
+        if (rx.DstPort == myPort && rFlags == 0x02U && rTxId == txid && rMsgId == msgId) {
             if (outTlvLen) *outTlvLen = rLen;
             if (outTlvBuf && rLen > 0U) {
                 uint32_t cp = (rLen < outTlvCap) ? rLen : outTlvCap;
@@ -126,6 +129,47 @@ static int QmiTransaction(HANDLE hDev, const S23MODEM_STATUS_INFO *st,
             }
             if (outQmiResult) *outQmiResult = qRes;
             if (outQmiError)  *outQmiError  = qErr;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int QmiTransaction(HANDLE hDev, const S23MODEM_STATUS_INFO *st,
+                          uint32_t svc, uint16_t msgId,
+                          const uint8_t *reqTlvs, uint16_t reqTlvLen,
+                          uint8_t *outTlvBuf, uint32_t outTlvCap, uint16_t *outTlvLen,
+                          uint16_t *outQmiResult, uint16_t *outQmiError) {
+    return QmiTransactionEx(hDev, st, svc, msgId, reqTlvs, reqTlvLen,
+                            outTlvBuf, outTlvCap, outTlvLen, outQmiResult, outQmiError, 2500U);
+}
+
+static int QmiWaitIndication(HANDLE hDev, uint32_t svc, uint16_t msgId,
+                             uint8_t *outTlvBuf, uint32_t outTlvCap, uint16_t *outTlvLen,
+                             uint32_t timeoutMs) {
+    uint32_t myPort = CLIENT_PORT_BASE + (svc & 0xFFU);
+    ULONGLONG tStart = GetTickCount64();
+    while ((GetTickCount64() - tStart) < (ULONGLONG)timeoutMs) {
+        S23MODEM_QRTR_PKT rx;
+        ZeroMemory(&rx, sizeof(rx));
+        rx.DstPort   = myPort;
+        rx.TimeoutMs = 400U;
+        DWORD retBytes = 0;
+        if (!DeviceIoControl(hDev, IOCTL_S23MODEM_QRTR_RX, &rx, sizeof(rx), &rx, sizeof(rx), &retBytes, NULL)) {
+            if ((GetTickCount64() - tStart) >= (ULONGLONG)timeoutMs) break;
+            continue;
+        }
+        if (rx.PayloadLen < 7U) continue;
+        uint8_t  rFlags = rx.Payload[0];
+        uint16_t rMsgId = Le16(rx.Payload + 3U);
+        uint16_t rLen   = Le16(rx.Payload + 5U);
+        if (7U + (uint32_t)rLen > rx.PayloadLen) rLen = (uint16_t)(rx.PayloadLen - 7U);
+        if (rx.DstPort == myPort && rFlags == 0x04U && rMsgId == msgId) {
+            if (outTlvLen) *outTlvLen = rLen;
+            if (outTlvBuf && rLen > 0U) {
+                uint32_t cp = (rLen < outTlvCap) ? rLen : outTlvCap;
+                memcpy(outTlvBuf, rx.Payload + 7U, cp);
+            }
             return 1;
         }
     }
@@ -182,10 +226,10 @@ static void DumpRawTlvs(const char *label, const uint8_t *tlvs, uint16_t tlvLen)
             printf("    [CORRUPT: tag=0x%02X len=%u remaining=%u]\n", t, ln, tlvLen - off);
             break;
         }
-        char h[80] = {0};
-        uint32_t showLen = (ln < 32U) ? ln : 32U;
+        char h[260] = {0};
+        uint32_t showLen = (ln < 128U) ? ln : 128U;
         FormatHex(tlvs + off, showLen, h, sizeof(h));
-        printf("    Tag 0x%02X: len=%u val=%s%s\n", t, ln, h, (ln > 32U) ? "..." : "");
+        printf("    Tag 0x%02X: len=%u val=%s%s\n", t, ln, h, (ln > 128U) ? "..." : "");
         off += ln;
     }
 }
@@ -226,49 +270,67 @@ static void QueryTlmmPins(HANDLE hDev) {
 
 static void QueryPdcConfigs(HANDLE hDev, const S23MODEM_STATUS_INFO *st) {
     printf("=== [QMI PDC 0x24] Carrier Configuration (MCFG MBN) Status ===\n");
-    uint8_t tlvs[2048];
+    uint8_t tlvs[4096];
     uint16_t tlvLen = 0, qRes = 0, qErr = 0;
 
-    /* 1. PDC_GET_SELECTED_CONFIG (0x0022) for HW config (type=1) and SW config (type=0) */
+    /* 0. QMI_PDC_INDICATION_REGISTER (0x0020): reg_config_change = 1 */
+    uint8_t indReg[4] = { 0x10U, 1U, 0U, 1U };
+    if (QmiTransaction(hDev, st, QMI_SVC_PDC, 0x0020U, indReg, sizeof(indReg), tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+        printf("  PDC_INDICATION_REGISTER (0x0020): res=%u err=0x%x\n", qRes, qErr);
+    }
+
+    /* 1. PDC_GET_SELECTED_CONFIG (0x0022): type 0=HW (PLATFORM), 1=SW (Carrier) */
     for (uint32_t ctype = 0; ctype <= 1; ctype++) {
         uint8_t req[7];
         req[0] = 0x01U; req[1] = 4U; req[2] = 0U;
         memcpy(req + 3U, &ctype, 4U);
         if (QmiTransaction(hDev, st, QMI_SVC_PDC, 0x0022U, req, 7U, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
-            printf("  PDC Selected Config (type=%u: %s): res=%u err=0x%x tlvLen=%u\n",
-                   ctype, (ctype == 0) ? "SW (Carrier)" : "HW (DSDS/SS)", qRes, qErr, tlvLen);
-            DumpRawTlvs("PDC_GET_SELECTED_CONFIG", tlvs, tlvLen);
-            uint16_t ln10 = 0, ln11 = 0;
-            const uint8_t *v10 = FindTlv(tlvs, tlvLen, 0x10U, &ln10);
-            const uint8_t *v11 = FindTlv(tlvs, tlvLen, 0x11U, &ln11);
-            if (v10 && ln10 > 0U) {
-                printf("    Active Config ID : '%.*s'\n", (int)ln10, (const char *)v10);
-            }
-            if (v11 && ln11 > 0U) {
-                printf("    Pending Config ID: '%.*s'\n", (int)ln11, (const char *)v11);
+            printf("  PDC Selected Config RESP (type=%u: %s): res=%u err=0x%x\n",
+                   ctype, (ctype == 0) ? "HW" : "SW", qRes, qErr);
+            if (qRes == 0U && QmiWaitIndication(hDev, QMI_SVC_PDC, 0x0022U, tlvs, sizeof(tlvs), &tlvLen, 1500U)) {
+                printf("  PDC Selected Config IND (type=%u: %s) tlvLen=%u:\n",
+                       ctype, (ctype == 0) ? "HW" : "SW", tlvLen);
+                DumpRawTlvs("PDC_GET_SELECTED_IND", tlvs, tlvLen);
+                uint16_t ln10 = 0, ln11 = 0;
+                const uint8_t *v10 = FindTlv(tlvs, tlvLen, 0x10U, &ln10);
+                const uint8_t *v11 = FindTlv(tlvs, tlvLen, 0x11U, &ln11);
+                if (v10 && ln10 > 0U) {
+                    printf("    Active Config ID : '%.*s'\n", (int)ln10, (const char *)v10);
+                }
+                if (v11 && ln11 > 0U) {
+                    printf("    Pending Config ID: '%.*s'\n", (int)ln11, (const char *)v11);
+                }
             }
         }
     }
 
-    /* 2. PDC_LIST_CONFIGS (0x0021) */
+    /* 2. PDC_LIST_CONFIGS (0x0024): type 0=HW, 1=SW */
     for (uint32_t ctype = 0; ctype <= 1; ctype++) {
-        uint8_t req[7];
-        req[0] = 0x01U; req[1] = 4U; req[2] = 0U;
-        memcpy(req + 3U, &ctype, 4U);
-        if (QmiTransaction(hDev, st, QMI_SVC_PDC, 0x0021U, req, 7U, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
-            printf("  PDC List Configs (type=%u: %s): res=%u err=0x%x tlvLen=%u\n",
-                   ctype, (ctype == 0) ? "SW" : "HW", qRes, qErr, tlvLen);
-            uint16_t ln10 = 0;
-            const uint8_t *v10 = FindTlv(tlvs, tlvLen, 0x10U, &ln10);
-            if (v10 && ln10 >= 4U) {
-                uint32_t numCfg = Le32(v10);
-                printf("    Stored Configs Count = %u\n", numCfg);
-                uint32_t off = 4U;
-                for (uint32_t k = 0; k < numCfg && off + 4U <= ln10; k++) {
-                    uint32_t idLen = Le32(v10 + off); off += 4U;
-                    if (off + idLen > ln10) break;
-                    printf("      [%u]: '%.*s'\n", k, (int)idLen, (const char *)(v10 + off));
-                    off += idLen;
+        uint8_t req[14];
+        uint32_t rpos = 0U;
+        uint32_t listSz = 32U;
+        req[rpos++] = 0x11U; req[rpos++] = 4U; req[rpos++] = 0U; memcpy(req + rpos, &listSz, 4U); rpos += 4U;
+        req[rpos++] = 0x12U; req[rpos++] = 4U; req[rpos++] = 0U; memcpy(req + rpos, &ctype, 4U); rpos += 4U;
+        if (QmiTransaction(hDev, st, QMI_SVC_PDC, 0x0024U, req, (uint16_t)rpos, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+            printf("  PDC List Configs RESP (type=%u: %s): res=%u err=0x%x tlvLen=%u\n",
+                   ctype, (ctype == 0) ? "HW" : "SW", qRes, qErr, tlvLen);
+            if (qRes == 0U && QmiWaitIndication(hDev, QMI_SVC_PDC, 0x0024U, tlvs, sizeof(tlvs), &tlvLen, 1500U)) {
+                printf("  PDC List Configs IND (type=%u: %s) tlvLen=%u:\n",
+                       ctype, (ctype == 0) ? "HW" : "SW", tlvLen);
+                DumpRawTlvs("PDC_LIST_CONFIGS_IND", tlvs, tlvLen);
+                uint16_t ln10 = 0;
+                const uint8_t *v10 = FindTlv(tlvs, tlvLen, 0x10U, &ln10);
+                if (v10 && ln10 >= 1U) {
+                    uint8_t numCfg = v10[0];
+                    printf("    Stored Configs Count = %u\n", numCfg);
+                    uint32_t off = 1U;
+                    for (uint8_t k = 0; k < numCfg && off + 5U <= ln10; k++) {
+                        uint32_t ctypeItem = Le32(v10 + off); off += 4U;
+                        uint8_t idLen = v10[off++];
+                        if (off + idLen > ln10) break;
+                        printf("      [%u] (type=%u): '%.*s'\n", k, ctypeItem, (int)idLen, (const char *)(v10 + off));
+                        off += idLen;
+                    }
                 }
             }
         }
@@ -277,18 +339,18 @@ static void QueryPdcConfigs(HANDLE hDev, const S23MODEM_STATUS_INFO *st) {
 
 static int PdcSetSelectedConfig(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint32_t ctype, const char *cfgId, uint32_t subId) {
     printf("=== [QMI PDC 0x24] PDC_SET_SELECTED_CONFIG (type=%u: %s sub=%u) ===\n",
-           ctype, (ctype == 0) ? "SW" : "HW", subId);
+           ctype, (ctype == 0) ? "HW" : "SW", subId);
     printf("  Config ID: '%s'\n", cfgId);
     uint32_t idLen = (uint32_t)strlen(cfgId);
 
     uint8_t req[256];
     uint32_t rpos = 0U;
-    /* TLV 0x01: config_info (type u32 + idLen u32 + id[]) */
-    uint16_t t1Len = (uint16_t)(8U + idLen);
+    /* TLV 0x01: config_info (type u32 + idLen u8 + id[]) */
+    uint16_t t1Len = (uint16_t)(5U + idLen);
     req[rpos++] = 0x01U;
     memcpy(req + rpos, &t1Len, 2U); rpos += 2U;
     memcpy(req + rpos, &ctype, 4U); rpos += 4U;
-    memcpy(req + rpos, &idLen, 4U); rpos += 4U;
+    req[rpos++] = (uint8_t)idLen;
     memcpy(req + rpos, cfgId, idLen); rpos += idLen;
 
     /* TLV 0x10: sub_id (u32) */
@@ -300,6 +362,9 @@ static int PdcSetSelectedConfig(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uin
     if (QmiTransaction(hDev, st, QMI_SVC_PDC, 0x0023U, req, (uint16_t)rpos, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
         printf("  PDC_SET_SELECTED_CONFIG -> res=%u err=0x%x tlvLen=%u\n", qRes, qErr, tlvLen);
         DumpRawTlvs("PDC_SET_SELECTED_CONFIG", tlvs, tlvLen);
+        if (qRes == 0U && QmiWaitIndication(hDev, QMI_SVC_PDC, 0x0023U, tlvs, sizeof(tlvs), &tlvLen, 1500U)) {
+            DumpRawTlvs("PDC_SET_SELECTED_IND", tlvs, tlvLen);
+        }
         return (qRes == 0U);
     }
     printf("  PDC_SET_SELECTED_CONFIG timed out\n");
@@ -308,7 +373,7 @@ static int PdcSetSelectedConfig(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uin
 
 static int PdcActivateConfig(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint32_t ctype, uint32_t subId) {
     printf("=== [QMI PDC 0x24] PDC_ACTIVATE_CONFIG (type=%u: %s sub=%u) ===\n",
-           ctype, (ctype == 0) ? "SW" : "HW", subId);
+           ctype, (ctype == 0) ? "HW" : "SW", subId);
     uint8_t req[16];
     uint32_t rpos = 0U;
     /* TLV 0x01: config_type (u32) */
@@ -320,9 +385,12 @@ static int PdcActivateConfig(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint32
 
     uint8_t tlvs[512];
     uint16_t tlvLen = 0, qRes = 0, qErr = 0;
-    if (QmiTransaction(hDev, st, QMI_SVC_PDC, 0x0024U, req, (uint16_t)rpos, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+    if (QmiTransaction(hDev, st, QMI_SVC_PDC, 0x0027U, req, (uint16_t)rpos, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
         printf("  PDC_ACTIVATE_CONFIG -> res=%u err=0x%x tlvLen=%u\n", qRes, qErr, tlvLen);
         DumpRawTlvs("PDC_ACTIVATE_CONFIG", tlvs, tlvLen);
+        if (qRes == 0U && QmiWaitIndication(hDev, QMI_SVC_PDC, 0x0027U, tlvs, sizeof(tlvs), &tlvLen, 2500U)) {
+            DumpRawTlvs("PDC_ACTIVATE_IND", tlvs, tlvLen);
+        }
         return (qRes == 0U);
     }
     printf("  PDC_ACTIVATE_CONFIG timed out\n");
@@ -358,12 +426,12 @@ static int PdcLoadConfigFromFile(HANDLE hDev, const S23MODEM_STATUS_INFO *st,
         uint8_t req[2048];
         uint32_t rpos = 0U;
 
-        /* TLV 0x01: load_config_info (type u32 + idLen u32 + id[]) */
-        uint16_t t1Len = (uint16_t)(8U + idLen);
+        /* TLV 0x01: load_config_info (type u32 + idLen u8 + id[]) */
+        uint16_t t1Len = (uint16_t)(5U + idLen);
         req[rpos++] = 0x01U;
         memcpy(req + rpos, &t1Len, 2U); rpos += 2U;
         memcpy(req + rpos, &ctype, 4U); rpos += 4U;
-        memcpy(req + rpos, &idLen, 4U); rpos += 4U;
+        req[rpos++] = (uint8_t)idLen;
         memcpy(req + rpos, cfgId, idLen); rpos += idLen;
 
         /* TLV 0x02: frame_info (total_size u32 + cur_offset u32 + frame_len u32 + data[]) */
@@ -377,12 +445,13 @@ static int PdcLoadConfigFromFile(HANDLE hDev, const S23MODEM_STATUS_INFO *st,
 
         uint8_t tlvs[512];
         uint16_t tlvLen = 0, qRes = 0, qErr = 0;
-        if (!QmiTransaction(hDev, st, QMI_SVC_PDC, 0x0020U, req, (uint16_t)rpos, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr) || qRes != 0U) {
+        if (!QmiTransaction(hDev, st, QMI_SVC_PDC, 0x0026U, req, (uint16_t)rpos, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr) || qRes != 0U) {
             printf("  PDC_LOAD_CONFIG chunk at off=%u failed res=%u err=0x%x\n", off, qRes, qErr);
             DumpRawTlvs("PDC_LOAD_CONFIG FAIL", tlvs, tlvLen);
             free(fileData);
             return 0;
         }
+        (void)QmiWaitIndication(hDev, QMI_SVC_PDC, 0x0026U, tlvs, sizeof(tlvs), &tlvLen, 1500U);
         off += chunkSize;
     }
     free(fileData);
@@ -614,10 +683,14 @@ static void QueryUimSlotsAndCards(HANDLE hDev, const S23MODEM_STATUS_INFO *st, u
         uint16_t ln10 = 0;
         const uint8_t *v10 = FindTlv(tlvs, tlvLen, 0x10U, &ln10);
         if (v10 && ln10 >= 9U) {
-            uint16_t gwPri = Le16(v10 + 0U), gwSec = Le16(v10 + 4U);
+            uint16_t gwPri = Le16(v10 + 0U), cdmaPri = Le16(v10 + 2U);
+            uint16_t gwSec = Le16(v10 + 4U), cdmaSec = Le16(v10 + 6U);
             uint8_t numSlot = v10[8U];
-            printf("  UIM_GET_CARD_STATUS: numLogicalSlots=%u gwPri=0x%04x gwSec=0x%04x\n",
-                   numSlot, gwPri, gwSec);
+            printf("  UIM_GET_CARD_STATUS: numLogicalSlots=%u gwPri=(slot=%u,app=%u)[0x%04x] gwSec=(slot=%u,app=%u)[0x%04x] cdmaPri=0x%04x cdmaSec=0x%04x\n",
+                   numSlot,
+                   v10[0U], v10[1U], gwPri,
+                   v10[4U], v10[5U], gwSec,
+                   cdmaPri, cdmaSec);
             uint32_t off = 9U;
             for (uint8_t s = 0; s < numSlot; s++) {
                 if (off + 6U > ln10) break;
@@ -632,18 +705,23 @@ static void QueryUimSlotsAndCards(HANDLE hDev, const S23MODEM_STATUS_INFO *st, u
                        s + 1U, cState, (cState == 1U) ? "PRESENT" : (cState == 0U) ? "ABSENT" : "ERROR",
                        upinSt, upinR, upukR, errC, nApp);
                 for (uint8_t a = 0; a < nApp; a++) {
-                    if (off + 6U > ln10) break;
+                    if (off + 7U > ln10) break;
                     uint8_t appType  = v10[off + 0U];
                     uint8_t appState = v10[off + 1U];
                     uint8_t persoSt  = v10[off + 2U];
-                    uint8_t aidLen   = v10[off + 5U];
-                    off += 6U;
-                    if (off + aidLen + 9U > ln10) break;
-                    char aidHex[48] = {0};
+                    uint8_t persoFtr = v10[off + 3U];
+                    uint8_t persoRet = v10[off + 4U];
+                    uint8_t aidLen   = v10[off + 6U];
+                    off += 7U;
+                    if (off + aidLen + 7U > ln10) break;
+                    char aidHex[68] = {0};
                     FormatHex(v10 + off, aidLen, aidHex, sizeof(aidHex));
-                    off += aidLen + 9U;
-                    printf("      App[%u]: type=%u state=%u perso=%u AID=%s\n",
-                           a, appType, appState, persoSt, aidHex);
+                    uint8_t upinRepl = v10[off + aidLen + 0U];
+                    uint8_t pin1St   = v10[off + aidLen + 1U];
+                    uint8_t pin1Ret  = v10[off + aidLen + 2U];
+                    off += aidLen + 7U;
+                    printf("      App[%u]: type=%u state=%u perso=(%u/%u/%u) pin1=(st=%u ret=%u upinR=%u) AID(%u)=%s\n",
+                           a, appType, appState, persoSt, persoFtr, persoRet, pin1St, pin1Ret, upinRepl, aidLen, aidHex);
                 }
             }
         }
@@ -1159,6 +1237,154 @@ static void QueryIpaStatus(HANDLE hDev, const S23MODEM_STATUS_INFO *st) {
            ipaSt.WanTxRpLsb, ipaSt.WanRxRpLsb, ipaSt.LanRxRpLsb, ipaSt.GsiErrorLog);
 }
 
+static void QueryLiveDiag(HANDLE hDev, const S23MODEM_STATUS_INFO *st, int doScan) {
+    uint8_t tlvs[4096];
+    uint16_t tlvLen = 0, qRes = 0, qErr = 0;
+
+    printf("=== [DIAG-LIVE] Read-Only DMS / PDC / UIM / NAS / WDS Inspection ===\n");
+    printf("  [QRTR Servers (%u)]\n", st->ServerCount);
+    for (uint32_t i = 0; i < st->ServerCount && i < S23MODEM_MAX_SERVERS; i++) {
+        printf("    #%02u svc=0x%04x (%3u) ver=0x%02x inst=0x%04x @ %u:0x%04x\n",
+               i + 1U, st->Servers[i].Service, st->Servers[i].Service,
+               st->Servers[i].Version, st->Servers[i].Instance,
+               st->Servers[i].Node, st->Servers[i].Port);
+    }
+
+    QueryAndSetDmsOnline(hDev, st, 0);
+
+    if (QmiTransaction(hDev, st, QMI_SVC_DMS, 0x0020U, NULL, 0, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+        printf("  [DMS 0x0020 GET_DEVICE_CAP] res=%u err=0x%x tlvLen=%u\n", qRes, qErr, tlvLen);
+        DumpRawTlvs("DMS_GET_DEVICE_CAP", tlvs, tlvLen);
+    }
+    if (QmiTransaction(hDev, st, QMI_SVC_DMS, 0x0045U, NULL, 0, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+        printf("  [DMS 0x0045 GET_BAND_CAPABILITY] res=%u err=0x%x tlvLen=%u\n", qRes, qErr, tlvLen);
+        DumpRawTlvs("DMS_GET_BAND_CAPABILITY", tlvs, tlvLen);
+    }
+
+    QueryPdcConfigs(hDev, st);
+    for (uint32_t ctype = 0; ctype <= 1; ctype++) {
+        uint8_t req[14];
+        req[0] = 0x01U; req[1] = 4U; req[2] = 0U; memcpy(req + 3U, &ctype, 4U);
+        uint32_t sub1 = 1U;
+        req[7] = 0x10U; req[8] = 4U; req[9] = 0U; memcpy(req + 10U, &sub1, 4U);
+        if (QmiTransaction(hDev, st, QMI_SVC_PDC, 0x0022U, req, 14U, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+            printf("  PDC Selected Config RESP (sub=1, type=%u:%s): res=%u err=0x%x\n",
+                   ctype, (ctype == 0) ? "HW" : "SW", qRes, qErr);
+            if (qRes == 0U && QmiWaitIndication(hDev, QMI_SVC_PDC, 0x0022U, tlvs, sizeof(tlvs), &tlvLen, 1500U)) {
+                DumpRawTlvs("PDC_GET_SELECTED_SUB1_IND", tlvs, tlvLen);
+            }
+        }
+    }
+
+    /* Inspect SMEM items 611 (MPSS log?), 612 (MDMP_LOG), 469 (BOOT) */
+    {
+        uint32_t smemIds[3] = { 611U, 612U, 469U };
+        for (int k = 0; k < 3; k++) {
+            uint8_t sbuf[2048];
+            DWORD rb = 0;
+            ZeroMemory(sbuf, sizeof(sbuf));
+            if (DeviceIoControl(hDev, IOCTL_S23MODEM_SMEM_READ, &smemIds[k], 4, sbuf, sizeof(sbuf), &rb, NULL)) {
+                char hex[132] = {0};
+                FormatHex(sbuf, (rb < 64U) ? rb : 64U, hex, sizeof(hex));
+                printf("  [SMEM %u] (%lu B) hex=%s\n", smemIds[k], rb, hex);
+                char asc[132];
+                uint32_t alen = (rb < 128U) ? rb : 128U;
+                for (uint32_t j = 0; j < alen; j++) {
+                    asc[j] = (sbuf[j] >= 0x20 && sbuf[j] < 0x7F) ? (char)sbuf[j] : '.';
+                }
+                asc[alen] = 0;
+                printf("  [SMEM %u] asc=%s\n", smemIds[k], asc);
+            }
+        }
+    }
+
+    UimGetConfiguration(hDev, st);
+    QueryUimSlotsAndCards(hDev, st, NULL, NULL);
+
+    printf("  --- NAS queries on default client (SUB 0 / PRIMARY) ---\n");
+    QueryNasAndWds(hDev, st);
+
+    if (QmiTransaction(hDev, st, QMI_SVC_NAS, 0x004DU, NULL, 0, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+        printf("  [NAS 0x004D GET_SYS_INFO] res=%u err=0x%x tlvLen=%u\n", qRes, qErr, tlvLen);
+        DumpRawTlvs("NAS_GET_SYS_INFO", tlvs, tlvLen);
+    }
+    if (QmiTransaction(hDev, st, QMI_SVC_NAS, 0x0034U, NULL, 0, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+        printf("  [NAS 0x0034 GET_SYS_SEL_PREF] res=%u err=0x%x tlvLen=%u\n", qRes, qErr, tlvLen);
+        DumpRawTlvs("NAS_GET_SYS_SEL_PREF", tlvs, tlvLen);
+    }
+    {
+        static const uint8_t rifs[4] = { 0x04U, 0x05U, 0x08U, 0x0CU };
+        for (int ri = 0; ri < 4; ri++) {
+            uint8_t txrxReq[4] = { 0x01U, 1U, 0U, rifs[ri] };
+            if (QmiTransaction(hDev, st, QMI_SVC_NAS, 0x005AU, txrxReq, sizeof(txrxReq), tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+                printf("  [NAS 0x005A GET_TX_RX_INFO radio=%s(0x%02x)] res=%u err=0x%x tlvLen=%u\n",
+                       NasRadioIfName(rifs[ri]), rifs[ri], qRes, qErr, tlvLen);
+                DumpRawTlvs("NAS_GET_TX_RX_INFO", tlvs, tlvLen);
+            }
+        }
+    }
+    if (QmiTransaction(hDev, st, QMI_SVC_NAS, 0x0039U, NULL, 0, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+        printf("  [NAS 0x0039 GET_OPERATOR_NAME] res=%u err=0x%x tlvLen=%u\n", qRes, qErr, tlvLen);
+        DumpRawTlvs("NAS_GET_OPERATOR_NAME", tlvs, tlvLen);
+    }
+
+    /* Now bind THIS s23modemd NAS client to SECONDARY subscription (1 = gwSec = Logical Slot 2 eSIM!) */
+    uint8_t bindReq[7] = { 0x01U, 4U, 0U, 1U, 0U, 0U, 0U };
+    if (QmiTransaction(hDev, st, QMI_SVC_NAS, 0x0071U, bindReq, sizeof(bindReq), tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+        printf("  --- [NAS 0x0071 BIND_SUBSCRIPTION(1=SECONDARY)] res=%u err=0x%x ---\n", qRes, qErr);
+        if (qRes == 0U) {
+            QueryNasAndWds(hDev, st);
+            if (QmiTransaction(hDev, st, QMI_SVC_NAS, 0x004DU, NULL, 0, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+                printf("  [SUB1 NAS 0x004D GET_SYS_INFO] res=%u err=0x%x tlvLen=%u\n", qRes, qErr, tlvLen);
+                DumpRawTlvs("SUB1_NAS_GET_SYS_INFO", tlvs, tlvLen);
+            }
+            if (QmiTransaction(hDev, st, QMI_SVC_NAS, 0x0034U, NULL, 0, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+                printf("  [SUB1 NAS 0x0034 GET_SYS_SEL_PREF] res=%u err=0x%x tlvLen=%u\n", qRes, qErr, tlvLen);
+                DumpRawTlvs("SUB1_NAS_GET_SYS_SEL_PREF", tlvs, tlvLen);
+            }
+            if (QmiTransaction(hDev, st, QMI_SVC_NAS, 0x0039U, NULL, 0, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+                printf("  [SUB1 NAS 0x0039 GET_OPERATOR_NAME] res=%u err=0x%x tlvLen=%u\n", qRes, qErr, tlvLen);
+                DumpRawTlvs("SUB1_NAS_GET_OPERATOR_NAME", tlvs, tlvLen);
+            }
+        }
+    }
+
+    if (doScan) {
+        static const uint8_t scanMasks[3] = { 0x04U, 0x07U, 0x20U }; /* LTE, GSM|UMTS|LTE, NR5G */
+        for (int sm = 0; sm < 3; sm++) {
+            uint8_t scanReq[4] = { 0x10U, 1U, 0U, scanMasks[sm] };
+            printf("  [NAS 0x0021 PERFORM_NETWORK_SCAN(type=0x%02x) on SUB1] scanning...\n", scanMasks[sm]);
+            if (QmiTransactionEx(hDev, st, QMI_SVC_NAS, 0x0021U, scanReq, sizeof(scanReq), tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr, 45000U)) {
+                printf("  [NAS 0x0021 PERFORM_NETWORK_SCAN(0x%02x)] res=%u err=0x%x tlvLen=%u\n", scanMasks[sm], qRes, qErr, tlvLen);
+                DumpRawTlvs("NAS_PERFORM_NETWORK_SCAN", tlvs, tlvLen);
+                uint16_t ln10 = 0;
+                const uint8_t *v10 = FindTlv(tlvs, tlvLen, 0x10U, &ln10);
+                if (v10 && ln10 >= 2U) {
+                    uint16_t numPlmn = Le16(v10);
+                    uint32_t off = 2U;
+                    printf("    Scanned PLMNs count = %u\n", numPlmn);
+                    for (uint16_t p = 0; p < numPlmn && off + 6U <= ln10; p++) {
+                        uint16_t mcc = Le16(v10 + off);
+                        uint16_t mnc = Le16(v10 + off + 2U);
+                        uint8_t  netStat = v10[off + 4U];
+                        uint8_t  descLen = v10[off + 5U];
+                        off += 6U;
+                        if (off + descLen > ln10) break;
+                        printf("      PLMN[%u]: MCC=%u MNC=%u stat=0x%02x desc='%.*s'\n",
+                               p, mcc, mnc, netStat, (int)descLen, (const char *)(v10 + off));
+                        off += descLen;
+                    }
+                }
+                if (qRes == 0U) break;
+            } else {
+                printf("  [NAS 0x0021 PERFORM_NETWORK_SCAN(0x%02x)] timed out\n", scanMasks[sm]);
+            }
+        }
+    }
+
+    QueryIpaStatus(hDev, st);
+}
+
 static void RunIpaLoopbackTest(HANDLE hDev, const S23MODEM_STATUS_INFO *st) {
     QueryIpaStatus(hDev, st);
     S23MODEM_IPA_STATUS stBefore, stAfter;
@@ -1221,13 +1447,26 @@ int main(int argc, char **argv) {
     QueryTlmmPins(hDev);
 
     int doLoadPdc = 0;
+    int doDiagLive = 0;
+    int doScan = 0;
+    int doBindGwPri = 0;
+    int doTestWds = 0;
     const char *enableIccid = NULL;
     const char *disableIccid = NULL;
     const char *deleteIccid = NULL;
 
-    /* Parse CLI options: --switch-slot <logical> <physical> or --load-pdc */
+    /* Parse CLI options: --switch-slot <logical> <physical> or --load-pdc or --diag-live */
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--switch-slot") == 0 && i + 2 < argc) {
+        if (strcmp(argv[i], "--diag-live") == 0) {
+            doDiagLive = 1;
+        } else if (strcmp(argv[i], "--scan") == 0) {
+            doDiagLive = 1;
+            doScan = 1;
+        } else if (strcmp(argv[i], "--bind-gw-pri") == 0) {
+            doBindGwPri = 1;
+        } else if (strcmp(argv[i], "--test-wds") == 0) {
+            doTestWds = 1;
+        } else if (strcmp(argv[i], "--switch-slot") == 0 && i + 2 < argc) {
             uint8_t logSlot  = (uint8_t)atoi(argv[i + 1]);
             uint32_t physSlot = (uint32_t)atoi(argv[i + 2]);
             SwitchUimSlot(hDev, &st, logSlot, physSlot);
@@ -1268,29 +1507,170 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (doTestWds) {
+        uint8_t tlvs[2048];
+        uint16_t tlvLen = 0, qRes = 0, qErr = 0;
+        printf("=== [DPM / WDS / WDA Data Call Test] ===\n");
+
+        /* 0. QMI_DPM (0x2F) DPM_OPEN_PORT_REQ (0x0020): hw_data_port_list TLV 0x11 */
+        {
+            uint32_t epType = 4U, ifaceId = 1U, consPipe = 2U, prodPipe = 24U;
+            uint8_t dpmReq[24]; uint32_t dp = 0;
+            dpmReq[dp++] = 0x11U; dpmReq[dp++] = 17U; dpmReq[dp++] = 0U;
+            dpmReq[dp++] = 1U; /* count = 1 */
+            memcpy(dpmReq + dp, &epType, 4U); dp += 4U;
+            memcpy(dpmReq + dp, &ifaceId, 4U); dp += 4U;
+            memcpy(dpmReq + dp, &consPipe, 4U); dp += 4U;
+            memcpy(dpmReq + dp, &prodPipe, 4U); dp += 4U;
+            if (QmiTransaction(hDev, &st, 0x2FU, 0x0020U, dpmReq, (uint16_t)dp, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+                printf("  [DPM 0x2F OPEN_PORT(ep=4,if=1,cons=2,prod=24)] res=%u err=0x%x tlvLen=%u\n", qRes, qErr, tlvLen);
+                DumpRawTlvs("DPM_OPEN_PORT", tlvs, tlvLen);
+            } else {
+                printf("  [DPM 0x2F OPEN_PORT] timed out\n");
+            }
+        }
+
+        /* 1. WDS_GET_PROFILE_SETTINGS (0x002B) for profile (type=0, index=1) */
+        uint8_t profIdReq[5] = { 0x01U, 2U, 0U, 0U, 1U };
+        if (QmiTransaction(hDev, &st, QMI_SVC_WDS, 0x002BU, profIdReq, sizeof(profIdReq), tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+            printf("  [WDS 0x002B GET_PROFILE_SETTINGS(1)] res=%u err=0x%x tlvLen=%u\n", qRes, qErr, tlvLen);
+            DumpRawTlvs("WDS_PROFILE_1", tlvs, tlvLen);
+        }
+
+        /* 2. WDA_SET_DATA_FORMAT (0x0020) ep_type=4 iface=1 (and fallback 5/0 if needed) */
+        uint32_t epPairs[3][2] = { {4U, 1U}, {4U, 2U}, {5U, 0U} };
+        uint32_t okEp = 4U, okIf = 1U;
+        for (int e = 0; e < 3; e++) {
+            uint8_t wdaReq[64]; uint32_t wp = 0;
+            uint32_t lp = 2U, agg = 5U, maxDgrams = 1U, maxSz = 1536U;
+            uint32_t epType = epPairs[e][0], ifaceId = epPairs[e][1];
+            wdaReq[wp++] = 0x11U; wdaReq[wp++] = 4U; wdaReq[wp++] = 0U; memcpy(wdaReq + wp, &lp, 4U); wp += 4U;
+            wdaReq[wp++] = 0x12U; wdaReq[wp++] = 4U; wdaReq[wp++] = 0U; memcpy(wdaReq + wp, &agg, 4U); wp += 4U;
+            wdaReq[wp++] = 0x13U; wdaReq[wp++] = 4U; wdaReq[wp++] = 0U; memcpy(wdaReq + wp, &agg, 4U); wp += 4U;
+            wdaReq[wp++] = 0x15U; wdaReq[wp++] = 4U; wdaReq[wp++] = 0U; memcpy(wdaReq + wp, &maxDgrams, 4U); wp += 4U;
+            wdaReq[wp++] = 0x16U; wdaReq[wp++] = 4U; wdaReq[wp++] = 0U; memcpy(wdaReq + wp, &maxSz, 4U); wp += 4U;
+            wdaReq[wp++] = 0x17U; wdaReq[wp++] = 8U; wdaReq[wp++] = 0U;
+            memcpy(wdaReq + wp, &epType, 4U); wp += 4U;
+            memcpy(wdaReq + wp, &ifaceId, 4U); wp += 4U;
+            if (QmiTransaction(hDev, &st, QMI_SVC_WDA, 0x0020U, wdaReq, (uint16_t)wp, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+                printf("  [WDA 0x0020 SET_DATA_FORMAT(ep=%u,if=%u)] res=%u err=0x%x tlvLen=%u\n", epType, ifaceId, qRes, qErr, tlvLen);
+                DumpRawTlvs("WDA_SET_DATA_FORMAT", tlvs, tlvLen);
+                if (qRes == 0U) { okEp = epType; okIf = ifaceId; break; }
+            }
+        }
+
+        /* 3. WDS_BIND_MUX_DATA_PORT (0x00A2) */
+        {
+            uint8_t bindReq[24]; uint32_t bp = 0;
+            uint32_t clientType = 1U; /* TETHERED=1 */
+            bindReq[bp++] = 0x10U; bindReq[bp++] = 8U; bindReq[bp++] = 0U;
+            memcpy(bindReq + bp, &okEp, 4U); bp += 4U;
+            memcpy(bindReq + bp, &okIf, 4U); bp += 4U;
+            bindReq[bp++] = 0x11U; bindReq[bp++] = 1U; bindReq[bp++] = 0U; bindReq[bp++] = 1U; /* mux_id = 1 */
+            bindReq[bp++] = 0x13U; bindReq[bp++] = 4U; bindReq[bp++] = 0U;
+            memcpy(bindReq + bp, &clientType, 4U); bp += 4U;
+            if (QmiTransaction(hDev, &st, QMI_SVC_WDS, 0x00A2U, bindReq, (uint16_t)bp, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+                printf("  [WDS 0x00A2 BIND_MUX_DATA_PORT(ep=%u,if=%u,mux=1,ct=1)] res=%u err=0x%x\n", okEp, okIf, qRes, qErr);
+                DumpRawTlvs("WDS_BIND_MUX", tlvs, tlvLen);
+            }
+        }
+
+        /* 4. Check DSD (0x2A) system status & WDS_START_NETWORK_INTERFACE (0x0020) */
+        if (QmiTransaction(hDev, &st, 0x2AU, 0x0024U, NULL, 0, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+            printf("  [DSD 0x0024 GET_SYSTEM_STATUS] res=%u err=0x%x tlvLen=%u\n", qRes, qErr, tlvLen);
+            DumpRawTlvs("DSD_SYS_STATUS", tlvs, tlvLen);
+        }
+
+        /* Try WDS_START_NETWORK_INTERFACE without stopping if already connected, or inspect error TLVs */
+        {
+            static const char apn[] = "internet.proximus.be";
+            uint8_t startReq[64]; uint32_t sp = 0;
+            uint16_t alen = (uint16_t)strlen(apn);
+            startReq[sp++] = 0x14U; memcpy(startReq + sp, &alen, 2U); sp += 2U;
+            memcpy(startReq + sp, apn, alen); sp += alen;
+            startReq[sp++] = 0x19U; startReq[sp++] = 1U; startReq[sp++] = 0U; startReq[sp++] = 4U; /* IPv4 */
+            if (QmiTransactionEx(hDev, &st, QMI_SVC_WDS, 0x0020U, startReq, (uint16_t)sp, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr, 15000U)) {
+                printf("  [WDS 0x0020 START_NET('internet.proximus.be', v4)] res=%u err=0x%x tlvLen=%u\n", qRes, qErr, tlvLen);
+                DumpRawTlvs("WDS_START_V4", tlvs, tlvLen);
+                if (qRes == 0U) {
+                    uint16_t l01 = 0; const uint8_t *v01 = FindTlv(tlvs, tlvLen, 0x01U, &l01);
+                    uint32_t handle = (v01 && l01 >= 4U) ? Le32(v01) : 0U;
+                    uint8_t getReq[7] = { 0x10U, 4U, 0U, 0x10U, 0x1FU, 0x00U, 0x00U };
+                    if (QmiTransaction(hDev, &st, QMI_SVC_WDS, 0x002DU, getReq, sizeof(getReq), tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+                        printf("  [WDS 0x002D GET_CURRENT_SETTINGS] res=%u err=0x%x\n", qRes, qErr);
+                        DumpRawTlvs("WDS_CUR_SETTINGS", tlvs, tlvLen);
+                    }
+                    if (handle != 0U) {
+                        uint8_t stopReq[7] = { 0x01U, 4U, 0U, 0, 0, 0, 0 };
+                        memcpy(stopReq + 3U, &handle, 4U);
+                        QmiTransaction(hDev, &st, QMI_SVC_WDS, 0x0021U, stopReq, sizeof(stopReq), tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr);
+                        printf("  [WDS 0x0021 STOP_NET(0x%08x)] res=%u err=0x%x\n", handle, qRes, qErr);
+                    }
+                }
+            }
+        }
+        CloseHandle(hDev);
+        return 0;
+    }
+
+    if (doBindGwPri) {
+        static const uint8_t usimAid[16] = {
+            0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02, 0xFF,
+            0x33, 0xFF, 0x01, 0x89, 0x06, 0x05, 0x00, 0xFF
+        };
+        uint8_t req[32];
+        uint32_t rpos = 0U;
+        /* TLV 0x01: session_change (session_type=0 GW_PRI, activate=1) */
+        req[rpos++] = 0x01U; req[rpos++] = 2U; req[rpos++] = 0U;
+        req[rpos++] = 0x00U; req[rpos++] = 0x01U;
+        /* TLV 0x10: app_info (slot=2, aidLen=16, aid[]) */
+        req[rpos++] = 0x10U; req[rpos++] = (uint8_t)(2U + 16U); req[rpos++] = 0U;
+        req[rpos++] = 0x02U; req[rpos++] = 16U;
+        memcpy(req + rpos, usimAid, 16U); rpos += 16U;
+        uint8_t tlvs[512]; uint16_t tlvLen = 0, qRes = 0, qErr = 0;
+        if (QmiTransaction(hDev, &st, QMI_SVC_UIM, 0x0038U, req, (uint16_t)rpos, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+            printf("  [UIM 0x0038 CHANGE_PROVISIONING_SESSION(GW_PRI -> slot=2)] res=%u err=0x%x\n", qRes, qErr);
+            DumpRawTlvs("CHANGE_PROV", tlvs, tlvLen);
+        } else {
+            printf("  [UIM 0x0038 CHANGE_PROVISIONING_SESSION] timed out\n");
+        }
+        CloseHandle(hDev);
+        return 0;
+    }
+
+    if (doDiagLive) {
+        QueryLiveDiag(hDev, &st, doScan);
+        CloseHandle(hDev);
+        printf("=== s23modemd.exe --diag-live complete ===\n");
+        return 0;
+    }
+
     QueryAndSetDmsOnline(hDev, &st, 1);
     QueryPdcConfigs(hDev, &st);
 
     if (doLoadPdc) {
-        /* Ensure DSDS Hardware & ROW Commercial Carrier MCFG MBNs are selected and active */
+        /* Ensure DSDS Hardware (type=0) & ROW Commercial Carrier (type=1) MCFG MBNs are selected and active */
         static const char hwCfgId[] = "mcfg_hw/generic/common/Kailua/STANDALONE/LA/DSDS/mcfg_hw.mbn";
         static const char hwFile[]  = "C:\\Windows\\System32\\drivers\\s23modem\\fw\\modem_pr\\mcfg\\configs\\mcfg_hw\\generic\\common\\Kailua\\STANDALONE\\LA\\DSDS\\mcfg_hw.mbn";
         static const char swCfgId[] = "mcfg_sw/generic/common/ROW/Commercial/mcfg_sw.mbn";
         static const char swFile[]  = "C:\\Windows\\System32\\drivers\\s23modem\\fw\\modem_pr\\mcfg\\configs\\mcfg_sw\\generic\\common\\ROW\\Commercial\\mcfg_sw.mbn";
 
-        if (!PdcSetSelectedConfig(hDev, &st, 1U, hwCfgId, 0U)) {
-            if (PdcLoadConfigFromFile(hDev, &st, 1U, hwCfgId, hwFile)) {
-                PdcSetSelectedConfig(hDev, &st, 1U, hwCfgId, 0U);
-            }
-        }
-        PdcActivateConfig(hDev, &st, 1U, 0U);
-
-        if (!PdcSetSelectedConfig(hDev, &st, 0U, swCfgId, 0U)) {
-            if (PdcLoadConfigFromFile(hDev, &st, 0U, swCfgId, swFile)) {
-                PdcSetSelectedConfig(hDev, &st, 0U, swCfgId, 0U);
+        if (!PdcSetSelectedConfig(hDev, &st, 0U, hwCfgId, 0U)) {
+            if (PdcLoadConfigFromFile(hDev, &st, 0U, hwCfgId, hwFile)) {
+                PdcSetSelectedConfig(hDev, &st, 0U, hwCfgId, 0U);
             }
         }
         PdcActivateConfig(hDev, &st, 0U, 0U);
+
+        if (!PdcSetSelectedConfig(hDev, &st, 1U, swCfgId, 0U)) {
+            if (PdcLoadConfigFromFile(hDev, &st, 1U, swCfgId, swFile)) {
+                PdcSetSelectedConfig(hDev, &st, 1U, swCfgId, 0U);
+            }
+        }
+        PdcActivateConfig(hDev, &st, 1U, 0U);
+        CloseHandle(hDev);
+        printf("=== s23modemd.exe --load-pdc complete ===\n");
+        return 0;
     }
 
     uint8_t euiccLogSlot = 0U, euiccPhysSlot = 0U;

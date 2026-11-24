@@ -1855,6 +1855,7 @@ static NTSTATUS S23ModemDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             status = STATUS_BUFFER_TOO_SMALL;
         } else {
             S23MODEM_QRTR_PKT *ioPkt = (S23MODEM_QRTR_PKT *)buf;
+            uint32_t targetPort = ioPkt->DstPort;
             uint32_t waitMs = ioPkt->TimeoutMs;
             if (waitMs > 5000U) waitMs = 5000U;
             ULONG loops = (waitMs / 5U) + 1U;
@@ -1864,9 +1865,28 @@ static NTSTATUS S23ModemDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                 KIRQL irql;
                 KeAcquireSpinLock(&g_RxRingLock, &irql);
                 if (g_RxTail != g_RxHead) {
-                    RtlCopyMemory(ioPkt, &g_RxRing[g_RxTail], sizeof(S23MODEM_QRTR_PKT));
-                    g_RxTail = (g_RxTail + 1U) % RX_RING_SLOTS;
-                    got = TRUE;
+                    if (targetPort == 0U) {
+                        RtlCopyMemory(ioPkt, &g_RxRing[g_RxTail], sizeof(S23MODEM_QRTR_PKT));
+                        g_RxTail = (g_RxTail + 1U) % RX_RING_SLOTS;
+                        got = TRUE;
+                    } else {
+                        uint32_t cur = g_RxTail;
+                        while (cur != g_RxHead) {
+                            if (g_RxRing[cur].DstPort == targetPort) {
+                                RtlCopyMemory(ioPkt, &g_RxRing[cur], sizeof(S23MODEM_QRTR_PKT));
+                                while (cur != g_RxTail) {
+                                    uint32_t prev = (cur == 0U) ? (RX_RING_SLOTS - 1U) : (cur - 1U);
+                                    RtlCopyMemory(&g_RxRing[cur], &g_RxRing[prev], sizeof(S23MODEM_QRTR_PKT));
+                                    cur = prev;
+                                }
+                                g_RxTail = (g_RxTail + 1U) % RX_RING_SLOTS;
+                                got = TRUE;
+                                break;
+                            }
+                            cur = (cur + 1U) % RX_RING_SLOTS;
+                        }
+                        if (!got) KeClearEvent(&g_RxEvent);
+                    }
                 } else {
                     KeClearEvent(&g_RxEvent);
                 }
