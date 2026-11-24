@@ -581,7 +581,7 @@ static void QueryAndSetDmsOnline(HANDLE hDev, const S23MODEM_STATUS_INFO *st, in
         }
     }
 
-    if (setOnline && curMode != 0U) {
+    if (setOnline == 1 && curMode != 0U) {
         uint8_t req[4] = { 0x01U, 0x01U, 0x00U, 0x00U }; /* TLV 0x01: mode = 0 (ONLINE) */
         if (QmiTransaction(hDev, st, QMI_SVC_DMS, 0x002EU, req, sizeof(req), tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
             printf("  SET_OPERATING_MODE(ONLINE) -> res=%u err=0x%x\n", qRes, qErr);
@@ -594,7 +594,7 @@ static void QueryAndSetDmsOnline(HANDLE hDev, const S23MODEM_STATUS_INFO *st, in
                 }
             }
         }
-    } else if (setOnline == 2 && curMode != 1U && curMode != 3U) {
+    } else if (setOnline == 2 && curMode != 1U && curMode != 3U && curMode != 5U) {
         uint8_t req[4] = { 0x01U, 0x01U, 0x00U, 0x01U }; /* TLV 0x01: mode = 1 (LOW_POWER) */
         if (QmiTransaction(hDev, st, QMI_SVC_DMS, 0x002EU, req, sizeof(req), tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
             printf("  SET_OPERATING_MODE(LOW_POWER) -> res=%u err=0x%x\n", qRes, qErr);
@@ -608,7 +608,7 @@ static void QueryAndSetDmsOnline(HANDLE hDev, const S23MODEM_STATUS_INFO *st, in
  * ========================================================================== */
 static void QueryUimSlotsAndCards(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t *outEuiccLogicalSlot, uint8_t *outEuiccPhysSlot) {
     printf("=== [QMI UIM 0x0B] Physical SIM & Embedded eSIM (eUICC) Slot Status ===\n");
-    uint8_t tlvs[2048];
+    uint8_t tlvs[4096];
     uint16_t tlvLen = 0, qRes = 0, qErr = 0;
 
     if (outEuiccLogicalSlot) *outEuiccLogicalSlot = 0U;
@@ -842,7 +842,7 @@ static int UimSendApduRaw(HANDLE hDev, const S23MODEM_STATUS_INFO *st,
     /* TLV 0x10: u8 channel_id */
     req[rpos++] = 0x10U; req[rpos++] = 1U; req[rpos++] = 0U; req[rpos++] = channelId;
 
-    uint8_t tlvs[2048];
+    uint8_t tlvs[4096];
     uint16_t tlvLen = 0, qRes = 0, qErr = 0;
     if (!QmiTransaction(hDev, st, QMI_SVC_UIM, 0x003BU, req, (uint16_t)rpos, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr) || qRes != 0U) {
         printf("  [UIM] SEND_APDU failed res=%u err=0x%x\n", qRes, qErr);
@@ -859,19 +859,44 @@ static int UimSendApduRaw(HANDLE hDev, const S23MODEM_STATUS_INFO *st,
     return 1;
 }
 
-/* Full ISO 7816-4 T=0/T=1 APDU with automatic 61 XX (GET RESPONSE) chaining */
+static void PrintHexStdout(const uint8_t *buf, uint32_t len) {
+    static const char hex[] = "0123456789ABCDEF";
+    for (uint32_t i = 0; i < len; i++) {
+        putchar(hex[(buf[i] >> 4) & 0x0FU]);
+        putchar(hex[buf[i] & 0x0FU]);
+    }
+}
+
+/* Full ISO 7816-4 T=0/T=1 APDU with 6C XX retry and automatic 61 XX (GET RESPONSE) chaining */
 static int UimTransceiveApdu(HANDLE hDev, const S23MODEM_STATUS_INFO *st,
                              uint8_t slot, uint8_t channelId,
                              const uint8_t *cmdApdu, uint16_t cmdLen,
                              uint8_t *outFullRsp, uint32_t outCap, uint32_t *outFullLen) {
-    uint8_t chunk[1024];
+    uint8_t cmdCopy[512];
+    uint8_t chunk[4096];
     uint16_t chunkLen = 0;
     *outFullLen = 0U;
-    if (!UimSendApduRaw(hDev, st, slot, channelId, cmdApdu, cmdLen, chunk, sizeof(chunk), &chunkLen) || chunkLen < 2U) {
+    if (cmdLen < 4U || cmdLen > 490U) return 0;
+    memcpy(cmdCopy, cmdApdu, cmdLen);
+
+    if (!UimSendApduRaw(hDev, st, slot, channelId, cmdCopy, cmdLen, chunk, sizeof(chunk), &chunkLen) || chunkLen < 2U) {
         return 0;
     }
 
-    while (chunkLen >= 2U) {
+    if (chunkLen == 2U && chunk[0] == 0x6CU) {
+        if (cmdLen == 4U) {
+            cmdCopy[4] = chunk[1];
+            cmdLen = 5U;
+        } else {
+            cmdCopy[cmdLen - 1U] = chunk[1];
+        }
+        chunkLen = 0U;
+        if (!UimSendApduRaw(hDev, st, slot, channelId, cmdCopy, cmdLen, chunk, sizeof(chunk), &chunkLen) || chunkLen < 2U) {
+            return 0;
+        }
+    }
+
+    for (int hops = 0; hops < 128 && chunkLen >= 2U; hops++) {
         uint8_t sw1 = chunk[chunkLen - 2U];
         uint8_t sw2 = chunk[chunkLen - 1U];
         uint16_t dataBytes = (uint16_t)(chunkLen - 2U);
@@ -884,12 +909,13 @@ static int UimTransceiveApdu(HANDLE hDev, const S23MODEM_STATUS_INFO *st,
             uint8_t getCla = (channelId < 4U) ? (uint8_t)(channelId & 0x03U)
                                               : (uint8_t)(0x40U | ((channelId - 4U) & 0x0FU));
             uint8_t getResp[5] = { getCla, 0xC0U, 0x00U, 0x00U, sw2 };
-            chunkLen = 0;
+            chunkLen = 0U;
             if (!UimSendApduRaw(hDev, st, slot, channelId, getResp, 5U, chunk, sizeof(chunk), &chunkLen) || chunkLen < 2U) {
                 return 0;
             }
             continue;
         }
+        if (*outFullLen + 2U > outCap) return 0;
         outFullRsp[(*outFullLen)++] = sw1;
         outFullRsp[(*outFullLen)++] = sw2;
         return 1;
@@ -900,113 +926,6 @@ static int UimTransceiveApdu(HANDLE hDev, const S23MODEM_STATUS_INFO *st,
 static uint8_t EsimPropCla(uint8_t channelId) {
     return (channelId < 4U) ? (uint8_t)(0x80U | (channelId & 0x03U))
                             : (uint8_t)(0xC0U | ((channelId - 4U) & 0x0FU));
-}
-
-static void EncodeIccidBcdSwap(const char *iccidHex, uint8_t outBcd[10]) {
-    memset(outBcd, 0xFF, 10U);
-    uint32_t len = (uint32_t)strlen(iccidHex);
-    if (len > 20U) len = 20U;
-    for (uint32_t i = 0; i < len; i += 2U) {
-        uint8_t d1 = (iccidHex[i] >= '0' && iccidHex[i] <= '9') ? (uint8_t)(iccidHex[i] - '0') : 0x0FU;
-        uint8_t d2 = (i + 1U < len && iccidHex[i + 1U] >= '0' && iccidHex[i + 1U] <= '9') ? (uint8_t)(iccidHex[i + 1U] - '0') : 0x0FU;
-        outBcd[i / 2U] = (uint8_t)((d2 << 4) | d1);
-    }
-}
-
-/* GSMA SGP.22 ES10c EnableProfileRequest (BF31): [A0: [5A: 10B ICCID]] [81: 01 FF (refreshFlag=TRUE)] */
-static int EsimEnableProfile(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t slot, uint8_t channelId, const char *iccidHex) {
-    uint8_t iccidBcd[10];
-    EncodeIccidBcdSwap(iccidHex, iccidBcd);
-
-    uint8_t cmd[32];
-    uint32_t pos = 0;
-    cmd[pos++] = EsimPropCla(channelId); cmd[pos++] = 0xE2U; cmd[pos++] = 0x91U; cmd[pos++] = 0x00U;
-    cmd[pos++] = 20U; /* Lc */
-    cmd[pos++] = 0xBFU; cmd[pos++] = 0x31U; cmd[pos++] = 17U;
-    cmd[pos++] = 0xA0U; cmd[pos++] = 12U;
-    cmd[pos++] = 0x5AU; cmd[pos++] = 10U;
-    memcpy(cmd + pos, iccidBcd, 10U); pos += 10U;
-    cmd[pos++] = 0x81U; cmd[pos++] = 0x01U; cmd[pos++] = 0xFFU; /* refreshFlag = TRUE */
-    cmd[pos++] = 0x00U; /* Le */
-
-    uint8_t rsp[512]; uint32_t rspLen = 0;
-    if (UimTransceiveApdu(hDev, st, slot, channelId, cmd, (uint16_t)pos, rsp, sizeof(rsp), &rspLen) && rspLen >= 2U) {
-        uint8_t sw1 = rsp[rspLen - 2U], sw2 = rsp[rspLen - 1U];
-        printf("  [eSIM EnableProfile] ICCID %s -> rspLen=%u SW=%02X%02X\n", iccidHex, rspLen, sw1, sw2);
-        return (sw1 == 0x90U && sw2 == 0x00U);
-    }
-    printf("  [eSIM EnableProfile] ICCID %s -> Failed (timeout/error)\n", iccidHex);
-    return 0;
-}
-
-/* GSMA SGP.22 ES10c DisableProfileRequest (BF32): [A0: [5A: 10B ICCID]] [81: 01 FF (refreshFlag=TRUE)] */
-static int EsimDisableProfile(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t slot, uint8_t channelId, const char *iccidHex) {
-    uint8_t iccidBcd[10];
-    EncodeIccidBcdSwap(iccidHex, iccidBcd);
-
-    uint8_t cmd[32];
-    uint32_t pos = 0;
-    cmd[pos++] = EsimPropCla(channelId); cmd[pos++] = 0xE2U; cmd[pos++] = 0x91U; cmd[pos++] = 0x00U;
-    cmd[pos++] = 20U; /* Lc */
-    cmd[pos++] = 0xBFU; cmd[pos++] = 0x32U; cmd[pos++] = 17U;
-    cmd[pos++] = 0xA0U; cmd[pos++] = 12U;
-    cmd[pos++] = 0x5AU; cmd[pos++] = 10U;
-    memcpy(cmd + pos, iccidBcd, 10U); pos += 10U;
-    cmd[pos++] = 0x81U; cmd[pos++] = 0x01U; cmd[pos++] = 0xFFU; /* refreshFlag = TRUE */
-    cmd[pos++] = 0x00U; /* Le */
-
-    uint8_t rsp[512]; uint32_t rspLen = 0;
-    if (UimTransceiveApdu(hDev, st, slot, channelId, cmd, (uint16_t)pos, rsp, sizeof(rsp), &rspLen) && rspLen >= 2U) {
-        uint8_t sw1 = rsp[rspLen - 2U], sw2 = rsp[rspLen - 1U];
-        printf("  [eSIM DisableProfile] ICCID %s -> rspLen=%u SW=%02X%02X\n", iccidHex, rspLen, sw1, sw2);
-        return (sw1 == 0x90U && sw2 == 0x00U);
-    }
-    printf("  [eSIM DisableProfile] ICCID %s -> Failed (timeout/error)\n", iccidHex);
-    return 0;
-}
-
-/* GSMA SGP.22 ES10c DeleteProfileRequest (BF33): CHOICE { [5A: 10B ICCID] } */
-static int EsimDeleteProfile(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t slot, uint8_t channelId, const char *iccidHex) {
-    uint8_t iccidBcd[10];
-    EncodeIccidBcdSwap(iccidHex, iccidBcd);
-
-    uint8_t cmd[32];
-    uint32_t pos = 0;
-    cmd[pos++] = EsimPropCla(channelId); cmd[pos++] = 0xE2U; cmd[pos++] = 0x91U; cmd[pos++] = 0x00U;
-    cmd[pos++] = 14U; /* Lc */
-    cmd[pos++] = 0xBFU; cmd[pos++] = 0x33U; cmd[pos++] = 12U;
-    cmd[pos++] = 0x5AU; cmd[pos++] = 10U;
-    memcpy(cmd + pos, iccidBcd, 10U); pos += 10U;
-
-    uint8_t rsp[512]; uint32_t rspLen = 0;
-    if (UimTransceiveApdu(hDev, st, slot, channelId, cmd, (uint16_t)pos, rsp, sizeof(rsp), &rspLen) && rspLen >= 2U) {
-        uint8_t sw1 = rsp[rspLen - 2U], sw2 = rsp[rspLen - 1U];
-        printf("  [eSIM DeleteProfile] ICCID %s -> rspLen=%u SW=%02X%02X\n", iccidHex, rspLen, sw1, sw2);
-        return (sw1 == 0x90U && sw2 == 0x00U);
-    }
-    printf("  [eSIM DeleteProfile] ICCID %s -> Failed (timeout/error)\n", iccidHex);
-    return 0;
-}
-
-/* Parse BER-TLV tag and length */
-
-static int EsimEuiccMemoryReset(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t slot, uint8_t channelId) {
-    uint8_t cmd[32];
-    uint32_t pos = 0;
-    cmd[pos++] = EsimPropCla(channelId); cmd[pos++] = 0xE2U; cmd[pos++] = 0x91U; cmd[pos++] = 0x00U;
-    cmd[pos++] = 0x06U; /* Lc */
-    cmd[pos++] = 0xBFU; cmd[pos++] = 0x34U; cmd[pos++] = 0x03U;
-    cmd[pos++] = 0x82U; cmd[pos++] = 0x01U; cmd[pos++] = 0x02U; /* resetOptions: 2 = delete all profiles */
-    cmd[pos++] = 0x00U; /* Le */
-
-    uint8_t rsp[512]; uint32_t rspLen = 0;
-    if (UimTransceiveApdu(hDev, st, slot, channelId, cmd, (uint16_t)pos, rsp, sizeof(rsp), &rspLen) && rspLen >= 2U) {
-        uint8_t sw1 = rsp[rspLen - 2U], sw2 = rsp[rspLen - 1U];
-        printf("  [eSIM EUICC Memory Reset] -> rspLen=%u SW=%02X%02X\n", rspLen, sw1, sw2);
-        return (sw1 == 0x90U && sw2 == 0x00U);
-    }
-    printf("  [eSIM EUICC Memory Reset] -> Failed (timeout/error)\n");
-    return 0;
 }
 
 static int ReadBerTlv(const uint8_t *buf, uint32_t len, uint32_t *ioPos,
@@ -1040,9 +959,433 @@ static int ReadBerTlv(const uint8_t *buf, uint32_t len, uint32_t *ioPos,
     return 1;
 }
 
+static void EncodeIccidBcdSwap(const char *iccidHex, uint8_t outBcd[10]) {
+    memset(outBcd, 0xFF, 10U);
+    uint32_t len = (uint32_t)strlen(iccidHex);
+    if (len > 20U) len = 20U;
+    for (uint32_t i = 0; i < len; i += 2U) {
+        uint8_t d1 = (iccidHex[i] >= '0' && iccidHex[i] <= '9') ? (uint8_t)(iccidHex[i] - '0') : 0x0FU;
+        uint8_t d2 = (i + 1U < len && iccidHex[i + 1U] >= '0' && iccidHex[i + 1U] <= '9') ? (uint8_t)(iccidHex[i + 1U] - '0') : 0x0FU;
+        outBcd[i / 2U] = (uint8_t)((d2 << 4) | d1);
+    }
+}
+
+static int HexNibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static uint32_t ParseHexBytes(const char *hexStr, uint8_t *outBuf, uint32_t outCap) {
+    uint32_t slen = (uint32_t)strlen(hexStr);
+    uint32_t n = 0U;
+    for (uint32_t i = 0; i + 1U < slen && n < outCap; i += 2U) {
+        int hi = HexNibble(hexStr[i]);
+        int lo = HexNibble(hexStr[i + 1U]);
+        if (hi < 0 || lo < 0) break;
+        outBuf[n++] = (uint8_t)((hi << 4) | lo);
+    }
+    return n;
+}
+
+static uint8_t BuildSignedBigEndianSeq(uint64_t seq, uint8_t outBytes[9]) {
+    uint8_t tmp[9];
+    uint8_t n = 0U;
+    uint64_t v = seq;
+    do {
+        tmp[n++] = (uint8_t)(v & 0xFFULL);
+        v >>= 8;
+    } while (v != 0ULL && n < 8U);
+    uint8_t pos = 0U;
+    if (tmp[n - 1U] & 0x80U) {
+        outBytes[pos++] = 0x00U;
+    }
+    for (uint8_t i = 0U; i < n; i++) {
+        outBytes[pos++] = tmp[n - 1U - i];
+    }
+    return pos;
+}
+
+static uint64_t ParseBigEndianUint(const uint8_t *buf, uint32_t len) {
+    uint64_t v = 0ULL;
+    for (uint32_t i = 0; i < len && i < 8U; i++) {
+        v = (v << 8) | (uint64_t)buf[i];
+    }
+    return v;
+}
+
+static void DecodeEs10ResultTag80(const uint8_t *rsp, uint32_t payLen, uint32_t expectedOuterTag, uint32_t *outResCode) {
+    *outResCode = 0xFFFFFFFFU;
+    uint32_t pos = 0U, tag = 0U, vlen = 0U;
+    const uint8_t *val = NULL;
+    if (ReadBerTlv(rsp, payLen, &pos, &tag, &val, &vlen) && tag == expectedOuterTag) {
+        uint32_t ipos = 0U, itag = 0U, ilen = 0U;
+        const uint8_t *ival = NULL;
+        while (ReadBerTlv(val, vlen, &ipos, &itag, &ival, &ilen)) {
+            if (itag == 0x80U && ilen >= 1U) {
+                *outResCode = (uint32_t)ival[0];
+            }
+        }
+    }
+}
+
+/* GSMA SGP.22 ES10c EnableProfileRequest (BF31): [A0: [5A: 10B ICCID]] [81: 01 FF (refreshFlag=TRUE)] */
+static int EsimEnableProfile(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t slot, uint8_t channelId, const char *iccidHex) {
+    uint8_t iccidBcd[10];
+    EncodeIccidBcdSwap(iccidHex, iccidBcd);
+
+    uint8_t cmd[32];
+    uint32_t pos = 0;
+    cmd[pos++] = EsimPropCla(channelId); cmd[pos++] = 0xE2U; cmd[pos++] = 0x91U; cmd[pos++] = 0x00U;
+    cmd[pos++] = 20U; /* Lc */
+    cmd[pos++] = 0xBFU; cmd[pos++] = 0x31U; cmd[pos++] = 17U;
+    cmd[pos++] = 0xA0U; cmd[pos++] = 12U;
+    cmd[pos++] = 0x5AU; cmd[pos++] = 10U;
+    memcpy(cmd + pos, iccidBcd, 10U); pos += 10U;
+    cmd[pos++] = 0x81U; cmd[pos++] = 0x01U; cmd[pos++] = 0xFFU; /* refreshFlag = TRUE */
+    cmd[pos++] = 0x00U; /* Le */
+
+    uint8_t rsp[512]; uint32_t rspLen = 0;
+    if (UimTransceiveApdu(hDev, st, slot, channelId, cmd, (uint16_t)pos, rsp, sizeof(rsp), &rspLen) && rspLen >= 2U) {
+        uint8_t sw1 = rsp[rspLen - 2U], sw2 = rsp[rspLen - 1U];
+        uint32_t resCode = 0xFFFFFFFFU;
+        DecodeEs10ResultTag80(rsp, rspLen - 2U, 0xBF31U, &resCode);
+        printf("  [eSIM EnableProfile] ICCID %s -> rspLen=%u SW=%02X%02X res=%u payload=", iccidHex, rspLen, sw1, sw2, resCode);
+        PrintHexStdout(rsp, rspLen - 2U);
+        printf("\n");
+        return (sw1 == 0x90U && sw2 == 0x00U && resCode == 0U);
+    }
+    printf("  [eSIM EnableProfile] ICCID %s -> Failed (timeout/error)\n", iccidHex);
+    return 0;
+}
+
+/* GSMA SGP.22 ES10c DisableProfileRequest (BF32): [A0: [5A: 10B ICCID]] [81: 01 00 (refreshFlag=FALSE)] */
+static int EsimDisableProfile(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t slot, uint8_t channelId, const char *iccidHex) {
+    uint8_t iccidBcd[10];
+    EncodeIccidBcdSwap(iccidHex, iccidBcd);
+
+    uint8_t cmd[32];
+    uint32_t pos = 0;
+    cmd[pos++] = EsimPropCla(channelId); cmd[pos++] = 0xE2U; cmd[pos++] = 0x91U; cmd[pos++] = 0x00U;
+    cmd[pos++] = 20U; /* Lc */
+    cmd[pos++] = 0xBFU; cmd[pos++] = 0x32U; cmd[pos++] = 17U;
+    cmd[pos++] = 0xA0U; cmd[pos++] = 12U;
+    cmd[pos++] = 0x5AU; cmd[pos++] = 10U;
+    memcpy(cmd + pos, iccidBcd, 10U); pos += 10U;
+    cmd[pos++] = 0x81U; cmd[pos++] = 0x01U; cmd[pos++] = 0x00U; /* refreshFlag = FALSE to avoid SW=6985 pending-refresh lock */
+    cmd[pos++] = 0x00U; /* Le */
+
+    uint8_t rsp[512]; uint32_t rspLen = 0;
+    if (UimTransceiveApdu(hDev, st, slot, channelId, cmd, (uint16_t)pos, rsp, sizeof(rsp), &rspLen) && rspLen >= 2U) {
+        uint8_t sw1 = rsp[rspLen - 2U], sw2 = rsp[rspLen - 1U];
+        uint32_t resCode = 0xFFFFFFFFU;
+        DecodeEs10ResultTag80(rsp, rspLen - 2U, 0xBF32U, &resCode);
+        const char *resName = (resCode == 0U) ? "ok" : (resCode == 1U) ? "iccidOrAidNotFound" :
+                              (resCode == 2U) ? "profileNotInEnabledState" : (resCode == 3U) ? "disallowedByPolicy" :
+                              (resCode == 5U) ? "catBusy" : (resCode == 127U) ? "undefinedError" : "unknown";
+        printf("  [eSIM DisableProfile] ICCID %s -> rspLen=%u SW=%02X%02X res=%u(%s) payload=",
+               iccidHex, rspLen, sw1, sw2, resCode, resName);
+        PrintHexStdout(rsp, rspLen - 2U);
+        printf("\n");
+        return (sw1 == 0x90U && sw2 == 0x00U && (resCode == 0U || resCode == 2U));
+    }
+    printf("  [eSIM DisableProfile] ICCID %s -> Failed (timeout/error)\n", iccidHex);
+    return 0;
+}
+
+/* GSMA SGP.22 ES10c DeleteProfileRequest (BF33): CHOICE { [5A: 10B ICCID] } */
+static int EsimDeleteProfile(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t slot, uint8_t channelId, const char *iccidHex) {
+    uint8_t iccidBcd[10];
+    EncodeIccidBcdSwap(iccidHex, iccidBcd);
+
+    uint8_t cmd[32];
+    uint32_t pos = 0;
+    cmd[pos++] = EsimPropCla(channelId); cmd[pos++] = 0xE2U; cmd[pos++] = 0x91U; cmd[pos++] = 0x00U;
+    cmd[pos++] = 15U; /* Lc = 3 (BF 33 0C) + 2 (5A 0A) + 10 (ICCID) = 15 */
+    cmd[pos++] = 0xBFU; cmd[pos++] = 0x33U; cmd[pos++] = 12U;
+    cmd[pos++] = 0x5AU; cmd[pos++] = 10U;
+    memcpy(cmd + pos, iccidBcd, 10U); pos += 10U;
+    cmd[pos++] = 0x00U; /* Le */
+
+    uint8_t rsp[512]; uint32_t rspLen = 0;
+    if (UimTransceiveApdu(hDev, st, slot, channelId, cmd, (uint16_t)pos, rsp, sizeof(rsp), &rspLen) && rspLen >= 2U) {
+        uint8_t sw1 = rsp[rspLen - 2U], sw2 = rsp[rspLen - 1U];
+        uint32_t resCode = 0xFFFFFFFFU;
+        DecodeEs10ResultTag80(rsp, rspLen - 2U, 0xBF33U, &resCode);
+        const char *resName = (resCode == 0U) ? "ok" : (resCode == 1U) ? "iccidOrAidNotFound" :
+                              (resCode == 2U) ? "profileNotInDisabledState" : (resCode == 3U) ? "disallowedByPolicy" :
+                              (resCode == 127U) ? "undefinedError" : "unknown";
+        printf("  [eSIM DeleteProfile] ICCID %s -> rspLen=%u SW=%02X%02X res=%u(%s) payload=",
+               iccidHex, rspLen, sw1, sw2, resCode, resName);
+        PrintHexStdout(rsp, rspLen - 2U);
+        printf("\n");
+        return (sw1 == 0x90U && sw2 == 0x00U && resCode == 0U);
+    }
+    printf("  [eSIM DeleteProfile] ICCID %s -> Failed (timeout/error)\n", iccidHex);
+    return 0;
+}
+
+/* GSMA SGP.22 ES10c DeleteProfileRequest (BF33): CHOICE { [4F: ISD-P AID] } */
+static int EsimDeleteProfileByAid(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t slot, uint8_t channelId, const char *aidHex) {
+    uint8_t aid[32];
+    uint32_t aidLen = ParseHexBytes(aidHex, aid, sizeof(aid));
+    if (aidLen == 0U || aidLen > 32U) {
+        printf("  [eSIM DeleteProfileByAid] Invalid AID hex '%s'\n", aidHex);
+        return 0;
+    }
+
+    uint8_t cmd[64];
+    uint32_t pos = 0;
+    uint8_t innerLen = (uint8_t)(2U + aidLen);
+    uint8_t lc = (uint8_t)(3U + innerLen);
+    cmd[pos++] = EsimPropCla(channelId); cmd[pos++] = 0xE2U; cmd[pos++] = 0x91U; cmd[pos++] = 0x00U;
+    cmd[pos++] = lc;
+    cmd[pos++] = 0xBFU; cmd[pos++] = 0x33U; cmd[pos++] = innerLen;
+    cmd[pos++] = 0x4FU; cmd[pos++] = (uint8_t)aidLen;
+    memcpy(cmd + pos, aid, aidLen); pos += aidLen;
+    cmd[pos++] = 0x00U; /* Le */
+
+    uint8_t rsp[512]; uint32_t rspLen = 0;
+    if (UimTransceiveApdu(hDev, st, slot, channelId, cmd, (uint16_t)pos, rsp, sizeof(rsp), &rspLen) && rspLen >= 2U) {
+        uint8_t sw1 = rsp[rspLen - 2U], sw2 = rsp[rspLen - 1U];
+        uint32_t resCode = 0xFFFFFFFFU;
+        DecodeEs10ResultTag80(rsp, rspLen - 2U, 0xBF33U, &resCode);
+        printf("  [eSIM DeleteProfileByAid] AID %s -> rspLen=%u SW=%02X%02X res=%u payload=",
+               aidHex, rspLen, sw1, sw2, resCode);
+        PrintHexStdout(rsp, rspLen - 2U);
+        printf("\n");
+        return (sw1 == 0x90U && sw2 == 0x00U && resCode == 0U);
+    }
+    printf("  [eSIM DeleteProfileByAid] AID %s -> Failed (timeout/error)\n", aidHex);
+    return 0;
+}
+
+static int EsimEuiccMemoryReset(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t slot, uint8_t channelId) {
+    uint8_t cmd[32];
+    uint32_t pos = 0;
+    cmd[pos++] = EsimPropCla(channelId); cmd[pos++] = 0xE2U; cmd[pos++] = 0x91U; cmd[pos++] = 0x00U;
+    cmd[pos++] = 0x07U; /* Lc */
+    cmd[pos++] = 0xBFU; cmd[pos++] = 0x34U; cmd[pos++] = 0x04U;
+    cmd[pos++] = 0x82U; cmd[pos++] = 0x02U; cmd[pos++] = 0x05U; cmd[pos++] = 0x80U; /* BIT STRING: bit 0 deleteOperationalProfiles */
+    cmd[pos++] = 0x00U; /* Le */
+
+    uint8_t rsp[512]; uint32_t rspLen = 0;
+    if (UimTransceiveApdu(hDev, st, slot, channelId, cmd, (uint16_t)pos, rsp, sizeof(rsp), &rspLen) && rspLen >= 2U) {
+        uint8_t sw1 = rsp[rspLen - 2U], sw2 = rsp[rspLen - 1U];
+        printf("  [eSIM EUICC Memory Reset] -> rspLen=%u SW=%02X%02X\n", rspLen, sw1, sw2);
+        return (sw1 == 0x90U && sw2 == 0x00U);
+    }
+    printf("  [eSIM EUICC Memory Reset] -> Failed (timeout/error)\n");
+    return 0;
+}
+
+static void PrintNotificationMetadata(const char *prefix, const uint8_t *val, uint32_t vlen) {
+    uint64_t seq = 0ULL;
+    int hasSeq = 0;
+    uint8_t opByte = 0U, opUnused = 0U;
+    int hasOp = 0;
+    char addr[256] = {0};
+    char iccid[40] = {0};
+    uint32_t pos = 0U, tag = 0U, flen = 0U;
+    const uint8_t *fval = NULL;
+    while (ReadBerTlv(val, vlen, &pos, &tag, &fval, &flen)) {
+        if (tag == 0x80U && flen > 0U) {
+            seq = ParseBigEndianUint(fval, flen);
+            hasSeq = 1;
+        } else if (tag == 0x81U && flen >= 2U) {
+            opUnused = fval[0];
+            opByte = fval[1];
+            hasOp = 1;
+        } else if (tag == 0x0CU && flen > 0U) {
+            uint32_t cp = (flen < sizeof(addr) - 1U) ? flen : (uint32_t)(sizeof(addr) - 1U);
+            memcpy(addr, fval, cp);
+            addr[cp] = 0;
+        } else if (tag == 0x5AU && flen > 0U) {
+            DecodeBcdSwap(fval, flen, iccid, sizeof(iccid));
+        }
+    }
+    printf("  %s seq=%s%llu op=0x%02x(unused=%u:%s%s%s%s) addr='%s' ICCID='%s'\n",
+           prefix,
+           hasSeq ? "" : "?", (unsigned long long)seq,
+           hasOp ? opByte : 0U, hasOp ? opUnused : 0U,
+           (opByte & 0x80U) ? "install " : "",
+           (opByte & 0x40U) ? "enable " : "",
+           (opByte & 0x20U) ? "disable " : "",
+           (opByte & 0x10U) ? "delete " : "",
+           addr[0] ? addr : "-",
+           iccid[0] ? iccid : "-");
+}
+
+/* GSMA SGP.22 ES10b ListNotificationRequest (BF28): <CLA> E2 91 00 03 BF 28 00 00 */
+static void EsimListNotifications(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t slot, uint8_t channelId) {
+    uint8_t *rsp = (uint8_t *)malloc(16384U);
+    if (!rsp) return;
+    uint32_t rspLen = 0U;
+    uint8_t cmd[9] = { EsimPropCla(channelId), 0xE2U, 0x91U, 0x00U, 0x03U, 0xBFU, 0x28U, 0x00U, 0x00U };
+    if (UimTransceiveApdu(hDev, st, slot, channelId, cmd, sizeof(cmd), rsp, 16384U, &rspLen) && rspLen >= 2U) {
+        uint8_t sw1 = rsp[rspLen - 2U], sw2 = rsp[rspLen - 1U];
+        uint32_t pos = 0U, tag = 0U, vlen = 0U;
+        const uint8_t *val = NULL;
+        if (sw1 == 0x90U && sw2 == 0x00U && ReadBerTlv(rsp, rspLen - 2U, &pos, &tag, &val, &vlen) && tag == 0xBF28U) {
+            uint32_t lpos = 0U, ltag = 0U, llen = 0U;
+            const uint8_t *lval = NULL;
+            uint32_t cnt = 0U;
+            if (ReadBerTlv(val, vlen, &lpos, &ltag, &lval, &llen) && ltag == 0xA0U) {
+                uint32_t epos = 0U, etag = 0U, elen = 0U;
+                const uint8_t *eval = NULL;
+                while (ReadBerTlv(lval, llen, &epos, &etag, &eval, &elen)) {
+                    if (etag == 0xBF2FU) {
+                        cnt++;
+                        char pfx[32];
+                        snprintf(pfx, sizeof(pfx), "[Notif #%u]", cnt);
+                        PrintNotificationMetadata(pfx, eval, elen);
+                    }
+                }
+            } else {
+                printf("  [eSIM ES10b ListNotification] rspLen=%u raw=", rspLen);
+                PrintHexStdout(rsp, rspLen - 2U);
+                printf("\n");
+            }
+            if (cnt == 0U) {
+                printf("  [eSIM ES10b ListNotification] 0 pending notifications (SW=9000)\n");
+            }
+        } else {
+            printf("  [eSIM ES10b ListNotification] rspLen=%u SW=%02X%02X payload=", rspLen, sw1, sw2);
+            PrintHexStdout(rsp, (rspLen >= 2U) ? (rspLen - 2U) : 0U);
+            printf("\n");
+        }
+    } else {
+        printf("  [eSIM ES10b ListNotification] Failed (timeout/error)\n");
+    }
+    free(rsp);
+}
+
+/* GSMA SGP.22 ES10b RetrieveNotificationsListRequest (BF2B): all (seqOpt < 0) or by seqNumber */
+static void EsimRetrieveNotifications(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t slot, uint8_t channelId, long long seqOpt) {
+    uint8_t cmd[24];
+    uint32_t pos = 0U;
+    cmd[pos++] = EsimPropCla(channelId); cmd[pos++] = 0xE2U; cmd[pos++] = 0x91U; cmd[pos++] = 0x00U;
+    if (seqOpt < 0LL) {
+        cmd[pos++] = 0x03U;
+        cmd[pos++] = 0xBFU; cmd[pos++] = 0x2BU; cmd[pos++] = 0x00U;
+    } else {
+        uint8_t seqBytes[9];
+        uint8_t sn = BuildSignedBigEndianSeq((uint64_t)seqOpt, seqBytes);
+        cmd[pos++] = (uint8_t)(5U + sn); /* Lc */
+        cmd[pos++] = 0xBFU; cmd[pos++] = 0x2BU; cmd[pos++] = (uint8_t)(2U + sn);
+        cmd[pos++] = 0x80U; cmd[pos++] = sn;
+        memcpy(cmd + pos, seqBytes, sn); pos += sn;
+    }
+    cmd[pos++] = 0x00U; /* Le */
+
+    uint8_t *rsp = (uint8_t *)malloc(16384U);
+    if (!rsp) return;
+    uint32_t rspLen = 0U;
+    if (UimTransceiveApdu(hDev, st, slot, channelId, cmd, (uint16_t)pos, rsp, 16384U, &rspLen) && rspLen >= 2U) {
+        uint8_t sw1 = rsp[rspLen - 2U], sw2 = rsp[rspLen - 1U];
+        uint32_t rpos = 0U, tag = 0U, vlen = 0U;
+        const uint8_t *val = NULL;
+        if (sw1 == 0x90U && sw2 == 0x00U && ReadBerTlv(rsp, rspLen - 2U, &rpos, &tag, &val, &vlen) && tag == 0xBF2BU) {
+            uint32_t lpos = 0U, ltag = 0U, llen = 0U;
+            const uint8_t *lval = NULL;
+            uint32_t cnt = 0U;
+            if (ReadBerTlv(val, vlen, &lpos, &ltag, &lval, &llen) && ltag == 0xA0U) {
+                uint32_t epos = 0U;
+                while (epos < llen) {
+                    uint32_t elemStart = epos;
+                    uint32_t etag = 0U, elen = 0U;
+                    const uint8_t *eval = NULL;
+                    if (!ReadBerTlv(lval, llen, &epos, &etag, &eval, &elen)) break;
+                    uint32_t fullLen = epos - elemStart;
+                    uint64_t seq = 0ULL;
+                    int hasSeq = 0;
+                    uint32_t cpos = 0U, ctag = 0U, clen = 0U;
+                    const uint8_t *cval = NULL;
+                    while (ReadBerTlv(eval, elen, &cpos, &ctag, &cval, &clen)) {
+                        if (ctag == 0xBF2FU || ctag == 0xA0U) {
+                            uint32_t mpos = 0U, mtag = 0U, mlen = 0U;
+                            const uint8_t *mval = NULL;
+                            while (ReadBerTlv(cval, clen, &mpos, &mtag, &mval, &mlen)) {
+                                if (mtag == 0x80U && mlen > 0U && !hasSeq) {
+                                    seq = ParseBigEndianUint(mval, mlen);
+                                    hasSeq = 1;
+                                }
+                                if (mtag == 0xBF2FU) {
+                                    uint32_t npos = 0U, ntag = 0U, nlen = 0U;
+                                    const uint8_t *nval = NULL;
+                                    while (ReadBerTlv(mval, mlen, &npos, &ntag, &nval, &nlen)) {
+                                        if (ntag == 0x80U && nlen > 0U) {
+                                            seq = ParseBigEndianUint(nval, nlen);
+                                            hasSeq = 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    cnt++;
+                    if (hasSeq) {
+                        printf("  PENDING_NOTIF_HEX:%llu:", (unsigned long long)seq);
+                    } else {
+                        printf("  PENDING_NOTIF_HEX:unknown:");
+                    }
+                    PrintHexStdout(lval + elemStart, fullLen);
+                    printf("\n");
+                }
+            }
+            if (cnt == 0U) {
+                printf("  [eSIM ES10b RetrieveNotifications] 0 returned (rspLen=%u SW=%02X%02X) payload=", rspLen, sw1, sw2);
+                PrintHexStdout(rsp, rspLen - 2U);
+                printf("\n");
+            }
+        } else {
+            printf("  [eSIM ES10b RetrieveNotifications] rspLen=%u SW=%02X%02X payload=", rspLen, sw1, sw2);
+            PrintHexStdout(rsp, (rspLen >= 2U) ? (rspLen - 2U) : 0U);
+            printf("\n");
+        }
+    } else {
+        printf("  [eSIM ES10b RetrieveNotifications] Failed (timeout/error)\n");
+    }
+    free(rsp);
+}
+
+/* GSMA SGP.22 ES10b RemoveNotificationFromListRequest (BF30): BF 30 <2+n> 80 <n> <seqBytes> */
+static int EsimRemoveNotification(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t slot, uint8_t channelId, uint64_t seq) {
+    uint8_t seqBytes[9];
+    uint8_t sn = BuildSignedBigEndianSeq(seq, seqBytes);
+
+    uint8_t cmd[24];
+    uint32_t pos = 0U;
+    cmd[pos++] = EsimPropCla(channelId); cmd[pos++] = 0xE2U; cmd[pos++] = 0x91U; cmd[pos++] = 0x00U;
+    cmd[pos++] = (uint8_t)(5U + sn); /* Lc */
+    cmd[pos++] = 0xBFU; cmd[pos++] = 0x30U; cmd[pos++] = (uint8_t)(2U + sn);
+    cmd[pos++] = 0x80U; cmd[pos++] = sn;
+    memcpy(cmd + pos, seqBytes, sn); pos += sn;
+    cmd[pos++] = 0x00U; /* Le */
+
+    uint8_t rsp[256]; uint32_t rspLen = 0U;
+    if (UimTransceiveApdu(hDev, st, slot, channelId, cmd, (uint16_t)pos, rsp, sizeof(rsp), &rspLen) && rspLen >= 2U) {
+        uint8_t sw1 = rsp[rspLen - 2U], sw2 = rsp[rspLen - 1U];
+        uint32_t resCode = 0xFFFFFFFFU;
+        DecodeEs10ResultTag80(rsp, rspLen - 2U, 0xBF30U, &resCode);
+        const char *resName = (resCode == 0U) ? "ok" : (resCode == 1U) ? "nothingToDelete" :
+                              (resCode == 127U) ? "undefinedError" : "unknown";
+        printf("  [eSIM ES10b RemoveNotification seq=%llu] -> rspLen=%u SW=%02X%02X res=%u(%s) payload=",
+               (unsigned long long)seq, rspLen, sw1, sw2, resCode, resName);
+        PrintHexStdout(rsp, rspLen - 2U);
+        printf("\n");
+        return (sw1 == 0x90U && sw2 == 0x00U && resCode == 0U);
+    }
+    printf("  [eSIM ES10b RemoveNotification seq=%llu] -> Failed (timeout/error)\n", (unsigned long long)seq);
+    return 0;
+}
+
 static void QueryEsimEuiccViaApdu(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t slot,
-                                  const char *enableIccid, const char *disableIccid, const char *deleteIccid) {
-    printf("=== [GSMA SGP.22 ES10c eUICC APDU Query on Logical Slot %u] ===\n", slot);
+                                  const char *enableIccid, const char *disableIccid,
+                                  const char *deleteIccid, const char *deleteAidHex,
+                                  int doGetNotifs, long long getNotifSeq, long long removeNotifSeq) {
+    printf("=== [GSMA SGP.22 ES10c/ES10b eUICC APDU Query on Logical Slot %u] ===\n", slot);
     /* GSMA SGP.22 ISD-R AID: A0 00 00 05 59 10 10 FF FF FF FF 89 00 00 01 00 */
     static const uint8_t isdrAid[16] = {
         0xA0, 0x00, 0x00, 0x05, 0x59, 0x10, 0x10, 0xFF,
@@ -1054,7 +1397,11 @@ static void QueryEsimEuiccViaApdu(HANDLE hDev, const S23MODEM_STATUS_INFO *st, u
         return;
     }
 
-    uint8_t rsp[4096];
+    uint8_t *rsp = (uint8_t *)malloc(16384U);
+    if (!rsp) {
+        UimCloseLogicalChannel(hDev, st, slot, chId);
+        return;
+    }
     uint32_t rspLen = 0U;
 
     /* Execute requested CLI actions before reading the final state */
@@ -1064,14 +1411,22 @@ static void QueryEsimEuiccViaApdu(HANDLE hDev, const S23MODEM_STATUS_INFO *st, u
         if (strcmp(deleteIccid, "reset") == 0) {
             EsimEuiccMemoryReset(hDev, st, slot, chId);
         } else {
-            /* Fallback APDU: ES10c DeleteProfileRequest */
             EsimDeleteProfile(hDev, st, slot, chId, deleteIccid);
         }
+    }
+    if (deleteAidHex) {
+        EsimDeleteProfileByAid(hDev, st, slot, chId, deleteAidHex);
+    }
+    if (removeNotifSeq >= 0LL) {
+        EsimRemoveNotification(hDev, st, slot, chId, (uint64_t)removeNotifSeq);
+    }
+    if (doGetNotifs) {
+        EsimRetrieveNotifications(hDev, st, slot, chId, getNotifSeq);
     }
 
     /* 1. ES10c GetEID: <CLA> E2 91 00 06 BF 3E 03 5C 01 5A 00 */
     uint8_t cmdGetEid[12] = { EsimPropCla(chId), 0xE2U, 0x91U, 0x00U, 0x06U, 0xBFU, 0x3EU, 0x03U, 0x5CU, 0x01U, 0x5AU, 0x00U };
-    if (UimTransceiveApdu(hDev, st, slot, chId, cmdGetEid, sizeof(cmdGetEid), rsp, sizeof(rsp), &rspLen) && rspLen >= 2U) {
+    if (UimTransceiveApdu(hDev, st, slot, chId, cmdGetEid, sizeof(cmdGetEid), rsp, 16384U, &rspLen) && rspLen >= 2U) {
         uint8_t sw1 = rsp[rspLen - 2U], sw2 = rsp[rspLen - 1U];
         uint32_t pos = 0, tag = 0, vlen = 0;
         const uint8_t *val = NULL;
@@ -1092,7 +1447,7 @@ static void QueryEsimEuiccViaApdu(HANDLE hDev, const S23MODEM_STATUS_INFO *st, u
 
     /* 2. ES10c GetProfilesInfo: <CLA> E2 91 00 03 BF 2D 00 00 */
     uint8_t cmdGetProf[9] = { EsimPropCla(chId), 0xE2U, 0x91U, 0x00U, 0x03U, 0xBFU, 0x2DU, 0x00U, 0x00U };
-    if (UimTransceiveApdu(hDev, st, slot, chId, cmdGetProf, sizeof(cmdGetProf), rsp, sizeof(rsp), &rspLen) && rspLen >= 2U) {
+    if (UimTransceiveApdu(hDev, st, slot, chId, cmdGetProf, sizeof(cmdGetProf), rsp, 16384U, &rspLen) && rspLen >= 2U) {
         uint8_t sw1 = rsp[rspLen - 2U], sw2 = rsp[rspLen - 1U];
         uint32_t pos = 0, tag = 0, vlen = 0;
         const uint8_t *val = NULL;
@@ -1105,22 +1460,64 @@ static void QueryEsimEuiccViaApdu(HANDLE hDev, const S23MODEM_STATUS_INFO *st, u
                 const uint8_t *eval = NULL;
                 while (ReadBerTlv(lval, llen, &epos, &etag, &eval, &elen)) {
                     if (etag == 0xE3U) {
-                        char iccid[32] = {0}, spn[64] = {0}, pname[64] = {0}, nick[64] = {0};
+                        char iccid[32] = {0}, spn[64] = {0}, pname[64] = {0}, nick[64] = {0}, aidHex[68] = {0};
                         uint32_t pstate = 0U, pclass = 2U;
+                        uint8_t pprUnused = 0U, pprByte = 0U; int hasPpr = 0;
+                        uint8_t b6Buf[512]; uint32_t b6Len = 0U;
                         uint32_t fpos = 0, ftag = 0, flen = 0;
                         const uint8_t *fval = NULL;
                         while (ReadBerTlv(eval, elen, &fpos, &ftag, &fval, &flen)) {
-                            if (ftag == 0x5AU) DecodeBcdSwap(fval, flen, iccid, sizeof(iccid));
+                            if (ftag == 0x4FU) FormatHex(fval, (flen < 32U) ? flen : 32U, aidHex, sizeof(aidHex));
+                            else if (ftag == 0x5AU) DecodeBcdSwap(fval, flen, iccid, sizeof(iccid));
                             else if (ftag == 0x9F70U && flen >= 1U) pstate = fval[0];
                             else if (ftag == 0x90U) { uint32_t c = (flen < 63U) ? flen : 63U; memcpy(nick, fval, c); nick[c] = 0; }
                             else if (ftag == 0x91U) { uint32_t c = (flen < 63U) ? flen : 63U; memcpy(spn, fval, c); spn[c] = 0; }
                             else if (ftag == 0x92U) { uint32_t c = (flen < 63U) ? flen : 63U; memcpy(pname, fval, c); pname[c] = 0; }
                             else if (ftag == 0x95U && flen >= 1U) pclass = fval[0];
+                            else if (ftag == 0x99U && flen >= 2U) { pprUnused = fval[0]; pprByte = fval[1]; hasPpr = 1; }
+                            else if (ftag == 0xB6U && flen > 0U) {
+                                b6Len = (flen < sizeof(b6Buf)) ? flen : (uint32_t)sizeof(b6Buf);
+                                memcpy(b6Buf, fval, b6Len);
+                            }
                         }
                         profIdx++;
-                        printf("  [eSIM Profile #%u] ICCID=%s State=%u(%s) SPN='%s' Name='%s' Nick='%s' Class=%u\n",
+                        printf("  [eSIM Profile #%u] ICCID=%s State=%u(%s) SPN='%s' Name='%s' Nick='%s' Class=%u AID=%s\n",
                                profIdx, iccid, pstate, (pstate == 1U) ? "ENABLED" : "DISABLED",
-                               spn, pname, nick, pclass);
+                               spn, pname, nick, pclass, aidHex[0] ? aidHex : "-");
+                        if (hasPpr) {
+                            printf("    PPRs (0x99): unused=%u bits=0x%02x (updateCtrl=%u ppr1_disableNotAllowed=%u ppr2_deleteNotAllowed=%u)\n",
+                                   pprUnused, pprByte,
+                                   (pprByte & 0x80U) ? 1U : 0U,
+                                   (pprByte & 0x40U) ? 1U : 0U,
+                                   (pprByte & 0x20U) ? 1U : 0U);
+                        }
+                        if (b6Len > 0U) {
+                            printf("    NotifCfg (0xB6 raw %u B): ", b6Len);
+                            PrintHexStdout(b6Buf, b6Len);
+                            printf("\n");
+                            uint32_t bpos = 0U, btag = 0U, blen = 0U;
+                            const uint8_t *bval = NULL;
+                            while (ReadBerTlv(b6Buf, b6Len, &bpos, &btag, &bval, &blen)) {
+                                if (btag == 0x30U) {
+                                    uint32_t ip = 0U, it = 0U, il = 0U;
+                                    const uint8_t *iv = NULL;
+                                    uint8_t opB = 0U; char naddr[256] = {0};
+                                    while (ReadBerTlv(bval, blen, &ip, &it, &iv, &il)) {
+                                        if (it == 0x80U && il >= 2U) opB = iv[1];
+                                        else if (it == 0x0CU && il > 0U) {
+                                            uint32_t cp = (il < sizeof(naddr) - 1U) ? il : (uint32_t)(sizeof(naddr) - 1U);
+                                            memcpy(naddr, iv, cp); naddr[cp] = 0;
+                                        }
+                                    }
+                                    printf("      -> op=0x%02x (%s%s%s%s) addr='%s'\n", opB,
+                                           (opB & 0x80U) ? "install " : "",
+                                           (opB & 0x40U) ? "enable " : "",
+                                           (opB & 0x20U) ? "disable " : "",
+                                           (opB & 0x10U) ? "delete " : "",
+                                           naddr[0] ? naddr : "-");
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1132,6 +1529,10 @@ static void QueryEsimEuiccViaApdu(HANDLE hDev, const S23MODEM_STATUS_INFO *st, u
         }
     }
 
+    /* 3. ES10b ListNotification */
+    EsimListNotifications(hDev, st, slot, chId);
+
+    free(rsp);
     UimCloseLogicalChannel(hDev, st, slot, chId);
 }
 
@@ -1151,7 +1552,7 @@ static const char *NasRadioIfName(uint8_t r) {
 
 static void QueryNasAndWds(HANDLE hDev, const S23MODEM_STATUS_INFO *st) {
     printf("=== [QMI NAS 0x03 & WDS 0x01] 5G NR / LTE Network & Signal Status ===\n");
-    uint8_t tlvs[2048];
+    uint8_t tlvs[4096];
     uint16_t tlvLen = 0, qRes = 0, qErr = 0;
 
     /* 1. NAS_GET_SERVING_SYSTEM (0x0024) */
@@ -1507,11 +1908,17 @@ int main(int argc, char **argv) {
     int doScan = 0;
     int doBindGwPri = 0;
     int doTestWds = 0;
+    int doEsimOnly = 0;
+    int doEsimPowerCycle = 0;
+    int doEsimGetNotifs = 0;
+    long long esimGetNotifSeq = -1LL;
+    long long esimRemoveNotifSeq = -1LL;
     const char *enableIccid = NULL;
     const char *disableIccid = NULL;
     const char *deleteIccid = NULL;
+    const char *deleteAidHex = NULL;
 
-    /* Parse CLI options: --switch-slot <logical> <physical> or --load-pdc or --diag-live */
+    /* Parse CLI options */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--diag-live") == 0) {
             doDiagLive = 1;
@@ -1530,12 +1937,34 @@ int main(int argc, char **argv) {
             i += 2;
         } else if (strcmp(argv[i], "--load-pdc") == 0) {
             doLoadPdc = 1;
+        } else if (strcmp(argv[i], "--esim-info") == 0) {
+            doEsimOnly = 1;
+        } else if (strcmp(argv[i], "--esim-powercycle") == 0) {
+            doEsimOnly = 1;
+            doEsimPowerCycle = 1;
+        } else if (strcmp(argv[i], "--esim-get-notifs") == 0) {
+            doEsimOnly = 1;
+            doEsimGetNotifs = 1;
+            esimGetNotifSeq = -1LL;
+        } else if (strcmp(argv[i], "--esim-get-notif") == 0 && i + 1 < argc) {
+            doEsimOnly = 1;
+            doEsimGetNotifs = 1;
+            esimGetNotifSeq = _atoi64(argv[++i]);
+        } else if (strcmp(argv[i], "--esim-remove-notif") == 0 && i + 1 < argc) {
+            doEsimOnly = 1;
+            esimRemoveNotifSeq = _atoi64(argv[++i]);
         } else if (strcmp(argv[i], "--enable") == 0 && i + 1 < argc) {
+            doEsimOnly = 1;
             enableIccid = argv[++i];
         } else if (strcmp(argv[i], "--disable") == 0 && i + 1 < argc) {
+            doEsimOnly = 1;
             disableIccid = argv[++i];
         } else if (strcmp(argv[i], "--delete") == 0 && i + 1 < argc) {
+            doEsimOnly = 1;
             deleteIccid = argv[++i];
+        } else if (strcmp(argv[i], "--delete-aid") == 0 && i + 1 < argc) {
+            doEsimOnly = 1;
+            deleteAidHex = argv[++i];
         } else if (strcmp(argv[i], "--ipa-only") == 0) {
             QueryIpaStatus(hDev, &st);
             CloseHandle(hDev);
@@ -1701,8 +2130,10 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    QueryAndSetDmsOnline(hDev, &st, 1);
-    QueryPdcConfigs(hDev, &st);
+    if (!doEsimOnly) {
+        QueryAndSetDmsOnline(hDev, &st, 1);
+        QueryPdcConfigs(hDev, &st);
+    }
 
     if (doLoadPdc) {
         /* Ensure DSDS Hardware (type=0) & ROW Commercial Carrier (type=1) MCFG MBNs are selected and active */
@@ -1748,25 +2179,38 @@ int main(int argc, char **argv) {
         if (euiccLogSlot == 0U) {
             /* Try explicit power-cycle on Logical Slot 2 (QMI UIM 0x0030 / 0x0031) */
             UimPowerDownSlot(hDev, &st, 2U);
-            Sleep(300);
+            Sleep(400);
             UimPowerUpSlot(hDev, &st, 2U);
             Sleep(1500);
             QueryUimSlotsAndCards(hDev, &st, &euiccLogSlot, &euiccPhysSlot);
         }
+    } else if (doEsimPowerCycle) {
+        printf("  [eSIM] Power-cycling Logical Slot %u to clear any pending-refresh lock...\n", euiccLogSlot);
+        UimPowerDownSlot(hDev, &st, euiccLogSlot);
+        Sleep(400);
+        UimPowerUpSlot(hDev, &st, euiccLogSlot);
+        Sleep(1500);
+        QueryUimSlotsAndCards(hDev, &st, &euiccLogSlot, &euiccPhysSlot);
     }
 
-    UimGetAtr(hDev, &st, 1U);
-    UimGetAtr(hDev, &st, 2U);
-
     uint8_t targetEsimSlot = (euiccLogSlot != 0U) ? euiccLogSlot : 2U;
-    UnbindGwPri(hDev, &st);
-    Sleep(500);
-    QueryAndSetDmsOnline(hDev, &st, 2);
-    Sleep(2000);
-    QueryEsimEuiccViaApdu(hDev, &st, targetEsimSlot, enableIccid, disableIccid, deleteIccid);
+    UimGetAtr(hDev, &st, 1U);
+    UimGetAtr(hDev, &st, targetEsimSlot);
 
-    QueryNasAndWds(hDev, &st);
-    QueryIpaStatus(hDev, &st);
+    if (disableIccid || deleteIccid || deleteAidHex) {
+        UnbindGwPri(hDev, &st);
+        Sleep(500);
+        QueryAndSetDmsOnline(hDev, &st, 2);
+        Sleep(1000);
+    }
+
+    QueryEsimEuiccViaApdu(hDev, &st, targetEsimSlot, enableIccid, disableIccid, deleteIccid, deleteAidHex,
+                          doEsimGetNotifs, esimGetNotifSeq, esimRemoveNotifSeq);
+
+    if (!doEsimOnly) {
+        QueryNasAndWds(hDev, &st);
+        QueryIpaStatus(hDev, &st);
+    }
 
     CloseHandle(hDev);
     printf("=== s23modemd.exe complete ===\n");
