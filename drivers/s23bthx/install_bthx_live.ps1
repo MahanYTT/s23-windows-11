@@ -72,5 +72,18 @@ Write-Output "=== sc query s23bthx / BthMini / bthport ==="
 & sc.exe query s23bthx 2>&1
 & sc.exe query BthMini 2>&1
 & sc.exe query bthserv 2>&1
+Write-Output "=== Ensure DeviceSetupManager is out of OOBE mode (so Settings shows paired/connected devices) ==="
+& reg.exe add "HKLM\SYSTEM\Setup" /v OOBEInProgress /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+& reg.exe add "HKLM\SYSTEM\Setup" /v OOBEInProgressDriverUpdatesPostponed /t REG_DWORD /d 0 /f 2>&1 | Out-Null
+& reg.exe add "HKLM\SYSTEM\Setup\Status\ChildCompletion" /v oobeldr.exe /t REG_DWORD /d 3 /f 2>&1 | Out-Null
+$lastDsm = Get-WinEvent -LogName 'Microsoft-Windows-DeviceSetupManager/Admin' -MaxEvents 10 -ErrorAction SilentlyContinue | Where-Object { $_.Id -in 100,109 } | Select-Object -First 1
+if ($lastDsm -and $lastDsm.Message -match 'OOBE') {
+    Write-Output "Restarting DsmSvc to exit OOBE mode..."
+    & sc.exe stop DsmSvc 2>&1 | Out-Null
+    Start-Sleep -Seconds 2
+    & sc.exe start DsmSvc 2>&1 | Out-Null
+}
+& sc.exe start BluetoothUserService_478e9 2>&1 | Out-Null
+
 Write-Output "=== PnP Bluetooth Devices ==="
 Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue | Select-Object Status,Problem,Service,FriendlyName,InstanceId | Format-Table -AutoSize | Out-String -Width 220

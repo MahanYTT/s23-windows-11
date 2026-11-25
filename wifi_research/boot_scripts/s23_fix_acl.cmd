@@ -44,10 +44,13 @@ echo [7] Program Files recursive RX >> %LOG%
 icacls "C:\Program Files" /grant "*S-1-5-32-545:(OI)(CI)RX" /grant "*S-1-5-11:(OI)(CI)RX" /grant "*S-1-5-19:(OI)(CI)RX" /grant "*S-1-5-20:(OI)(CI)RX" /grant "*S-1-15-2-1:(OI)(CI)RX" /grant "*S-1-15-2-2:(OI)(CI)RX" /T /C /Q >> %LOG% 2>&1
 icacls "C:\Program Files (x86)" /grant "*S-1-5-32-545:(OI)(CI)RX" /grant "*S-1-5-11:(OI)(CI)RX" /grant "*S-1-5-19:(OI)(CI)RX" /grant "*S-1-5-20:(OI)(CI)RX" /grant "*S-1-15-2-1:(OI)(CI)RX" /grant "*S-1-15-2-2:(OI)(CI)RX" /T /C /Q >> %LOG% 2>&1
 
-echo [8] Resetting SetupType=0, SystemSetupInProgress=0, CmdLine="" >> %LOG%
+echo [8] Resetting SetupType=0, SystemSetupInProgress=0, CmdLine="", and OOBE flags >> %LOG%
 reg add HKLM\SYSTEM\Setup /v SetupType /t REG_DWORD /d 0 /f >> %LOG% 2>&1
 reg add HKLM\SYSTEM\Setup /v SystemSetupInProgress /t REG_DWORD /d 0 /f >> %LOG% 2>&1
 reg add HKLM\SYSTEM\Setup /v CmdLine /t REG_SZ /d "" /f >> %LOG% 2>&1
+reg add HKLM\SYSTEM\Setup /v OOBEInProgress /t REG_DWORD /d 0 /f >> %LOG% 2>&1
+reg add HKLM\SYSTEM\Setup /v OOBEInProgressDriverUpdatesPostponed /t REG_DWORD /d 0 /f >> %LOG% 2>&1
+reg add HKLM\SYSTEM\Setup\Status\ChildCompletion /v oobeldr.exe /t REG_DWORD /d 3 /f >> %LOG% 2>&1
 
 echo === s23_fix_acl.cmd FINISHED %DATE% %TIME% === >> %LOG%
 exit 0

@@ -125,7 +125,9 @@ typedef const uint16_t *PCWSTR;
 
 #define HciPacketCommand                0x01u
 #define HciPacketAclData                0x02u
+#define HciPacketScoData                0x03u
 #define HciPacketEvent                  0x04u
+#define HciPacketIsoData                0x05u
 #define ScoSupportNone                  0u
 #define ScoSupportHCIBypass             2u
 
@@ -530,6 +532,14 @@ static inline PDRIVER_CANCEL IoSetCancelRoutine(PIRP Irp, PDRIVER_CANCEL fn) {
 #define LOG_CAP 65536U
 static char     g_LogBuf[LOG_CAP];
 static uint32_t g_LogLen = 0;
+static KEVENT   g_LogMutex;
+
+static VOID LogLock(VOID) {
+    (void)KeWaitForSingleObject(&g_LogMutex, Executive, KernelMode, FALSE, NULL);
+}
+static VOID LogUnlock(VOID) {
+    (void)KeSetEvent(&g_LogMutex, IO_NO_INCREMENT, FALSE);
+}
 
 #define FW_BUF_CAP 184320U
 static uint8_t  g_FwBuf[FW_BUF_CAP];
@@ -1544,7 +1554,7 @@ static VOID S23BthxCancelIrp(PDEVICE_OBJECT devObj, PIRP irp) {
     IofCompleteRequest(irp, IO_NO_INCREMENT);
 }
 
-static VOID CompleteReadIrpWithPacket(PIRP irp, UCHAR pktType, const uint8_t *pkt, uint32_t pktLen) {
+static NTSTATUS CompleteReadIrpWithPacket(PIRP irp, UCHAR pktType, const uint8_t *pkt, uint32_t pktLen) {
     PIO_STACK_LOCATION isl = IoGetCurrentIrpStackLocation(irp);
     ULONG outLen = isl->Parameters.DeviceIoControl.OutputBufferLength;
     PBTHX_HCI_READ_WRITE_CONTEXT outCtx = (PBTHX_HCI_READ_WRITE_CONTEXT)irp->UserBuffer;
@@ -1552,7 +1562,7 @@ static VOID CompleteReadIrpWithPacket(PIRP irp, UCHAR pktType, const uint8_t *pk
         irp->IoStatus.Status = STATUS_BUFFER_TOO_SMALL;
         irp->IoStatus.Information = 0;
         IofCompleteRequest(irp, IO_NO_INCREMENT);
-        return;
+        return STATUS_BUFFER_TOO_SMALL;
     }
     outCtx->Type = pktType;
     outCtx->DataLen = pktLen;
@@ -1560,6 +1570,7 @@ static VOID CompleteReadIrpWithPacket(PIRP irp, UCHAR pktType, const uint8_t *pk
     irp->IoStatus.Status = STATUS_SUCCESS;
     irp->IoStatus.Information = 5U + (ULONG_PTR)pktLen;
     IofCompleteRequest(irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
 }
 
 /* ============================================================================
@@ -1605,10 +1616,13 @@ static VOID S23BthxTxThread(PVOID ctx) {
                     ext->TxScratch[1] == 0x6DU && ext->TxScratch[2] == 0x0CU &&
                     ext->TxScratch[3] == 0x02U && ext->TxScratch[5] != 0x00U) {
                     ext->TxScratch[5] = 0x00U;
+                    LogLock();
                     LogStr("  [QUIRK] Write_LE_Host_Support(0x0C6D): Simultaneous_LE_Host 1->0\r\n");
+                    LogUnlock();
                 }
                 if (ext->LogTxCount < 80U) {
                     ext->LogTxCount++;
+                    LogLock();
                     LogStr("  TX type="); LogHex8(inCtx->Type);
                     LogStr(" len="); LogU32(dlen);
                     if (dlen >= 2U) {
@@ -1616,6 +1630,7 @@ static VOID S23BthxTxThread(PVOID ctx) {
                     }
                     LogStr("\r\n");
                     FlushLogFile();
+                    LogUnlock();
                 }
                 if (GeniTxRaw(ext, ext->TxScratch, 1U + dlen)) {
                     *outBytes = dlen;
@@ -1642,6 +1657,7 @@ static VOID S23BthxTxThread(PVOID ctx) {
 static VOID DeliverRxPacket(PS23BTHX_EXT ext, UCHAR pktType, const uint8_t *pkt, uint32_t pktLen) {
     if (ext->LogRxCount < 80U) {
         ext->LogRxCount++;
+        LogLock();
         LogStr("  RX type="); LogHex8(pktType);
         LogStr(" len="); LogU32(pktLen);
         if (pktLen >= 1U) { LogStr(" b0="); LogHex8(pkt[0]); }
@@ -1651,6 +1667,7 @@ static VOID DeliverRxPacket(PS23BTHX_EXT ext, UCHAR pktType, const uint8_t *pkt,
         }
         LogStr("\r\n");
         FlushLogFile();
+        LogUnlock();
     }
 
     KIRQL oldIrql = KeAcquireSpinLockRaiseToDpc(&ext->IoLock);
@@ -1695,21 +1712,39 @@ static VOID ProcessRxByte(PS23BTHX_EXT ext, uint8_t ch) {
             ext->RxGot = 0;
             ext->RxNeed = 4U;
             ext->RxState = RX_STATE_HDR;
+        } else if (ch == HciPacketScoData) {
+            ext->RxPktType = HciPacketScoData;
+            ext->RxGot = 0;
+            ext->RxNeed = 3U;
+            ext->RxState = RX_STATE_HDR;
+        } else if (ch == HciPacketIsoData) {
+            ext->RxPktType = HciPacketIsoData;
+            ext->RxGot = 0;
+            ext->RxNeed = 4U;
+            ext->RxState = RX_STATE_HDR;
         }
         break;
 
     case RX_STATE_HDR:
         ext->RxPktBuf[ext->RxGot++] = ch;
         if (ext->RxGot >= ext->RxNeed) {
-            uint32_t payload = (ext->RxPktType == HciPacketEvent)
-                ? (uint32_t)ext->RxPktBuf[1]
-                : ((uint32_t)ext->RxPktBuf[2] | ((uint32_t)ext->RxPktBuf[3] << 8));
+            uint32_t payload = 0U;
+            if (ext->RxPktType == HciPacketEvent) {
+                payload = (uint32_t)ext->RxPktBuf[1];
+            } else if (ext->RxPktType == HciPacketAclData) {
+                payload = (uint32_t)ext->RxPktBuf[2] | ((uint32_t)ext->RxPktBuf[3] << 8);
+            } else if (ext->RxPktType == HciPacketScoData) {
+                payload = (uint32_t)ext->RxPktBuf[2];
+            } else if (ext->RxPktType == HciPacketIsoData) {
+                payload = (uint32_t)ext->RxPktBuf[2] | (((uint32_t)ext->RxPktBuf[3] & 0x3FU) << 8);
+            }
             uint32_t total = ext->RxNeed + payload;
-            if (total > MAX_PKT_BYTES) {
+            BOOLEAN deliver = (ext->RxPktType == HciPacketEvent || ext->RxPktType == HciPacketAclData) ? TRUE : FALSE;
+            if (deliver && total > MAX_PKT_BYTES) {
                 ext->RxState = RX_STATE_IDLE;
                 ext->RxGot = 0;
             } else if (payload == 0U) {
-                DeliverRxPacket(ext, ext->RxPktType, ext->RxPktBuf, total);
+                if (deliver) DeliverRxPacket(ext, ext->RxPktType, ext->RxPktBuf, total);
                 ext->RxState = RX_STATE_IDLE;
                 ext->RxGot = 0;
             } else {
@@ -1720,9 +1755,14 @@ static VOID ProcessRxByte(PS23BTHX_EXT ext, uint8_t ch) {
         break;
 
     case RX_STATE_BODY:
-        ext->RxPktBuf[ext->RxGot++] = ch;
+        if (ext->RxGot < MAX_PKT_BYTES) {
+            ext->RxPktBuf[ext->RxGot] = ch;
+        }
+        ext->RxGot++;
         if (ext->RxGot >= ext->RxNeed) {
-            DeliverRxPacket(ext, ext->RxPktType, ext->RxPktBuf, ext->RxNeed);
+            if (ext->RxPktType == HciPacketEvent || ext->RxPktType == HciPacketAclData) {
+                DeliverRxPacket(ext, ext->RxPktType, ext->RxPktBuf, ext->RxNeed);
+            }
             ext->RxState = RX_STATE_IDLE;
             ext->RxGot = 0;
         }
@@ -1790,12 +1830,14 @@ static NTSTATUS S23BthxDispatchIoctl(PDEVICE_OBJECT fdo, PIRP irp) {
 
     if (ext->LogIoctlCount < 20U) {
         ext->LogIoctlCount++;
+        LogLock();
         LogStr("IOCTL mj="); LogHex8(isl->MajorFunction);
         LogStr(" code="); LogHex32(code);
         LogStr(" in="); LogU32(inLen);
         LogStr(" out="); LogU32(outLen);
         LogStr("\r\n");
         FlushLogFile();
+        LogUnlock();
     }
 
     switch (code) {
@@ -1949,9 +1991,8 @@ static NTSTATUS S23BthxDispatchIoctl(PDEVICE_OBJECT fdo, PIRP irp) {
         KeReleaseSpinLock(&ext->IoLock, oldIrql);
 
         if (havePkt) {
-            CompleteReadIrpWithPacket(irp, (UCHAR)pktType, pktCopy, pktLen);
+            NTSTATUS cst = CompleteReadIrpWithPacket(irp, (UCHAR)pktType, pktCopy, pktLen);
             ReleaseReadBuf(ext, pktCopy);
-            NTSTATUS cst = irp->IoStatus.Status;
             IoReleaseRemoveLockEx(&ext->RemoveLock, irp, sizeof(IO_REMOVE_LOCK));
             return cst;
         }
@@ -2075,13 +2116,18 @@ static NTSTATUS S23BthxPnp(PDEVICE_OBJECT fdo, PIRP irp) {
                 NTSTATUS t1 = SpawnWorker(S23BthxTxThread, ext, &ext->TxThreadObj);
                 NTSTATUS t2 = SpawnWorker(S23BthxRxThread, ext, &ext->RxThreadObj);
                 if (!NT_SUCCESS(t1) || !NT_SUCCESS(t2)) {
+                    LogLock();
                     LogStr("[ERR] Failed to spawn TX/RX worker threads\r\n");
+                    FlushLogFile();
+                    LogUnlock();
                     S23BthxStopHw(ext);
                     st = STATUS_INSUFFICIENT_RESOURCES;
                 } else {
+                    LogLock();
                     LogStr("s23bthx START_DEVICE complete (TX/RX workers active)\r\n");
+                    FlushLogFile();
+                    LogUnlock();
                 }
-                FlushLogFile();
             }
         }
         irp->IoStatus.Status = st;
@@ -2107,8 +2153,10 @@ static NTSTATUS S23BthxPnp(PDEVICE_OBJECT fdo, PIRP irp) {
         NTSTATUS st = IofCallDriver(ext->LowerDevice, irp);
         IoDetachDevice(ext->LowerDevice);
         IoDeleteDevice(fdo);
+        LogLock();
         LogStr("s23bthx REMOVE_DEVICE done\r\n");
         FlushLogFile();
+        LogUnlock();
         return st;
     }
 
@@ -2161,8 +2209,10 @@ static NTSTATUS S23BthxAddDevice(PDRIVER_OBJECT drv, PDEVICE_OBJECT pdo) {
                                  FILE_DEVICE_BLUETOOTH, FILE_DEVICE_SECURE_OPEN,
                                  FALSE, &fiDo);
     if (!NT_SUCCESS(st) || !fiDo) {
+        LogLock();
         LogStr("[ERR] IoCreateDevice failed\r\n");
         FlushLogFile();
+        LogUnlock();
         return st;
     }
 
@@ -2185,15 +2235,19 @@ static NTSTATUS S23BthxAddDevice(PDRIVER_OBJECT drv, PDEVICE_OBJECT pdo) {
     /* Mirror lower device buffering & power flags cleanly */
     fiDo->Flags |= (ext->LowerDevice->Flags & (DO_POWER_PAGABLE)) | 0;
     fiDo->Flags &= ~DO_DEVICE_INITIALIZING;
+    LogLock();
     LogStr("s23bthx AddDevice OK\r\n");
     FlushLogFile();
+    LogUnlock();
     return STATUS_SUCCESS;
 }
 
 static VOID S23BthxUnload(PDRIVER_OBJECT drv) {
     (void)drv;
+    LogLock();
     LogStr("s23bthx DriverUnload\r\n");
     FlushLogFile();
+    LogUnlock();
 }
 
 /* Forced .reloc anchors for ARM64 /DYNAMICBASE */
@@ -2203,11 +2257,14 @@ volatile ULONG gRelocTouch = 1u;
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
     (void)RegistryPath;
-    LogStr("=== s23bthx.sys v1.0.0.5 (ARM64 WDM BTHX LowerFilter) DriverEntry ===\r\n");
     if (!gRelocAnchors[0] || !gRelocAnchors[1] || gRelocTouch == 0U) {
         return STATUS_UNSUCCESSFUL;
     }
+    KeInitializeEvent(&g_LogMutex, SynchronizationEvent, TRUE);
+    LogLock();
+    LogStr("=== s23bthx.sys v1.0.0.6 (ARM64 WDM BTHX LowerFilter) DriverEntry ===\r\n");
     FlushLogFile();
+    LogUnlock();
 
     DriverObject->MajorFunction[IRP_MJ_CREATE]                  = S23BthxPassDown;
     DriverObject->MajorFunction[IRP_MJ_CLOSE]                   = S23BthxPassDown;
