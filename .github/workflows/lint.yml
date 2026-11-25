@@ -111,18 +111,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang-18 lld-18 llvm-18 binutils-aarch64-linux-gnu
           echo /usr/lib/llvm-18/bin >> "$GITHUB_PATH"
-      # drivers/s23audprobe and drivers/s23audio are deliberately not built here (live work in progress).
-      - name: Build helper and probe drivers (same flags as local WSL builds)
+      # Every drivers/*/build_wsl.py that is not in the production list above is discovered automatically,
+      # so new drivers are built without editing this file. drivers/s23audprobe is deliberately skipped.
+      - name: Build every other drivers/*/build_wsl.py (same flags as local WSL builds)
         run: |
-          for d in s23perf s23disp_diag s23aclfix s23aclsvc s23pilprobe s23pcieprobe s23sensprobe s23btprobe s23gpuprobe; do
+          for f in drivers/*/build_wsl.py; do
+            d="$(basename "$(dirname "$f")")"
+            case "$d" in s23batt|s23bthx|s23keys|s23touch|s23audprobe) continue ;; esac
             echo "::group::$d"
-            python3 "drivers/$d/build_wsl.py"
+            python3 "$f"
             echo "::endgroup::"
           done
-      - name: __chkstk / stack frame check (kernel drivers only; s23aclsvc.exe is a user-mode service)
+      - name: __chkstk / stack frame / .reloc check (every built kernel driver)
         run: |
-          python3 scripts/ci/check_driver_stack.py \
-            drivers/s23perf/out/s23perf.sys drivers/s23disp_diag/out/s23disp_diag.sys \
-            drivers/s23aclfix/out/s23aclfix.sys drivers/s23pilprobe/out/s23pilprobe.sys \
-            drivers/s23pcieprobe/out/s23pcieprobe.sys drivers/s23sensprobe/out/s23sensprobe.sys \
-            drivers/s23btprobe/out/s23btprobe.sys drivers/s23gpuprobe/out/s23gpuprobe.sys
+          shopt -s nullglob
+          sys=(drivers/*/out/*.sys)
+          if [ "${#sys[@]}" -gt 0 ]; then python3 scripts/ci/check_driver_stack.py "${sys[@]}"; fi

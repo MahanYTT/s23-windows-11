@@ -22,7 +22,20 @@ ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
 GPU = os.path.join(ROOT, "drivers", "s23gpu")
 PERF = os.path.join(ROOT, "drivers", "s23perf")
 
-TESTS = ["test_va_alloc.c", "test_msm_validate.c", "test_alloc_range.c", "test_disp_clip.c", "test_perf_gov.c"]
+# Tests that need generated (extracted) includes run first, in this order; every other
+# tests/c/test_*.c is discovered automatically, so new tests never have to edit this file.
+# New tests include driver headers relative to drivers/, e.g. #include "s23pmic/s23pmic_proto.h".
+EXTRACTED_TESTS = ["test_va_alloc.c", "test_msm_validate.c", "test_alloc_range.c", "test_disp_clip.c"]
+DRIVERS = os.path.join(ROOT, "drivers")
+
+
+def discover_tests():
+    rest = sorted(f for f in os.listdir(HERE)
+                  if f.startswith("test_") and f.endswith(".c") and f not in EXTRACTED_TESTS)
+    return EXTRACTED_TESTS + rest
+
+
+TESTS = discover_tests()
 
 
 def read(path):
@@ -96,6 +109,21 @@ def extract(outdir):
         f.write(f"#define S23_ALLOC_RANGE_REJECT(al) ({cond})\n")
 
 
+def run_extract_plugins(outdir):
+    """Each tests/c/extract_*.py may define extract(outdir, helpers) to generate its own includes
+    (same marker-extraction idea as above) without editing this file. `helpers` gives access to
+    read(), between() and function() plus the ROOT/GPU/DRIVERS paths."""
+    import importlib.util
+    helpers = {"read": read, "between": between, "function": function,
+               "ROOT": ROOT, "GPU": GPU, "DRIVERS": DRIVERS}
+    for fn in sorted(os.listdir(HERE)):
+        if fn.startswith("extract_") and fn.endswith(".py"):
+            spec = importlib.util.spec_from_file_location(fn[:-3], os.path.join(HERE, fn))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            mod.extract(outdir, helpers)
+
+
 def find_cc(explicit):
     for cand in ([explicit] if explicit else []) + [os.environ.get("CC"), "cc", "gcc", "clang"]:
         if cand and shutil.which(cand):
@@ -116,8 +144,9 @@ def main(argv):
     failed = 0
     with tempfile.TemporaryDirectory(prefix="s23ctest-") as out:
         extract(out)
+        run_extract_plugins(out)
         flags = ["-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function",
-                 f"-I{out}", f"-I{GPU}", f"-I{PERF}", f"-I{HERE}"]
+                 f"-I{out}", f"-I{GPU}", f"-I{PERF}", f"-I{HERE}", f"-I{DRIVERS}"]
         if sanitize:
             flags += ["-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-fno-omit-frame-pointer"]
         for t in TESTS:
