@@ -13,11 +13,27 @@ EXPORTS
   MmUnmapIoSpace
   KeStallExecutionProcessor
   KeDelayExecutionThread
+  KeWaitForSingleObject
+  KeInitializeEvent
+  KeSetEvent
+  KeInitializeSpinLock
+  KeAcquireSpinLockRaiseToDpc
+  KeReleaseSpinLock
+  PsCreateSystemThread
+  PsTerminateSystemThread
+  ObReferenceObjectByHandle
+  ObfDereferenceObject
+  IoCreateDevice
+  IoDeleteDevice
+  IoCreateSymbolicLink
+  IoDeleteSymbolicLink
+  IofCompleteRequest
   RtlInitUnicodeString
   ZwCreateFile
   ZwWriteFile
   ZwOpenKey
   ZwQueryValueKey
+  ZwQuerySystemInformation
   ZwClose
 """
 

@@ -20,8 +20,9 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
 GPU = os.path.join(ROOT, "drivers", "s23gpu")
+PERF = os.path.join(ROOT, "drivers", "s23perf")
 
-TESTS = ["test_va_alloc.c", "test_msm_validate.c", "test_alloc_range.c", "test_disp_clip.c"]
+TESTS = ["test_va_alloc.c", "test_msm_validate.c", "test_alloc_range.c", "test_disp_clip.c", "test_perf_gov.c"]
 
 
 def read(path):
@@ -116,7 +117,7 @@ def main(argv):
     with tempfile.TemporaryDirectory(prefix="s23ctest-") as out:
         extract(out)
         flags = ["-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function",
-                 f"-I{out}", f"-I{GPU}", f"-I{HERE}"]
+                 f"-I{out}", f"-I{GPU}", f"-I{PERF}", f"-I{HERE}"]
         if sanitize:
             flags += ["-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-fno-omit-frame-pointer"]
         for t in TESTS:

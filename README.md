@@ -24,7 +24,7 @@ This repository contains the ARM64 kernel drivers, UEFI DXE patches, ACPI SSDTs,
 | Area | Status | Notes |
 |---|---|---|
 | UEFI / ACPI | **WORKS ✅** | Custom UEFI boot image on `sda25` with `S23DisplayFixDxe` ([`display_research/`](display_research/)), PCIe0 bring-up and ACPI SSDTs; boots WinPE and full Windows 11 Pro 24H2. |
-| CPU | **WORKS ✅** | Native ARM64 execution across all 8 cores on Snapdragon 8 Gen 2 for Galaxy (`SM8550-AC`); EPSS CPUfreq & TSENS telemetry probed ([`drivers/s23perf/`](drivers/s23perf/)). Production DVFS/thermal policies are not finished. |
+| CPU | **WORKS ✅** | Native ARM64 execution across all 8 cores on Snapdragon 8 Gen 2 for Galaxy (`SM8550-AC`); resident dynamic EPSS DVFS & 41-sensor TSENS thermal governor + `s23perfctl.ps1` CLI ([`drivers/s23perf/`](drivers/s23perf/)). |
 | RAM | **WORKS ✅** | Usable Windows memory map with reserved subsystem carve-outs for daily desktop and GPU workloads; full stress and suspend-retention qualification still pending. |
 | UFS / installation | **WORKS ✅** | Installed Windows 11 boots directly from 4 KiB-sector UFS partition `sda43` (`/dev/block/by-name/win`) with Android LUNs isolated (`SanPolicy = 4`); public reproducible installer still pending. |
 | Display | **WORKS ✅** | Native `1080×2340 @ 120 Hz` AMOLED presentation with high-resolution VSync, native brightness slider and Night Light ([`drivers/s23gpu/`](drivers/s23gpu/), [`display_research/`](display_research/)). Display idle-off/sleep-wake hardening still pending. |
@@ -32,7 +32,7 @@ This repository contains the ARM64 kernel drivers, UEFI DXE patches, ACPI SSDTs,
 | Touchscreen | **WORKS ✅** | STM `FTS2BA61Y` HID multitouch minidriver on QUP1 SE4 GENI SPI (`0x00A90000`, IRQ `gpio25`, [`drivers/s23touch/`](drivers/s23touch/)). Everyday multitouch works; suspend/resume qualification pending. |
 | Physical buttons | **PARTIAL 🟡** | Read-only SPMI PMIC arbiter HID minidriver ([`drivers/s23keys/`](drivers/s23keys/)): Volume Up / Volume Down work natively; Power button display-off/wake behavior still needs investigation. |
 | Wi-Fi 6E | **WORKS ✅** | Live with internet on `QCA6490` PCIe0 (`PCI\VEN_17CB&DEV_1103`): UEFI RC bring-up + Qualcomm `qcwlan8280.sys` + S23 `bdwlan.elf` ([`wifi_research/`](wifi_research/), [`drivers/s23pcieprobe/`](drivers/s23pcieprobe/)). |
-| Bluetooth 5.3 + BLE | **WORKS ✅** | `BthMini` extensible-transport lower filter for `QCA6490` on `UART14` (`3.2 Mbaud`, IBS, [`drivers/s23bthx/`](drivers/s23bthx/)): Classic + BLE, A2DP-sized ACL buffers. Suspend/resume & HFP/SCO qualification pending. |
+| Bluetooth 5.3 + BLE | **WORKS ✅** | `BthMini` extensible-transport lower filter for `QCA6490` on `UART14` (`3.2 Mbaud`, IBS, [`drivers/s23bthx/`](drivers/s23bthx/)): Classic + BLE, A2DP-sized ACL buffers, plus [`fix_bt_settings_ui.ps1`](drivers/s23bthx/fix_bt_settings_ui.ps1) for Windows Settings pairing visibility. Suspend/resume & HFP/SCO qualification pending. |
 | Audio | **WORKS ✅** | Native ARM64 PortCls WaveRT + Topology driver (`ROOT\S23AUDIO` / `ACPI\S23AUD01`, [`drivers/s23audio/`](drivers/s23audio/)): lazy ADSP PIL (`PAS 36` + `PAS 1`), GLink/GPRv2/PRM, Gunyah-safe APPS-SMMU bypass, dual Cirrus Logic `CS35L43` stereo playback verified via WASAPI. Mic capture & Halo DSP calibration pending. |
 | Battery reporting | **WORKS ✅** | Maxim `MAX77705` fuel gauge (`@0x36`) Windows battery miniclass driver (`battc.sys`, [`drivers/s23batt/`](drivers/s23batt/)): validated percentage, voltage, current rate and calibrated battery temperature. |
 | Charging | **WORKS ✅** | Maxim `MAX77705` charger (`@0x69`, [`drivers/s23batt/`](drivers/s23batt/)): 3.0 A input limit, 2.5 A CC wired fast charge, 4.4 V float, watchdog handling and abnormal-off recovery. Dynamic USB-PD/PPS (`PCA9481`) & wireless charging (`S2MIW04`) not yet wired. |
@@ -60,12 +60,12 @@ Driver versions are tracked in each driver's `.inf` (`DriverVer`) and in the com
 - [ ] Portable public UEFI build/reconstruction workflow.
 - [ ] Cold-start and recovery hardening.
 
-### CPU — 2/4 complete
+### CPU — 3/4 complete
 
 - [x] Native ARM64 execution on Snapdragon 8 Gen 2 for Galaxy (`SM8550-AC`).
 - [x] All 8 logical processors enumerated; EPSS CPUfreq & TSENS telemetry probed ([`drivers/s23perf/`](drivers/s23perf/)).
-- [ ] Production Windows DVFS / EPSS frequency-scaling driver.
-- [ ] Idle and thermal-policy qualification.
+- [x] Resident dynamic EPSS DVFS & 41-sensor TSENS thermal governor (`Mode=2`, Balanced/Powersave/Performance/Fixed profiles, `s23perfctl.ps1`).
+- [ ] Idle and full ACPI/PEP thermal-policy qualification.
 
 ### RAM — 2/4 complete
 
