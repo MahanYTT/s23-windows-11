@@ -44,7 +44,7 @@ typedef uint16_t USHORT, WCHAR;
 typedef int16_t  CSHORT;
 typedef uint8_t  UCHAR, BOOLEAN, KIRQL;
 typedef int8_t   CHAR;
-typedef uint32_t ULONG;
+typedef uint32_t ULONG, *PULONG;
 typedef int32_t  LONG;
 typedef uint64_t ULONGLONG, ULONG_PTR, SIZE_T, KSPIN_LOCK;
 typedef void    *PVOID, *HANDLE;
