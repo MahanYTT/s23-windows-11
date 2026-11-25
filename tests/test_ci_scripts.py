@@ -67,6 +67,11 @@ class DriverStackCheckTest(unittest.TestCase):
         rc, out = self.run_check(build_pe([sub_sp_imm(0x500), RET], signed=False), "--frame-warn", "2048")
         self.assertNotIn("::warning", out)
 
+    def test_empty_reloc_fails(self):
+        rc, out = self.run_check(build_pe([RET], signed=False, reloc=False))
+        self.assertEqual(rc, 1)
+        self.assertIn(".reloc", out)
+
     def test_usage(self):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(check_driver_stack.main([]), 2)

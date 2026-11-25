@@ -22,7 +22,20 @@ ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
 GPU = os.path.join(ROOT, "drivers", "s23gpu")
 PERF = os.path.join(ROOT, "drivers", "s23perf")
 
-TESTS = ["test_va_alloc.c", "test_msm_validate.c", "test_alloc_range.c", "test_disp_clip.c", "test_perf_gov.c"]
+# Tests that need generated (extracted) includes run first, in this order; every other
+# tests/c/test_*.c is discovered automatically, so new tests never have to edit this file.
+# New tests include driver headers relative to drivers/, e.g. #include "s23pmic/s23pmic_proto.h".
+EXTRACTED_TESTS = ["test_va_alloc.c", "test_msm_validate.c", "test_alloc_range.c", "test_disp_clip.c"]
+DRIVERS = os.path.join(ROOT, "drivers")
+
+
+def discover_tests():
+    rest = sorted(f for f in os.listdir(HERE)
+                  if f.startswith("test_") and f.endswith(".c") and f not in EXTRACTED_TESTS)
+    return EXTRACTED_TESTS + rest
+
+
+TESTS = discover_tests()
 
 
 def read(path):
@@ -117,7 +130,7 @@ def main(argv):
     with tempfile.TemporaryDirectory(prefix="s23ctest-") as out:
         extract(out)
         flags = ["-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function",
-                 f"-I{out}", f"-I{GPU}", f"-I{PERF}", f"-I{HERE}"]
+                 f"-I{out}", f"-I{GPU}", f"-I{PERF}", f"-I{HERE}", f"-I{DRIVERS}"]
         if sanitize:
             flags += ["-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-fno-omit-frame-pointer"]
         for t in TESTS:

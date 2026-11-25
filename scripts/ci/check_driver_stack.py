@@ -3,7 +3,8 @@
 
 Usage: python scripts/ci/check_driver_stack.py [--frame-warn BYTES] <driver.sys> [...]
 
-FAILs if a driver imports __chkstk or contains the ARM64 `bl __chkstk` sequence; prints a warning
+FAILs if a driver has an empty .reloc directory (Windows ARM64 rejects such images), imports __chkstk
+or contains the ARM64 `bl __chkstk` sequence; prints a warning
 annotation for every stack frame above --frame-warn (default 1024 bytes). Uses the same detection
 code as drivers/s23gpuprobe/verify_pe.py, without the Authenticode/import-reference checks that need
 signed binaries and the phone's ntoskrnl.exe.
@@ -25,6 +26,10 @@ def check(path, frame_warn):
         for s in syms:
             if "chkstk" in s.lower():
                 errors.append(f"imports {dll}!{s}")
+    pe = int.from_bytes(data[0x3C:0x40], "little")
+    reloc_sz = int.from_bytes(data[pe + 24 + 112 + 5 * 8 + 4:pe + 24 + 112 + 5 * 8 + 8], "little")
+    if reloc_sz == 0:
+        errors.append("empty .reloc directory (add a non-const gRelocAnchors table)")
     sites = verify_pe.find_chkstk_sites(data)
     if sites:
         errors.append("__chkstk call sequence at RVA " + ", ".join(f"0x{r:X}" for r in sites))
