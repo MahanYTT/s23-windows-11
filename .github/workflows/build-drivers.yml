@@ -95,6 +95,27 @@ jobs:
           }
           $ver = (Get-ChildItem (Join-Path $kitsDir 'Include') -Directory | Where-Object { $_.Name -match '^10\.0\.' } | Sort-Object Name -Descending | Select-Object -First 1).Name
           if (-not $ver) { throw "Could not detect Windows Kits version under $kitsDir\Include" }
+          # Ensure user-mode um/ucrt headers & ARM64 libs exist under $kitsDir\<Inc|Lib>\$ver (falling back to runner's preinstalled SDK)
+          foreach ($sub in @('Include', 'Lib')) {
+              $dstVer = Join-Path (Join-Path $kitsDir $sub) $ver
+              foreach ($kind in @('um', 'ucrt', 'shared')) {
+                  $checkRel = if ($sub -eq 'Lib') { "$kind\arm64" } else { $kind }
+                  if (-not (Test-Path (Join-Path $dstVer $checkRel))) {
+                      $srcMatch = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\$sub\10.0.*\$checkRel" -Directory -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
+                      if ($srcMatch) {
+                          New-Item -ItemType Directory -Force -Path (Join-Path $dstVer $checkRel) | Out-Null
+                          Copy-Item "$($srcMatch.FullName)\*" (Join-Path $dstVer $checkRel) -Recurse -Force
+                      }
+                  }
+              }
+          }
+          if (-not (Test-Path "$kitsDir\Lib\$ver\um\arm64\setupapi.lib")) {
+              $foundUm = Get-ChildItem $kitsDir, 'C:\Program Files (x86)\Windows Kits\10' -Filter 'setupapi.lib' -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -like '*\arm64\*' } | Select-Object -First 1
+              Write-Host "Searched setupapi.lib: $($foundUm.FullName)"
+              if (-not $foundUm) { throw "ARM64 setupapi.lib not found" }
+              New-Item -ItemType Directory -Force -Path "$kitsDir\Lib\$ver\um\arm64" | Out-Null
+              Copy-Item "$($foundUm.DirectoryName)\*" "$kitsDir\Lib\$ver\um\arm64" -Recurse -Force
+          }
           $wdfInc = (Get-ChildItem $kitsDir -Directory -Recurse | Where-Object { $_.FullName -like '*\wdf\kmdf\1.33' -and $_.FullName -like '*\Include\*' } | Select-Object -First 1).FullName
           $wdfLib = (Get-ChildItem $kitsDir -Directory -Recurse | Where-Object { $_.FullName -like '*\wdf\kmdf\arm64\1.33' -and $_.FullName -like '*\Lib\*' } | Select-Object -First 1).FullName
           $inf2catExe = (Get-ChildItem (Join-Path $kitsDir 'bin') -Filter inf2cat.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1)
