@@ -188,7 +188,7 @@ jobs:
           $tag = $env:GITHUB_REF_NAME
           gh release view $tag 2>$null
           if ($LASTEXITCODE -ne 0) {
-              gh release create $tag --prerelease --title "S23 Windows 11 ARM64 Drivers ($tag)" --notes "Prebuilt test-signed (CN=S23TouchTest2020) ARM64 kernel drivers + tools. Proprietary Samsung/Qualcomm firmware (pull from your own phone over ADB via the scripts in README.md) and qcwlan8280.sys must still be pulled/supplied by the user (see README.md and docs/LINUX_INSTALL.md)." s23-drivers-arm64.zip SHA256SUMS.txt
+              gh release create $tag --prerelease --title "S23 Windows 11 ARM64 Drivers ($tag)" --notes "Prebuilt test-signed (CN=S23TouchTest2020) ARM64 kernel drivers + tools. Prebuilt Project Mu UEFI boot image (Mu-dm1q.img) is published at https://github.com/MahanYTT/Mu-Silicium/releases. Proprietary Samsung/Qualcomm firmware (pull from your own phone over ADB via the scripts in README.md) and qcwlan8280.sys must still be pulled/supplied by the user (see README.md and docs/LINUX_INSTALL.md)." s23-drivers-arm64.zip SHA256SUMS.txt
           } else {
               gh release upload $tag s23-drivers-arm64.zip SHA256SUMS.txt --clobber
           }

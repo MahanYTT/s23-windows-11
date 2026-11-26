@@ -9,7 +9,7 @@ You do **not** need a Windows host PC or Windows VM to partition the S23, pull d
 | **Open-source S23 Windows drivers** (`s23touch`, `s23batt`, `s23keys`, `s23bthx`, `s23perf`, `s23audio`, `s23mbb`, `s23modem_xprt`, `s23gpu.sys` KMD) + `s23modemd.exe`, `s23sms.ps1`, `s23perfctl.ps1`, `s23_firstboot.ps1`, `s23test.cer` | **[GitHub Releases](https://github.com/MahanYTT/s23-windows-11/releases)** (`s23-drivers-arm64.zip`) or [`.github/workflows/build-drivers.yml`](../.github/workflows/build-drivers.yml) | Pre-built and test-signed (`CN=S23TouchTest2020`) automatically via GitHub Actions — zero local Windows needed. |
 | **Stock Samsung/Qualcomm phone firmware** (`modem`, `apnhlos`, `dsp`, `vendor` GPU/Wi-Fi/BT/audio blobs) | **Pulled from your own phone** via `install_s23_linux.py pull-fw` | Proprietary + bound to your device's TrustZone rollback fuses (bit 8 / bit 9); see [`modem_5g_research/FIRMWARE_GROUND_TRUTH.md`](../modem_5g_research/FIRMWARE_GROUND_TRUTH.md). |
 | **Qualcomm Wi-Fi 6E driver** (`qcwlan8280.sys`) | User-supplied proprietary Qualcomm WHQL package | See [`wifi_research/qca6490_bringup/QCA6490_DRIVER_AND_FW_GUIDE.md`](../wifi_research/qca6490_bringup/QCA6490_DRIVER_AND_FW_GUIDE.md) and [`wifi_research/WIFI_BRINGUP_FIXES.md`](../wifi_research/WIFI_BRINGUP_FIXES.md). |
-| **Project Mu UEFI `boot.img`** (`Mu-dm1q.img`) | Built on Linux (`Mu-Silicium` + `S23DisplayFixDxe`) | See [`display_research/DISPLAY_BLACK_SCREEN_FIX.md`](../display_research/DISPLAY_BLACK_SCREEN_FIX.md) and [`scripts/legacy/compile_dm1q_v4.sh`](../scripts/legacy/compile_dm1q_v4.sh). |
+| **Project Mu UEFI `boot.img`** (`Mu-dm1q.img`) | **[`MahanYTT/Mu-Silicium`](https://github.com/MahanYTT/Mu-Silicium)** ([Releases](https://github.com/MahanYTT/Mu-Silicium/releases)) | Built cleanly on Linux from [`Platforms/Samsung/dm1qPkg`](https://github.com/MahanYTT/Mu-Silicium/tree/main/Platforms/Samsung/dm1qPkg) (`S23DisplayFixDxe`, `S23Pcie0Dxe`, `MemoryMapLib`, `AcpiTables`, `dm1q.dtb`) + upstream `Project-Silicium/Device-Binaries` (`dm2q`) XBL DXEs. Prebuilt CI `Mu-dm1q.img` is published on GitHub Releases. |
 | **Mesa Freedreno 3D / OpenGL DLLs** (`s23gpu_umd.dll`, `libgallium_wgl.dll`) | Built on Linux from Mesa Freedreno | Optional for basic display; required for D3D11 / OpenGL 4.6 hardware acceleration (`drivers/s23gpu/s23gpu.inf`, [`gpu_research/S23_ADRENO740_ARCHITECTURE.md`](../gpu_research/S23_ADRENO740_ARCHITECTURE.md)). |
 | **Windows 11 ARM64 ISO** (`10.0.26100` / 24H2) | Official Microsoft / UUP dump ISO | Applied directly from Linux via `wimlib-imagex`. |
 
@@ -146,8 +146,19 @@ python3 scripts/linux/install_s23_linux.py disable-msc
 
 ### Step 5: Flash Mu-Silicium UEFI boot image to `sda25` (`boot`)
 
+Download prebuilt `Mu-dm1q.img` from [`MahanYTT/Mu-Silicium` Releases](https://github.com/MahanYTT/Mu-Silicium/releases) (or build from source on Linux):
+
 ```bash
-python3 scripts/linux/install_s23_linux.py flash-boot --image /path/to/Mu-dm1q.img
+# Option A: Download prebuilt CI release image:
+gh release download --repo MahanYTT/Mu-Silicium --pattern 'Mu-dm1q.img'
+
+# Option B: Build from source cleanly on Ubuntu 24.04 / Linux:
+# git clone https://github.com/MahanYTT/Mu-Silicium.git && cd Mu-Silicium
+# sudo apt-get update && bash ./setup_env.sh -p apt
+# export CLANGPDB_AARCH64_PREFIX=aarch64-linux-gnu-
+# python3 ./build_uefi.py -d dm1q -r RELEASE
+
+python3 scripts/linux/install_s23_linux.py flash-boot --image ./Mu-dm1q.img
 adb reboot
 ```
 

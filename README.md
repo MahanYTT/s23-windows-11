@@ -19,11 +19,11 @@ This repository contains the ARM64 kernel drivers, UEFI DXE patches, ACPI SSDTs,
 ## Status
 
 **Demonstrated:** native Windows 11 Pro 24H2 ARM64 (`10.0.26100`) on UFS, 120 Hz AMOLED display with native brightness & Night Light, experimental Adreno 740 WDDM 2.0 acceleration (Mesa Freedreno D3D11 + OpenGL 4.6), multitouch, volume keys, Wi-Fi 6E with internet, 5G/LTE cellular data, native SMS & eSIM provisioning (`Snapdragon X70` + `IPA v5.5`), Bluetooth 5.3 + BLE, stereo ADSP AudioReach + dual CS35L43 audio, MAX77705 battery reporting and wired fast charging, and WinUSB PC link.  
-**Still unfinished:** cellular voice/IMS, IPv6 dual-stack & 5G NR tuning, native USB-C dual-role Host/OTG + PD 3.0 + DP Alt-Mode, power-button sleep/wake and system suspend/resume (S0ix), haptics (`CS40L26A`), motion/light/proximity sensors, cameras, GNSS, NFC, TPM/Secure Boot, and a portable public installer/UEFI workflow.
+**Still unfinished:** cellular voice/IMS, IPv6 dual-stack & 5G NR tuning, native USB-C dual-role Host/OTG + PD 3.0 + DP Alt-Mode, power-button sleep/wake and system suspend/resume (S0ix), haptics (`CS40L26A`), motion/light/proximity sensors, cameras, GNSS, NFC, and TPM/Secure Boot.
 
 | Area | Status | Notes |
 |---|---|---|
-| UEFI / ACPI | **WORKS ✅** | Custom UEFI boot image on `sda25` with `S23DisplayFixDxe` ([`display_research/`](display_research/)), PCIe0 bring-up and ACPI SSDTs; boots WinPE and full Windows 11 Pro 24H2. |
+| UEFI / ACPI | **WORKS ✅** | Custom [`MahanYTT/Mu-Silicium`](https://github.com/MahanYTT/Mu-Silicium) UEFI boot image on `sda25` ([prebuilt `Mu-dm1q.img`](https://github.com/MahanYTT/Mu-Silicium/releases)) with `S23DisplayFixDxe` ([`display_research/`](display_research/)), `S23Pcie0Dxe` (`QCA6490` PCIe0 RC + ACPI SSDT), S23 `MemoryMapLib`, `dm1q.dtb`, and upstream `Project-Silicium/Device-Binaries` (`dm2q`) XBL DXEs; boots WinPE and full Windows 11 Pro 24H2. |
 | CPU | **WORKS ✅** | Native ARM64 execution across all 8 cores on Snapdragon 8 Gen 2 for Galaxy (`SM8550-AC`); resident dynamic EPSS DVFS & 41-sensor TSENS thermal governor + `s23perfctl.ps1` CLI ([`drivers/s23perf/`](drivers/s23perf/)). |
 | RAM | **WORKS ✅** | Usable Windows memory map with reserved subsystem carve-outs for daily desktop and GPU workloads; full stress and suspend-retention qualification still pending. |
 | UFS / installation | **WORKS ✅** | Installed Windows 11 boots directly from 4 KiB-sector UFS partition `sda43` (`/dev/block/by-name/win`) with Android LUNs isolated (`SanPolicy = 4`); public reproducible installer still pending. |
@@ -51,13 +51,13 @@ Driver versions are tracked in each driver's `.inf` (`DriverVer`) and in the com
 <details>
 <summary><strong>Detailed development checkpoints</strong></summary>
 
-### UEFI / ACPI — 4/6 complete
+### UEFI / ACPI — 5/6 complete
 
 - [x] OEM boot-chain integration (`sda25` UEFI boot image, Project Mu / `dm1q`).
-- [x] Custom DXE (`S23DisplayFixDxe`, PCIe0 bring-up) and ACPI SSDT resources.
+- [x] Custom DXE (`S23DisplayFixDxe`, `S23Pcie0Dxe`) and ACPI SSDT resources.
 - [x] Windows boot-manager handoff (`SanPolicy = 4`, `testsigning on`).
 - [x] WinPE and full Windows 11 Pro 24H2 (`10.0.26100`) boot.
-- [ ] Portable public UEFI build/reconstruction workflow.
+- [x] Portable public UEFI build/reconstruction workflow ([`MahanYTT/Mu-Silicium`](https://github.com/MahanYTT/Mu-Silicium) `dm1qPkg` + CI `Mu-dm1q.img` [Releases](https://github.com/MahanYTT/Mu-Silicium/releases)).
 - [ ] Cold-start and recovery hardening.
 
 ### CPU — 3/4 complete
