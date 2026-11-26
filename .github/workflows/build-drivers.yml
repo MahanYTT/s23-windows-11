@@ -48,18 +48,29 @@ jobs:
           name: clang-drivers-unsigned
           path: drivers/
           merge-multiple: false
-      - name: Install VS ARM64 C++ build tools
+      - name: Locate or install VS ARM64 C++ build tools
         shell: powershell
         run: |
-          $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vsPath = & $vswhere -latest -products * -property installationPath | Select-Object -First 1
-          if (-not $vsPath) { throw "Visual Studio not found" }
-          $p = Start-Process -FilePath $vsInstaller -ArgumentList @(
-              'modify', '--installPath', $vsPath, '--quiet', '--norestart', '--nocache',
-              '--add', 'Microsoft.VisualStudio.Component.VC.Tools.ARM64'
-          ) -Wait -PassThru -NoNewWindow
-          if ($p.ExitCode -notin 0, 3010) { throw "vs_installer exited with $($p.ExitCode)" }
+          $ErrorActionPreference = 'Stop'
+          $armCl = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\arm64\cl.exe' -ErrorAction SilentlyContinue |
+              Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $armCl) {
+              $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+              $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+              $vsPath = & $vswhere -latest -products * -property installationPath | Select-Object -First 1
+              if (-not $vsPath) { throw "Visual Studio not found" }
+              $p = Start-Process -FilePath $vsInstaller -ArgumentList @(
+                  'modify', '--installPath', "`"$vsPath`"", '--quiet', '--norestart', '--nocache',
+                  '--add', 'Microsoft.VisualStudio.Component.VC.Tools.ARM64'
+              ) -Wait -PassThru -NoNewWindow
+              if ($p.ExitCode -notin 0, 3010) { throw "vs_installer exited with $($p.ExitCode)" }
+              $armCl = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\arm64\cl.exe' -ErrorAction SilentlyContinue |
+                  Sort-Object FullName -Descending | Select-Object -First 1
+          }
+          if (-not $armCl) { throw "ARM64 cl.exe still missing after VS check/install" }
+          $msvcToolsDir = $armCl.Directory.Parent.Parent.Parent.FullName
+          "S23_MSVC_TOOLS_DIR=$msvcToolsDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "MSVC ARM64 Tools: $msvcToolsDir"
       - name: Install Windows SDK/WDK ARM64 via NuGet
         shell: powershell
         run: |
@@ -86,11 +97,21 @@ jobs:
           if (-not $ver) { throw "Could not detect Windows Kits version under $kitsDir\Include" }
           $wdfInc = (Get-ChildItem $kitsDir -Directory -Recurse | Where-Object { $_.FullName -like '*\wdf\kmdf\1.33' -and $_.FullName -like '*\Include\*' } | Select-Object -First 1).FullName
           $wdfLib = (Get-ChildItem $kitsDir -Directory -Recurse | Where-Object { $_.FullName -like '*\wdf\kmdf\arm64\1.33' -and $_.FullName -like '*\Lib\*' } | Select-Object -First 1).FullName
+          $inf2catExe = (Get-ChildItem (Join-Path $kitsDir 'bin') -Filter inf2cat.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1)
+          if (-not $inf2catExe) {
+              $inf2catExe = (Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Filter inf2cat.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1)
+          }
+          $signtoolExe = (Get-ChildItem (Join-Path $kitsDir 'bin') -Filter signtool.exe -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -like '*\x64\*' } | Select-Object -First 1)
+          if (-not $signtoolExe) {
+              $signtoolExe = (Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Filter signtool.exe -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -like '*\x64\*' } | Sort-Object FullName -Descending | Select-Object -First 1)
+          }
           "S23_KITS_ROOT=$kitsDir\" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "S23_WDK_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          if ($wdfInc) { "S23_WDF_INC=$wdfInc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
-          if ($wdfLib) { "S23_WDF_LIB=$wdfLib" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
-          Write-Host "KitsRoot=$kitsDir\ WdkVersion=$ver WdfInc=$wdfInc WdfLib=$wdfLib"
+          if ($wdfInc)      { "S23_WDF_INC=$wdfInc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
+          if ($wdfLib)      { "S23_WDF_LIB=$wdfLib" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
+          if ($inf2catExe)  { "S23_WDK_BIN_X86=$($inf2catExe.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
+          if ($signtoolExe) { "S23_WDK_BIN_X64=$($signtoolExe.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
+          Write-Host "KitsRoot=$kitsDir\ WdkVersion=$ver WdfInc=$wdfInc WdfLib=$wdfLib inf2cat=$($inf2catExe.FullName) signtool=$($signtoolExe.FullName)"
       - name: Sign Clang drivers, build WDK drivers, and stage bundle
         shell: powershell
         run: |
