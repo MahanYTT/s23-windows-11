@@ -31,6 +31,7 @@ downloaded_qcwlan8280/
 **/pkg/
 **/cat_stage/
 **/build/
+.s23_local_cert/
 *.sys
 *.exe
 *.dll

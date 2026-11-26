@@ -253,21 +253,23 @@ def verify(sys_path, nt_path=None, extra_refs=(), frame_warn=DEFAULT_FRAME_WARN,
 
     # ---- imports against the phone's own binaries
     ref_map = {}
+    declared_refs = set()
     if nt_path:
         if os.path.exists(nt_path):
             ref_map["ntoskrnl.exe"] = nt_path
         else:
             print(f"  NOTE: reference {nt_path} not found, ntoskrnl.exe imports not resolved")
     for rp in extra_refs:
+        bn = os.path.basename(rp).lower()
+        if bn.endswith("_phone.sys"):
+            bn = bn[:-10] + ".sys"
+        declared_refs.add(bn)
         if os.path.exists(rp):
-            bn = os.path.basename(rp).lower()
-            if bn.endswith("_phone.sys"):
-                bn = bn[:-10] + ".sys"
             ref_map[bn] = rp
         else:
             print(f"  NOTE: reference {rp} not found")
 
-    allowed = set(["ntoskrnl.exe"]) | set(ref_map.keys())
+    allowed = set(["ntoskrnl.exe"]) | set(ref_map.keys()) | declared_refs
     unexpected = [d for d in imports.keys() if d not in allowed]
     check(not unexpected, f"Unexpected DLL imports: {unexpected}")
 

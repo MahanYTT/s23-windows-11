@@ -241,8 +241,13 @@ Driver versions are tracked in each driver's `.inf` (`DriverVer`) and in the com
 ├── audio_sensors_research/    audio / haptics / sensors bus map
 ├── modem_5g_research/         5G modem blueprint, PIL/subsystem notes, SSDTs (index: README.md)
 ├── usb_research/              native USB-C spec + MAX77705 OPCODE mailbox reference (host-tested)
-├── docs/archive/              historical bring-up reports & handoff notes
-└── scripts/legacy/            one-off bring-up scripts kept for reference
+├── docs/
+│   ├── LINUX_INSTALL.md       Native Linux (CachyOS / Arch / Debian / Fedora) install & dual-boot guide
+│   └── archive/               historical bring-up reports & handoff notes
+└── scripts/
+    ├── linux/                 Linux installer (`install_s23_linux.py`), Clang build/signer, udev rule, first-boot setup
+    ├── ci/                    CI repo-hygiene and driver stack checks
+    └── legacy/                one-off bring-up scripts kept for reference
 ```
 
 ---
@@ -253,19 +258,25 @@ All drivers target **Windows ARM64 kernel mode** and only import standard kernel
 
 ### Prerequisites
 
-- **WSL** (for `build_wsl.py` drivers): `clang-18`, `lld` (`lld-link`), `llvm-dlltool`, `binutils-aarch64-linux-gnu` (`objdump`), Python 3; `acpica-tools` (`iasl`) for SSDTs.
-- **Windows** (for `s23gpu` and signing): Visual Studio 2022 with the ARM64 MSVC toolset, Windows SDK/WDK `10.0.26100`, PowerShell, Python 3, and the test-signing certificate `CN=S23TouchTest2020` in `Cert:\CurrentUser\My`.
+- **Linux (native on CachyOS / Arch / Debian / Fedora, or WSL on Windows):**
+  - Full install/provisioning from Linux (no Windows PC or VM required): see **[`docs/LINUX_INSTALL.md`](docs/LINUX_INSTALL.md)** and [`scripts/linux/`](scripts/linux/) (`install_s23_linux.py`, `build_and_sign_linux.py`, `99-s23-winusb.rules`).
+  - Clang driver builds (`build_wsl.py`) & SSDTs: `clang` (`clang-18` or newer), `lld` (`lld-link`), `llvm-dlltool`, Python 3, `acpica` (`iasl`), plus `osslsigncode` / `openssl` for Linux signing.
+- **Windows / GitHub Actions** (only for building `s23gpu`, `s23audio`, `s23modem`, `s23mbb` from source + `.cat` generation): Visual Studio 2022 with the ARM64 MSVC toolset, Windows SDK/WDK `10.0.26100`, PowerShell, Python 3, and `CN=S23TouchTest2020`. Or download the prebuilt `s23-drivers-arm64` bundle from [`.github/workflows/build-drivers.yml`](.github/workflows/build-drivers.yml).
 
-### WSL / Clang drivers (`s23batt`, `s23touch`, `s23keys`, `s23bthx`, probes)
+### Linux / Clang / WSL drivers (`s23batt`, `s23touch`, `s23keys`, `s23bthx`, `s23perf`, probes)
+
+```bash
+# On Linux (or WSL): compile + stack-check all 5 Clang runtime drivers (and sign via osslsigncode)
+python3 scripts/linux/build_and_sign_linux.py
+# Or compile a single driver cleanly on Linux/WSL:
+python3 drivers/s23bthx/build_wsl.py
+```
 
 ```powershell
-# 1. compile + link the ARM64 .sys inside WSL (writes drivers/<name>/out/)
-wsl python3 ./drivers/s23bthx/build_wsl.py
-
-# 2. sign the driver and create the catalog on Windows (writes drivers/<name>/pkg/)
+# On Windows (for WHQL-style .cat packaging via signtool / inf2cat):
 powershell -ExecutionPolicy Bypass -File .\drivers\s23bthx\sign_and_cat.ps1
 
-# 3. verify the signed binary (ARM64, PE32+, .reloc, checksum, Authenticode, imports)
+# Verify the signed binary (ARM64, PE32+, .reloc, checksum, Authenticode, imports)
 python .\drivers\s23gpuprobe\verify_pe.py .\drivers\s23bthx\pkg\s23bthx.sys <path-to-phone-ntoskrnl.exe>
 ```
 
@@ -290,7 +301,7 @@ iasl -tc gpu_research/s23_gpu_bringup/s23_gpu_acpi.asl
 
 ## Using `s23link.py`
 
-With the phone running Windows and connected over USB-C:
+Works natively on **Windows** (`WinUSB` / `UsbDk`) and **Linux** (`libusb-1.0` — install [`scripts/linux/99-s23-winusb.rules`](scripts/linux/99-s23-winusb.rules)) with the phone running Windows over USB-C:
 
 ```powershell
 python s23link.py ping                       # round-trip test

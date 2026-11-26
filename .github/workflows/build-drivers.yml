@@ -1,0 +1,136 @@
+name: Build ARM64 Drivers (No Local Windows Needed)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  clang-drivers:
+    name: Build Clang/LLD drivers (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install LLVM 18 and binutils
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-18 lld-18 llvm-18 binutils-aarch64-linux-gnu
+          echo /usr/lib/llvm-18/bin >> "$GITHUB_PATH"
+      - name: Build and stack-check Clang runtime drivers
+        run: python3 scripts/linux/build_and_sign_linux.py --no-sign
+      - name: Upload unsigned Clang .sys outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: clang-drivers-unsigned
+          path: |
+            drivers/s23touch/out/s23touch.sys
+            drivers/s23batt/out/s23batt.sys
+            drivers/s23keys/out/s23keys.sys
+            drivers/s23bthx/out/s23bthx.sys
+            drivers/s23perf/out/s23perf.sys
+
+  wdk-and-package:
+    name: Build WDK drivers, sign all, and package ARM64 bundle
+    needs: clang-drivers
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Download Clang outputs
+        uses: actions/download-artifact@v4
+        with:
+          name: clang-drivers-unsigned
+          path: drivers/
+          merge-multiple: false
+      - name: Install VS ARM64 C++ build tools
+        shell: powershell
+        run: |
+          $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -property installationPath | Select-Object -First 1
+          if (-not $vsPath) { throw "Visual Studio not found" }
+          $p = Start-Process -FilePath $vsInstaller -ArgumentList @(
+              'modify', '--installPath', $vsPath, '--quiet', '--norestart', '--nocache',
+              '--add', 'Microsoft.VisualStudio.Component.VC.Tools.ARM64'
+          ) -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -notin 0, 3010) { throw "vs_installer exited with $($p.ExitCode)" }
+      - name: Install Windows SDK/WDK ARM64 via NuGet
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nugetDir = 'C:\wdk_nuget'
+          $kitsDir  = 'C:\s23_kits'
+          New-Item -ItemType Directory -Force -Path $nugetDir, $kitsDir | Out-Null
+          $nuget = (Get-Command nuget.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+          if (-not $nuget) {
+              $nuget = "$nugetDir\nuget.exe"
+              Invoke-WebRequest -UseBasicParsing -Uri 'https://dist.nuget.org/win-x86-commandline/latest/nuget.exe' -OutFile $nuget
+          }
+          foreach ($pkg in @('Microsoft.Windows.SDK.CPP', 'Microsoft.Windows.SDK.CPP.arm64', 'Microsoft.Windows.WDK.ARM64')) {
+              & $nuget install $pkg -OutputDirectory $nugetDir -NonInteractive
+              if ($LASTEXITCODE -ne 0) { throw "nuget install $pkg failed" }
+          }
+          foreach ($pkgDir in (Get-ChildItem $nugetDir -Directory)) {
+              $cDir = Join-Path $pkgDir.FullName 'c'
+              if (Test-Path $cDir) {
+                  Copy-Item "$cDir\*" $kitsDir -Recurse -Force
+              }
+          }
+          $ver = (Get-ChildItem (Join-Path $kitsDir 'Include') -Directory | Where-Object { $_.Name -match '^10\.0\.' } | Sort-Object Name -Descending | Select-Object -First 1).Name
+          if (-not $ver) { throw "Could not detect Windows Kits version under $kitsDir\Include" }
+          $wdfInc = (Get-ChildItem $kitsDir -Directory -Recurse | Where-Object { $_.FullName -like '*\wdf\kmdf\1.33' -and $_.FullName -like '*\Include\*' } | Select-Object -First 1).FullName
+          $wdfLib = (Get-ChildItem $kitsDir -Directory -Recurse | Where-Object { $_.FullName -like '*\wdf\kmdf\arm64\1.33' -and $_.FullName -like '*\Lib\*' } | Select-Object -First 1).FullName
+          "S23_KITS_ROOT=$kitsDir\" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "S23_WDK_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if ($wdfInc) { "S23_WDF_INC=$wdfInc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
+          if ($wdfLib) { "S23_WDF_LIB=$wdfLib" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
+          Write-Host "KitsRoot=$kitsDir\ WdkVersion=$ver WdfInc=$wdfInc WdfLib=$wdfLib"
+      - name: Sign Clang drivers, build WDK drivers, and stage bundle
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($d in @('s23touch', 's23batt', 's23keys', 's23bthx')) {
+              powershell -NoProfile -ExecutionPolicy Bypass -File "drivers\$d\sign_and_cat.ps1"
+              if ($LASTEXITCODE) { throw "sign_and_cat failed for $d" }
+          }
+          powershell -NoProfile -ExecutionPolicy Bypass -File "drivers\s23perf\sign.ps1"
+          if ($LASTEXITCODE) { throw "sign.ps1 failed for s23perf" }
+
+          $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -eq 'CN=S23TouchTest2020' -and $_.HasPrivateKey } | Select-Object -First 1
+          if (-not $cert) { throw 'Test signing cert missing' }
+          $env:S23_CERT_THUMBPRINT = $cert.Thumbprint
+
+          foreach ($d in @('s23audio', 's23modem', 's23mbb')) {
+              powershell -NoProfile -ExecutionPolicy Bypass -File "drivers\$d\build.ps1"
+              if ($LASTEXITCODE) { throw "build.ps1 failed for $d" }
+          }
+          powershell -NoProfile -ExecutionPolicy Bypass -File 'drivers\s23gpu\build.ps1' -SkipMesa
+          if ($LASTEXITCODE) { throw 's23gpu\build.ps1 -SkipMesa failed' }
+
+          $bundle = 'dist_s23_drivers'
+          New-Item -ItemType Directory -Force -Path $bundle | Out-Null
+          foreach ($d in @('s23touch', 's23batt', 's23keys', 's23bthx', 's23perf', 's23audio', 's23mbb', 's23gpu')) {
+              $pkg = "drivers\$d\pkg"
+              if (Test-Path $pkg) {
+                  Copy-Item $pkg (Join-Path $bundle $d) -Recurse -Force
+              }
+          }
+          $mdmOut = Join-Path $bundle 's23modem'
+          New-Item -ItemType Directory -Force -Path $mdmOut | Out-Null
+          Copy-Item 'drivers\s23modem\out\s23modem_xprt.sys' $mdmOut -Force
+          Copy-Item 'drivers\s23modem\out\s23modemd.exe' $mdmOut -Force
+          Copy-Item 'drivers\s23mbb\s23sms.ps1' $bundle -Force
+          Copy-Item 'drivers\s23perf\s23perfctl.ps1' $bundle -Force
+          Copy-Item 'scripts\linux\s23_firstboot.ps1' $bundle -Force
+          Copy-Item 'drivers\s23touch\pkg\s23test.cer' $bundle -Force
+      - name: Upload packaged ARM64 drivers
+        uses: actions/upload-artifact@v4
+        with:
+          name: s23-drivers-arm64
+          path: dist_s23_drivers/

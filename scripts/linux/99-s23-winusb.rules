@@ -1,0 +1,5 @@
+# Udev rule for Samsung Galaxy S23 running Windows (`s23link.py` WinUSB/GenericUSBFn link, VID 1209 PID 0001..0004)
+# Install on Linux (CachyOS / Arch / Debian / Fedora):
+#   sudo cp scripts/linux/99-s23-winusb.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+SUBSYSTEM=="usb", ATTR{idVendor}=="1209", ATTR{idProduct}=="000[1-4]", MODE="0666", TAG+="uaccess"

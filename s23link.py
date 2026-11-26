@@ -5,8 +5,17 @@
 # Python API:  with Link() as L: L.exec('ver'); L.put(local, remote); L.get(remote, local)
 # Transport: WinUSB via ctypes (libusb cannot open this device).  Device = VID 1209 / PID 0003 (see esp_run_devmode3.cmd); DeviceInterfaceGUIDs come from
 # the MS OS extended-property descriptor the phone returns.  Frames: see usbfn_agent.ps1.
-import ctypes, os, socket, struct, sys, time, uuid, zlib
-from ctypes import wintypes as W
+import ctypes, ctypes.util, os, socket, struct, sys, time, uuid, zlib
+if sys.platform == 'win32':
+    from ctypes import wintypes as W
+else:
+    class _WinTypesFallback:
+        DWORD = ctypes.c_uint32
+        ULONG = ctypes.c_uint32
+        BOOL = ctypes.c_int
+        LPCWSTR = ctypes.c_wchar_p
+        HWND = ctypes.c_void_p
+    W = _WinTypesFallback
 
 USAGE = '''usage: s23link.py [--tcp PORT] <command> [args]
   ping                      round-trip test
@@ -316,6 +325,169 @@ class UsbdkTransport:
         self.d.UsbDk_StopRedirect(self.red)
 
 
+class _LibUsbDeviceDescriptor(ctypes.Structure):
+    _fields_ = [
+        ('bLength', ctypes.c_uint8),
+        ('bDescriptorType', ctypes.c_uint8),
+        ('bcdUSB', ctypes.c_uint16),
+        ('bDeviceClass', ctypes.c_uint8),
+        ('bDeviceSubClass', ctypes.c_uint8),
+        ('bDeviceProtocol', ctypes.c_uint8),
+        ('bMaxPacketSize0', ctypes.c_uint8),
+        ('idVendor', ctypes.c_uint16),
+        ('idProduct', ctypes.c_uint16),
+        ('bcdDevice', ctypes.c_uint16),
+        ('iManufacturer', ctypes.c_uint8),
+        ('iProduct', ctypes.c_uint8),
+        ('iSerialNumber', ctypes.c_uint8),
+        ('bNumConfigurations', ctypes.c_uint8),
+    ]
+
+
+class LibUsbTransport:
+    """Native Linux/POSIX transport via libusb-1.0 (bulk OUT 0x01 / IN 0x81 on VID 1209 PID 0001..0004)."""
+    VID = 0x1209
+    PIDS = (0x0004, 0x0003, 0x0002, 0x0001)
+    ERR_ACCESS = -3
+    ERR_NO_DEVICE = -4
+    ERR_BUSY = -6
+    ERR_TIMEOUT = -7
+    TRANSIENT_ERRORS = frozenset((ERR_BUSY, ERR_NO_DEVICE))
+
+    def __init__(self, open_timeout_s=None):
+        libname = ctypes.util.find_library('usb-1.0') or 'libusb-1.0.so.0'
+        try:
+            u = self.u = ctypes.CDLL(libname)
+        except OSError as e:
+            raise RemoteError('libusb-1.0 not found (%s); install libusb (e.g. libusb / libusb-1.0-0)' % e) from e
+        u.libusb_init.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+        u.libusb_init.restype = ctypes.c_int
+        u.libusb_exit.argtypes = [ctypes.c_void_p]
+        u.libusb_get_device_list.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))]
+        u.libusb_get_device_list.restype = ctypes.c_ssize_t
+        u.libusb_free_device_list.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int]
+        u.libusb_get_device_descriptor.argtypes = [ctypes.c_void_p, ctypes.POINTER(_LibUsbDeviceDescriptor)]
+        u.libusb_get_device_descriptor.restype = ctypes.c_int
+        u.libusb_open.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        u.libusb_open.restype = ctypes.c_int
+        u.libusb_close.argtypes = [ctypes.c_void_p]
+        u.libusb_set_auto_detach_kernel_driver.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        u.libusb_set_auto_detach_kernel_driver.restype = ctypes.c_int
+        u.libusb_claim_interface.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        u.libusb_claim_interface.restype = ctypes.c_int
+        u.libusb_release_interface.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        u.libusb_release_interface.restype = ctypes.c_int
+        u.libusb_clear_halt.argtypes = [ctypes.c_void_p, ctypes.c_ubyte]
+        u.libusb_clear_halt.restype = ctypes.c_int
+        u.libusb_bulk_transfer.argtypes = [
+            ctypes.c_void_p, ctypes.c_ubyte, ctypes.c_char_p,
+            ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_uint,
+        ]
+        u.libusb_bulk_transfer.restype = ctypes.c_int
+
+        self.ctx = ctypes.c_void_p()
+        rc = u.libusb_init(ctypes.byref(self.ctx))
+        if rc != 0:
+            raise RemoteError('libusb_init failed (%d)' % rc)
+        self.hdl = None
+        self.rbuf = ctypes.create_string_buffer(65536)
+        self.path = None
+        try:
+            retry_transient(self._open, open_timeout() if open_timeout_s is None else open_timeout_s)
+        except Exception:
+            if self.ctx:
+                u.libusb_exit(self.ctx)
+                self.ctx = None
+            raise
+
+    def _open(self):
+        u = self.u
+        devs = ctypes.POINTER(ctypes.c_void_p)()
+        cnt = u.libusb_get_device_list(self.ctx, ctypes.byref(devs))
+        if cnt < 0:
+            raise RemoteError('libusb_get_device_list failed (%d)' % cnt)
+        target_vid = target_pid = None
+        hdl = ctypes.c_void_p()
+        rc = 0
+        try:
+            candidates = []
+            for i in range(cnt):
+                dev = devs[i]
+                if not dev:
+                    break
+                desc = _LibUsbDeviceDescriptor()
+                if u.libusb_get_device_descriptor(dev, ctypes.byref(desc)) == 0:
+                    if desc.idVendor == self.VID and desc.idProduct in self.PIDS:
+                        candidates.append((desc.idProduct, dev))
+            candidates.sort(key=lambda pair: self.PIDS.index(pair[0]))
+            for pid, dev in candidates:
+                rc = u.libusb_open(dev, ctypes.byref(hdl))
+                if rc == 0:
+                    target_vid, target_pid = self.VID, pid
+                    break
+                if rc == self.ERR_ACCESS:
+                    raise RemoteError(
+                        'Permission denied opening S23 USB device (%04x:%04x); install scripts/linux/99-s23-winusb.rules or run with sudo'
+                        % (self.VID, pid)
+                    )
+                if rc in self.TRANSIENT_ERRORS:
+                    raise TransientOpenError('libusb_open failed %d' % rc, rc)
+                raise RemoteError('libusb_open failed (%d)' % rc)
+            else:
+                raise RemoteError('RM9 USB device not found (libusb interface for vid_1209&pid_0001..0004)')
+        finally:
+            u.libusb_free_device_list(devs, 1)
+
+        u.libusb_set_auto_detach_kernel_driver(hdl, 1)
+        rc = u.libusb_claim_interface(hdl, 0)
+        if rc != 0:
+            u.libusb_close(hdl)
+            if rc == self.ERR_ACCESS:
+                raise RemoteError(
+                    'Permission denied claiming S23 USB interface; install scripts/linux/99-s23-winusb.rules or run with sudo'
+                )
+            if rc in self.TRANSIENT_ERRORS:
+                raise TransientOpenError('libusb_claim_interface failed %d' % rc, rc)
+            raise RemoteError('libusb_claim_interface failed (%d)' % rc)
+        for ep in (0x01, 0x81):
+            u.libusb_clear_halt(hdl, ep)
+        self.hdl = hdl
+        self.path = 'libusb:%04x:%04x' % (target_vid, target_pid)
+
+    def send(self, frame):
+        if len(frame) % 512 == 0:
+            frame += b'\0'
+        done = ctypes.c_int(0)
+        buf = ctypes.create_string_buffer(frame, len(frame))
+        rc = self.u.libusb_bulk_transfer(self.hdl, 0x01, buf, len(frame), ctypes.byref(done), 5000)
+        if rc != 0:
+            raise RemoteError('libusb bulk OUT failed (%d)' % rc)
+
+    def recv(self, timeout_s):
+        """one transfer = one frame; returns bytes or None on timeout"""
+        got = ctypes.c_int(0)
+        rc = self.u.libusb_bulk_transfer(
+            self.hdl, 0x81, self.rbuf, 65536, ctypes.byref(got), _timeout_ms(timeout_s)
+        )
+        if rc == self.ERR_TIMEOUT:
+            return None
+        if rc != 0:
+            raise RemoteError('libusb bulk IN failed (%d)' % rc)
+        return self.rbuf.raw[:got.value]
+
+    def close(self):
+        if self.hdl:
+            try:
+                self.u.libusb_release_interface(self.hdl, 0)
+            except Exception:
+                pass
+            self.u.libusb_close(self.hdl)
+            self.hdl = None
+        if self.ctx:
+            self.u.libusb_exit(self.ctx)
+            self.ctx = None
+
+
 class TcpTransport:
     def __init__(self, port):
         self.s = socket.create_connection(('127.0.0.1', port), timeout=10)
@@ -363,10 +535,13 @@ class Link:
                     try:
                         self.t = TcpTransport(DAEMON_PORT)       # `rm9link.py serve` keeps the USB redirect open (every open/close of UsbDk resets the device)
                     except OSError:
-                        try:
-                            self.t = UsbdkTransport() if usbdk else WinUsbTransport()
-                        except (FileNotFoundError, OSError):
-                            self.t = WinUsbTransport()
+                        if sys.platform != 'win32':
+                            self.t = LibUsbTransport()
+                        else:
+                            try:
+                                self.t = UsbdkTransport() if usbdk else WinUsbTransport()
+                            except (FileNotFoundError, OSError):
+                                self.t = WinUsbTransport()
                 break
             except (RemoteError, OSError):
                 if time.time() >= end:
@@ -572,7 +747,7 @@ def serve(net=False):
         nonlocal usb
         while usb is None:
             try:
-                usb = UsbdkTransport()
+                usb = UsbdkTransport() if sys.platform == 'win32' else LibUsbTransport()
                 log('usb open: ' + usb.path)
             except Exception as e:
                 if str(e) != last_err[0]:

@@ -394,7 +394,7 @@ static void test_spec_message_encode(void)
 static size_t encode_sample(uint8_t *buf, size_t cap, int *err)
 {
     s23pb_writer w;
-    size_t m1, m2;
+    size_t m1 = 0, m2 = 0;
     s23pb_writer_init(&w, buf, cap);
     s23pb_put_uint64(&w, 1, 150);
     s23pb_submsg_begin(&w, 3, &m1);

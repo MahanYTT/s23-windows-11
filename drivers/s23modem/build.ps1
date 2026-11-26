@@ -1,22 +1,58 @@
+param(
+    [string]$MsvcToolsDir   = $env:S23_MSVC_TOOLS_DIR,
+    [string]$KitsRoot       = $env:S23_KITS_ROOT,
+    [string]$WdkVersion     = $(if ($env:S23_WDK_VERSION) { $env:S23_WDK_VERSION } else { '10.0.26100.0' }),
+    [string]$WdkBinX64      = $env:S23_WDK_BIN_X64,
+    [string]$CertThumbprint = $(if ($env:S23_CERT_THUMBPRINT) { $env:S23_CERT_THUMBPRINT } else { '05DBD92557F4FC52EF2A5E5955789D8EED637C68' }),
+    [string]$NtoskrnlRef    = $(if ($env:S23_NTOSKRNL_REF) { $env:S23_NTOSKRNL_REF } else { 'C:\Users\Mahan\.gemini\antigravity\brain\69c04d84-af7a-419e-9781-d650ca2201d9\scratch\ntoskrnl_phone.exe' }),
+    [string]$HalRef         = $(if ($env:S23_HAL_REF) { $env:S23_HAL_REF } else { 'C:\Users\Mahan\.gemini\antigravity\brain\69c04d84-af7a-419e-9781-d650ca2201d9\scratch\phone_dlls\hal.dll' })
+)
 $ErrorActionPreference = 'Stop'
+
+function Find-MsvcToolsDir {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path $vswhere) {
+        $vs = $null
+        try { $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath 2>$null | Select-Object -First 1 } catch {}
+        if ($vs) {
+            $verFile = Join-Path $vs 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt'
+            if (Test-Path $verFile) {
+                $tools = Join-Path $vs ('VC\Tools\MSVC\' + (Get-Content $verFile -TotalCount 1).Trim())
+                if (Test-Path (Join-Path $tools 'bin\Hostx64\arm64\cl.exe')) { return $tools }
+            }
+        }
+    }
+    return 'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207'
+}
+
+function Find-KitsRoot {
+    try {
+        $root = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots' -Name KitsRoot10 -ErrorAction Stop).KitsRoot10
+        if ($root -and (Test-Path $root)) { return $root }
+    } catch {}
+    return 'C:\Program Files (x86)\Windows Kits\10\'
+}
+
+if (-not $MsvcToolsDir) { $MsvcToolsDir = Find-MsvcToolsDir }
+if (-not $KitsRoot)     { $KitsRoot     = Find-KitsRoot }
 
 $dir       = $PSScriptRoot
 $outDir    = Join-Path $dir 'out'
-$msvcDir   = 'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207'
+$msvcDir   = $MsvcToolsDir
 $msvcBin   = Join-Path $msvcDir 'bin\Hostx64\arm64'
 $msvcInc   = Join-Path $msvcDir 'include'
 $msvcLib   = Join-Path $msvcDir 'lib\arm64'
-$wdkInc    = 'C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0'
-$wdkLib    = 'C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0'
-$wdkBinX64 = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64'
+$wdkInc    = Join-Path $KitsRoot "Include\$WdkVersion"
+$wdkLib    = Join-Path $KitsRoot "Lib\$WdkVersion"
+$wdkBinX64 = if ($WdkBinX64) { $WdkBinX64 } else { Join-Path $KitsRoot "bin\$WdkVersion\x64" }
 
 $cl        = Join-Path $msvcBin 'cl.exe'
 $link      = Join-Path $msvcBin 'link.exe'
 $armasm    = Join-Path $msvcBin 'armasm64.exe'
 $signtool  = Join-Path $wdkBinX64 'signtool.exe'
-$thumb     = '05DBD92557F4FC52EF2A5E5955789D8EED637C68'
-$ntPhone   = 'C:\Users\Mahan\.gemini\antigravity\brain\69c04d84-af7a-419e-9781-d650ca2201d9\scratch\ntoskrnl_phone.exe'
-$halPhone  = 'C:\Users\Mahan\.gemini\antigravity\brain\69c04d84-af7a-419e-9781-d650ca2201d9\scratch\phone_dlls\hal.dll'
+$thumb     = $CertThumbprint
+$ntPhone   = $NtoskrnlRef
+$halPhone  = $HalRef
 $verifyPy  = Join-Path $dir '..\s23gpuprobe\verify_pe.py'
 
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null

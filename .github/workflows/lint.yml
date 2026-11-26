@@ -35,6 +35,17 @@ jobs:
       - name: Unit tests (no hardware)
         run: python -m unittest discover -s tests -v
 
+  python-linux:
+    name: Python unit tests (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Linux unit tests (s23link libusb + Linux installer)
+        run: python3 -m unittest discover -s tests -v
+
   c-host-tests:
     name: Host C tests for s23gpu pure logic (ASan + UBSan)
     runs-on: ubuntu-24.04

@@ -16,7 +16,10 @@ param(
     [string]$CertThumbprint = $(if ($env:S23_CERT_THUMBPRINT) { $env:S23_CERT_THUMBPRINT } else { '05DBD92557F4FC52EF2A5E5955789D8EED637C68' }),
     [string]$MesaWslDir     = $env:S23_MESA_WSL_DIR,
     [string]$NtoskrnlRef    = $(if ($env:S23_NTOSKRNL_REF) { $env:S23_NTOSKRNL_REF } else { 'C:\Users\Mahan\.gemini\antigravity\brain\69c04d84-af7a-419e-9781-d650ca2201d9\scratch\ntoskrnl_phone.exe' }),
-    [string]$HalRef         = $(if ($env:S23_HAL_REF) { $env:S23_HAL_REF } else { 'C:\Users\Mahan\.gemini\antigravity\brain\69c04d84-af7a-419e-9781-d650ca2201d9\scratch\hal.dll' })
+    [string]$HalRef         = $(if ($env:S23_HAL_REF) { $env:S23_HAL_REF } else { 'C:\Users\Mahan\.gemini\antigravity\brain\69c04d84-af7a-419e-9781-d650ca2201d9\scratch\hal.dll' }),
+    [string]$WdkBinX86      = $env:S23_WDK_BIN_X86,
+    [string]$WdkBinX64      = $env:S23_WDK_BIN_X64,
+    [switch]$SkipMesa
 )
 $ErrorActionPreference = 'Stop'
 
@@ -70,8 +73,8 @@ $msvcInc  = Join-Path $MsvcToolsDir 'include'
 $msvcLib  = Join-Path $MsvcToolsDir 'lib\arm64'
 $wdkInc   = Join-Path $KitsRoot "Include\$WdkVersion"
 $wdkLib   = Join-Path $KitsRoot "Lib\$WdkVersion"
-$wdkBinX86 = Join-Path $KitsRoot "bin\$WdkVersion\x86"
-$wdkBinX64 = Join-Path $KitsRoot "bin\$WdkVersion\x64"
+$wdkBinX86 = if ($WdkBinX86) { $WdkBinX86 } else { Join-Path $KitsRoot "bin\$WdkVersion\x86" }
+$wdkBinX64 = if ($WdkBinX64) { $WdkBinX64 } else { Join-Path $KitsRoot "bin\$WdkVersion\x64" }
 
 $cl       = Join-Path $msvcBin 'cl.exe'
 $link     = Join-Path $msvcBin 'link.exe'
@@ -92,10 +95,12 @@ New-Item -ItemType Directory -Force -Path $outDir, $pkgDir | Out-Null
 Remove-Item -Recurse -Force (Join-Path $outDir '*'), (Join-Path $pkgDir '*') -ErrorAction SilentlyContinue
 $outWsl = ConvertTo-WslPath $outDir
 
-$wslMesaDll = "$MesaWslDir/build_d3d10/src/gallium/targets/d3d10umd/libgallium_d3d10.dll"
-$mesaUmd = Join-Path $outDir 'mesa_d3d10_arm64.dll'
-wsl bash -lc "test -f '$wslMesaDll' && cp '$wslMesaDll' '$outWsl/mesa_d3d10_arm64.dll'" 2>$null
-if ($LASTEXITCODE) { throw "Failed to copy Mesa UMD from WSL ($wslMesaDll)" }
+if (-not $SkipMesa) {
+    $wslMesaDll = "$MesaWslDir/build_d3d10/src/gallium/targets/d3d10umd/libgallium_d3d10.dll"
+    $mesaUmd = Join-Path $outDir 'mesa_d3d10_arm64.dll'
+    wsl bash -lc "test -f '$wslMesaDll' && cp '$wslMesaDll' '$outWsl/mesa_d3d10_arm64.dll'" 2>$null
+    if ($LASTEXITCODE) { throw "Failed to copy Mesa UMD from WSL ($wslMesaDll)" }
+}
 
 Write-Host '=== Assembling scm_arm64.asm ==='
 & $armasm -o (Join-Path $outDir 'scm_arm64.obj') (Join-Path $dir 'scm_arm64.asm')
@@ -142,54 +147,65 @@ if ($LASTEXITCODE) { throw "cl.exe opengl_test failed: $LASTEXITCODE" }
 & $cl /nologo /MT /O2 /W3 @umInc (Join-Path $dir 's23disp_only.c') "/Fo$outDir\s23disp_only.obj" /link /MACHINE:ARM64 @umLibPaths user32.lib wtsapi32.lib advapi32.lib kernel32.lib "/OUT:$outDir\s23disp_only.exe"
 if ($LASTEXITCODE) { throw "cl.exe s23disp_only failed: $LASTEXITCODE" }
 
-Write-Host "Using Mesa Freedreno UMD: $mesaUmd"
-Copy-Item $mesaUmd (Join-Path $outDir 's23gpu_umd.dll') -Force
+if (-not $SkipMesa) {
+    Write-Host "Using Mesa Freedreno UMD: $mesaUmd"
+    Copy-Item $mesaUmd (Join-Path $outDir 's23gpu_umd.dll') -Force
 
-$wslWglDll = "$MesaWslDir/build_d3d10/src/gallium/targets/wgl/libgallium_wgl.dll"
-$wslGlDll  = "$MesaWslDir/build_d3d10/src/gallium/targets/libgl-gdi/opengl32.dll"
-wsl bash -lc "if test -f '$wslWglDll' && test -f '$wslGlDll'; then cp '$wslWglDll' '$outWsl/libgallium_wgl.dll' && cp '$wslGlDll' '$outWsl/opengl32.dll'; fi" 2>$null
-if (Test-Path (Join-Path $outDir 'libgallium_wgl.dll')) {
-    & $signtool sign /fd SHA256 /sha1 $thumb (Join-Path $outDir 'libgallium_wgl.dll') (Join-Path $outDir 'opengl32.dll')
-    if ($LASTEXITCODE) { throw "signtool OpenGL DLLs failed: $LASTEXITCODE" }
+    $wslWglDll = "$MesaWslDir/build_d3d10/src/gallium/targets/wgl/libgallium_wgl.dll"
+    $wslGlDll  = "$MesaWslDir/build_d3d10/src/gallium/targets/libgl-gdi/opengl32.dll"
+    wsl bash -lc "if test -f '$wslWglDll' && test -f '$wslGlDll'; then cp '$wslWglDll' '$outWsl/libgallium_wgl.dll' && cp '$wslGlDll' '$outWsl/opengl32.dll'; fi" 2>$null
+    if (Test-Path (Join-Path $outDir 'libgallium_wgl.dll')) {
+        & $signtool sign /fd SHA256 /sha1 $thumb (Join-Path $outDir 'libgallium_wgl.dll') (Join-Path $outDir 'opengl32.dll')
+        if ($LASTEXITCODE) { throw "signtool OpenGL DLLs failed: $LASTEXITCODE" }
+    }
+
+    # outd = x64 Mesa WGL ICD + libgl-gdi opengl32.dll for APP-LOCAL use only (copied next to an x64 app by
+    # deploy_s23gpu.ps1). They are deliberately NOT in s23gpu.inf: UserModeDriverNameWoW/OpenGLDriverNameWoW are for
+    # 32-bit (x86) processes, and no x86 or x64 D3D UMD is built. See GPU_POLISH_NOTES.md section c.
+    $outX64Dir = Join-Path $outDir 'x64'
+    New-Item -ItemType Directory -Force -Path $outX64Dir | Out-Null
+    $wslWglX64 = "$MesaWslDir/build_x64/src/gallium/targets/wgl/libgallium_wgl.dll"
+    $wslGlX64  = "$MesaWslDir/build_x64/src/gallium/targets/libgl-gdi/opengl32.dll"
+    wsl bash -lc "if test -f '$wslWglX64' && test -f '$wslGlX64'; then cp '$wslWglX64' '$outWsl/x64/libgallium_wgl.dll' && cp '$wslGlX64' '$outWsl/x64/opengl32.dll'; fi" 2>$null
+    if (Test-Path (Join-Path $outX64Dir 'libgallium_wgl.dll')) {
+        & $signtool sign /fd SHA256 /sha1 $thumb (Join-Path $outX64Dir 'libgallium_wgl.dll') (Join-Path $outX64Dir 'opengl32.dll')
+        if ($LASTEXITCODE) { throw "signtool x64 OpenGL DLLs failed: $LASTEXITCODE" }
+    }
+
+    Write-Host '=== Packaging & Signing ==='
+    Copy-Item $sysOut (Join-Path $pkgDir 's23gpu.sys') -Force
+    Copy-Item (Join-Path $outDir 's23gpu_umd.dll') (Join-Path $pkgDir 's23gpu_umd.dll') -Force
+    Copy-Item (Join-Path $outDir 'libgallium_wgl.dll') (Join-Path $pkgDir 'libgallium_wgl.dll') -Force
+    Copy-Item (Join-Path $dir 's23gpu.inf') (Join-Path $pkgDir 's23gpu.inf') -Force
+
+    & $signtool sign /fd SHA256 /sha1 $thumb (Join-Path $pkgDir 's23gpu.sys') (Join-Path $pkgDir 's23gpu_umd.dll') (Join-Path $pkgDir 'libgallium_wgl.dll')
+    if ($LASTEXITCODE) { throw "signtool .sys/.dll failed: $LASTEXITCODE" }
+
+    & $inf2cat "/driver:$pkgDir" /os:10_NI_ARM64,10_GE_ARM64
+    if ($LASTEXITCODE) { throw "inf2cat failed: $LASTEXITCODE" }
+
+    & $signtool sign /fd SHA256 /sha1 $thumb (Join-Path $pkgDir 's23gpu.cat')
+    if ($LASTEXITCODE) { throw "signtool .cat failed: $LASTEXITCODE" }
+
+    Write-Host '=== Verifying PE Headers, Imports & Catalog ==='
+    & $dumpbin /headers (Join-Path $pkgDir 's23gpu.sys') | Select-String -Pattern 'machine|checksum|subsystem|DLL characteristics'
+    & $dumpbin /imports (Join-Path $pkgDir 's23gpu.sys') | Select-String -Pattern '\.sys|\.exe|\.dll'
+
+    & $dumpbin /headers (Join-Path $outDir 's23gpu_test.exe') (Join-Path $outDir 's23gpu_install.exe') (Join-Path $outDir 's23gpu_d3d11_test.exe') (Join-Path $pkgDir 's23gpu_umd.dll') | Select-String -Pattern 'machine|Dump of file'
+    python (Join-Path $dir '..\s23gpuprobe\verify_pe.py') (Join-Path $pkgDir 's23gpu.sys') $NtoskrnlRef $HalRef
+    if ($LASTEXITCODE) { throw "verify_pe.py failed: $LASTEXITCODE" }
+
+    $sigs = Get-AuthenticodeSignature (Join-Path $pkgDir 's23gpu.sys'), (Join-Path $pkgDir 's23gpu_umd.dll'), (Join-Path $pkgDir 's23gpu.cat')
+} else {
+    Write-Host '=== Packaging & Signing KMD Only (-SkipMesa) ==='
+    Copy-Item $sysOut (Join-Path $pkgDir 's23gpu.sys') -Force
+    Copy-Item (Join-Path $dir 's23gpu.inf') (Join-Path $pkgDir 's23gpu.inf') -Force
+    & $signtool sign /fd SHA256 /sha1 $thumb (Join-Path $pkgDir 's23gpu.sys')
+    if ($LASTEXITCODE) { throw "signtool .sys failed: $LASTEXITCODE" }
+    python (Join-Path $dir '..\s23gpuprobe\verify_pe.py') (Join-Path $pkgDir 's23gpu.sys') $NtoskrnlRef $HalRef (Join-Path $dir 'watchdog.sys') (Join-Path $dir 'dxgkrnl.sys')
+    if ($LASTEXITCODE) { throw "verify_pe.py failed: $LASTEXITCODE" }
+    $sigs = Get-AuthenticodeSignature (Join-Path $pkgDir 's23gpu.sys')
 }
-
-# outd = x64 Mesa WGL ICD + libgl-gdi opengl32.dll for APP-LOCAL use only (copied next to an x64 app by
-# deploy_s23gpu.ps1). They are deliberately NOT in s23gpu.inf: UserModeDriverNameWoW/OpenGLDriverNameWoW are for
-# 32-bit (x86) processes, and no x86 or x64 D3D UMD is built. See GPU_POLISH_NOTES.md section c.
-$outX64Dir = Join-Path $outDir 'x64'
-New-Item -ItemType Directory -Force -Path $outX64Dir | Out-Null
-$wslWglX64 = "$MesaWslDir/build_x64/src/gallium/targets/wgl/libgallium_wgl.dll"
-$wslGlX64  = "$MesaWslDir/build_x64/src/gallium/targets/libgl-gdi/opengl32.dll"
-wsl bash -lc "if test -f '$wslWglX64' && test -f '$wslGlX64'; then cp '$wslWglX64' '$outWsl/x64/libgallium_wgl.dll' && cp '$wslGlX64' '$outWsl/x64/opengl32.dll'; fi" 2>$null
-if (Test-Path (Join-Path $outX64Dir 'libgallium_wgl.dll')) {
-    & $signtool sign /fd SHA256 /sha1 $thumb (Join-Path $outX64Dir 'libgallium_wgl.dll') (Join-Path $outX64Dir 'opengl32.dll')
-    if ($LASTEXITCODE) { throw "signtool x64 OpenGL DLLs failed: $LASTEXITCODE" }
-}
-
-Write-Host '=== Packaging & Signing ==='
-Copy-Item $sysOut (Join-Path $pkgDir 's23gpu.sys') -Force
-Copy-Item (Join-Path $outDir 's23gpu_umd.dll') (Join-Path $pkgDir 's23gpu_umd.dll') -Force
-Copy-Item (Join-Path $outDir 'libgallium_wgl.dll') (Join-Path $pkgDir 'libgallium_wgl.dll') -Force
-Copy-Item (Join-Path $dir 's23gpu.inf') (Join-Path $pkgDir 's23gpu.inf') -Force
-
-& $signtool sign /fd SHA256 /sha1 $thumb (Join-Path $pkgDir 's23gpu.sys') (Join-Path $pkgDir 's23gpu_umd.dll') (Join-Path $pkgDir 'libgallium_wgl.dll')
-if ($LASTEXITCODE) { throw "signtool .sys/.dll failed: $LASTEXITCODE" }
-
-& $inf2cat "/driver:$pkgDir" /os:10_NI_ARM64,10_GE_ARM64
-if ($LASTEXITCODE) { throw "inf2cat failed: $LASTEXITCODE" }
-
-& $signtool sign /fd SHA256 /sha1 $thumb (Join-Path $pkgDir 's23gpu.cat')
-if ($LASTEXITCODE) { throw "signtool .cat failed: $LASTEXITCODE" }
-
-Write-Host '=== Verifying PE Headers, Imports & Catalog ==='
-& $dumpbin /headers (Join-Path $pkgDir 's23gpu.sys') | Select-String -Pattern 'machine|checksum|subsystem|DLL characteristics'
-& $dumpbin /imports (Join-Path $pkgDir 's23gpu.sys') | Select-String -Pattern '\.sys|\.exe|\.dll'
-
-& $dumpbin /headers (Join-Path $outDir 's23gpu_test.exe') (Join-Path $outDir 's23gpu_install.exe') (Join-Path $outDir 's23gpu_d3d11_test.exe') (Join-Path $pkgDir 's23gpu_umd.dll') | Select-String -Pattern 'machine|Dump of file'
-python (Join-Path $dir '..\s23gpuprobe\verify_pe.py') (Join-Path $pkgDir 's23gpu.sys') $NtoskrnlRef $HalRef
-if ($LASTEXITCODE) { throw "verify_pe.py failed: $LASTEXITCODE" }
-
-$sigs = Get-AuthenticodeSignature (Join-Path $pkgDir 's23gpu.sys'), (Join-Path $pkgDir 's23gpu_umd.dll'), (Join-Path $pkgDir 's23gpu.cat')
 $sigs | Format-Table Path, Status, @{N='Thumbprint';E={$_.SignerCertificate.Thumbprint}}, @{N='Signer';E={$_.SignerCertificate.Subject}}
 foreach ($s in $sigs) {
     if (-not $s.SignerCertificate -or $s.SignerCertificate.Thumbprint -ne $thumb) {

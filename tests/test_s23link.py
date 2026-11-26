@@ -254,5 +254,81 @@ class CliTest(unittest.TestCase):
         fake.__enter__.return_value.exec.assert_called_once_with('dir C:\\', 120)
 
 
+class LibUsbTransportTest(unittest.TestCase):
+    def _fake_libusb(self, vid=0x1209, pid=0x0003, open_rc=0, recv_rc=0, recv_bytes=b'pong'):
+        import ctypes
+        dev_ptr = ctypes.c_void_p(0x1111)
+        dev_arr = (ctypes.c_void_p * 2)(dev_ptr, None)
+        sent = []
+        closed = []
+
+        u = mock.MagicMock()
+        def init(ctx_p):
+            ctypes.cast(ctx_p, ctypes.POINTER(ctypes.c_void_p))[0] = 0x2222
+            return 0
+        def get_list(ctx, list_p):
+            ctypes.cast(list_p, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0] = ctypes.cast(dev_arr, ctypes.POINTER(ctypes.c_void_p))
+            return 1
+        def get_desc(dev, desc_p):
+            desc = ctypes.cast(desc_p, ctypes.POINTER(s23link._LibUsbDeviceDescriptor)).contents
+            desc.idVendor = vid
+            desc.idProduct = pid
+            return 0
+        def usb_open(dev, hdl_p):
+            if open_rc == 0:
+                ctypes.cast(hdl_p, ctypes.POINTER(ctypes.c_void_p))[0] = 0x3333
+            return open_rc
+        def bulk_xfer(hdl, ep, buf, length, xfer_p, timeout_ms):
+            if ep == 0x01:
+                sent.append(ctypes.string_at(buf, length))
+                ctypes.cast(xfer_p, ctypes.POINTER(ctypes.c_int))[0] = length
+                return 0
+            if recv_rc == 0:
+                ctypes.memmove(buf, recv_bytes, len(recv_bytes))
+                ctypes.cast(xfer_p, ctypes.POINTER(ctypes.c_int))[0] = len(recv_bytes)
+            return recv_rc
+
+        u.libusb_init.side_effect = init
+        u.libusb_get_device_list.side_effect = get_list
+        u.libusb_get_device_descriptor.side_effect = get_desc
+        u.libusb_open.side_effect = usb_open
+        u.libusb_set_auto_detach_kernel_driver.return_value = 0
+        u.libusb_claim_interface.return_value = 0
+        u.libusb_clear_halt.return_value = 0
+        u.libusb_bulk_transfer.side_effect = bulk_xfer
+        u.libusb_close.side_effect = lambda h: closed.append(h)
+        u.libusb_exit.side_effect = lambda c: closed.append(('exit', c))
+        return u, sent, closed
+
+    def test_send_pads_512_multiple_and_recv_timeout_returns_none(self):
+        u, sent, closed = self._fake_libusb(recv_rc=s23link.LibUsbTransport.ERR_TIMEOUT)
+        with mock.patch.object(s23link.ctypes.util, 'find_library', return_value='libusb-1.0.so.0'), \
+             mock.patch.object(s23link.ctypes, 'CDLL', return_value=u):
+            t = s23link.LibUsbTransport(open_timeout_s=0)
+            self.assertEqual(t.path, 'libusb:1209:0003')
+            t.send(b'A' * 512)
+            self.assertEqual(len(sent[0]), 513)
+            self.assertIsNone(t.recv(0.5))
+            t.close()
+        self.assertTrue(closed)
+
+    def test_access_denied_mentions_udev_rules(self):
+        u, _, _ = self._fake_libusb(open_rc=s23link.LibUsbTransport.ERR_ACCESS)
+        with mock.patch.object(s23link.ctypes.util, 'find_library', return_value='libusb-1.0.so.0'), \
+             mock.patch.object(s23link.ctypes, 'CDLL', return_value=u):
+            with self.assertRaises(s23link.RemoteError) as cm:
+                s23link.LibUsbTransport(open_timeout_s=0)
+            self.assertIn('99-s23-winusb.rules', str(cm.exception))
+
+    def test_non_windows_link_selects_libusb_transport(self):
+        fake_t = mock.MagicMock()
+        with mock.patch.object(s23link, 'TcpTransport', side_effect=OSError('no daemon')), \
+             mock.patch.object(s23link, 'LibUsbTransport', return_value=fake_t) as m_libusb, \
+             mock.patch.object(s23link.sys, 'platform', 'linux'):
+            link = s23link.Link()
+        m_libusb.assert_called_once_with()
+        self.assertIs(link.t, fake_t)
+
+
 if __name__ == '__main__':
     unittest.main()
