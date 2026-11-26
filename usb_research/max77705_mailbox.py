@@ -105,6 +105,12 @@ def decode_bc_status(v):
     return {"VBUSDet": (v >> 7) & 1, "PrChgTyp": (v >> 3) & 7, "DCDTmo": (v >> 2) & 1, "ChgTyp": v & 3}
 
 
+def decode_usbc_status1(v):
+    """REG_USBC_STATUS1 (0x06): VBADC[7:4] (VBUS voltage bucket), UIDADC[2:0] (raw values)."""
+    v = _byte(v)
+    return {"VBADC": (v >> 4) & 0xF, "UIDADC": v & 7}
+
+
 def decode_pd_status1(v):
     """REG_PD_STATUS1 (0x0D): PD_DataRole[7], PD_PSRDY[4], FCT_ID[3:0]."""
     v = _byte(v)

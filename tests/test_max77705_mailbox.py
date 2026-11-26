@@ -83,6 +83,11 @@ class StatusRegisterTest(unittest.TestCase):
     def test_pd_status1_fields(self):
         self.assertEqual(mb.decode_pd_status1(0b1_00_1_1010), {"PD_DataRole": 1, "PD_PSRDY": 1, "FCT_ID": 0xA})
 
+    def test_usbc_status1_fields(self):
+        self.assertEqual(mb.decode_usbc_status1(0b1011_1_110), {"VBADC": 0xB, "UIDADC": 6})
+        with self.assertRaises(mb.MailboxError):
+            mb.decode_usbc_status1(256)
+
     def test_every_byte_round_trips_through_its_fields(self):
         for v in range(256):
             c = mb.decode_cc_status0(v)
