@@ -14,6 +14,11 @@ This repository contains the ARM64 kernel drivers, UEFI DXE patches, ACPI SSDTs,
 > 4. **Never call `Set-Date`** in live scripts on the phone. The UEFI RTC starts at `2024-04-01`; jumping the clock forward triggers the display idle-off timer (black screen).
 > 5. **Avoid WHEA `0x124` SError aborts** — never touch TZ-reserved QUP/TLMM pins (`GPIO36..39`, `50..51`, `56..59`, `64..65`; `QUP1_SE2`, `QUP2_SE0`, `QUP2_SE2`), non-APPS SMEM partitions, KGSL `0x03D00000` while `GPUCC_GX_GDSCR` bit 31 is 0, GMU `0x03D6A000` while `GPUCC_CX_GDSCR` is collapsed, or PIL DDR carve-outs before checking `IMEM ImageLoadInfo (0x146AA94C)`.
 
+**Quick Downloads & Guides:**
+- **Prebuilt signed ARM64 drivers (`s23-drivers-arm64.zip`):** [GitHub Releases (`s23-windows-11`)](https://github.com/MahanYTT/s23-windows-11/releases) (zero local Windows needed)
+- **Prebuilt Project Mu UEFI (`Mu-dm1q.img`) & source (`dm1qPkg`):** [`MahanYTT/Mu-Silicium`](https://github.com/MahanYTT/Mu-Silicium) ([Releases](https://github.com/MahanYTT/Mu-Silicium/releases))
+- **Native Linux install guide (CachyOS / Arch / Debian / Fedora):** [`docs/LINUX_INSTALL.md`](docs/LINUX_INSTALL.md)
+
 ---
 
 ## Status
@@ -26,7 +31,7 @@ This repository contains the ARM64 kernel drivers, UEFI DXE patches, ACPI SSDTs,
 | UEFI / ACPI | **WORKS ✅** | Custom [`MahanYTT/Mu-Silicium`](https://github.com/MahanYTT/Mu-Silicium) UEFI boot image on `sda25` ([prebuilt `Mu-dm1q.img`](https://github.com/MahanYTT/Mu-Silicium/releases)) with `S23DisplayFixDxe` ([`display_research/`](display_research/)), `S23Pcie0Dxe` (`QCA6490` PCIe0 RC + ACPI SSDT), S23 `MemoryMapLib`, `dm1q.dtb`, and upstream `Project-Silicium/Device-Binaries` (`dm2q`) XBL DXEs; boots WinPE and full Windows 11 Pro 24H2. |
 | CPU | **WORKS ✅** | Native ARM64 execution across all 8 cores on Snapdragon 8 Gen 2 for Galaxy (`SM8550-AC`); resident dynamic EPSS DVFS & 41-sensor TSENS thermal governor + `s23perfctl.ps1` CLI ([`drivers/s23perf/`](drivers/s23perf/)). |
 | RAM | **WORKS ✅** | Usable Windows memory map with reserved subsystem carve-outs for daily desktop and GPU workloads; full stress and suspend-retention qualification still pending. |
-| UFS / installation | **WORKS ✅** | Installed Windows 11 boots directly from 4 KiB-sector UFS partition `sda43` (`/dev/block/by-name/win`) with Android LUNs isolated (`SanPolicy = 4`); public reproducible installer still pending. |
+| UFS / installation | **WORKS ✅** | Installed Windows 11 boots directly from 4 KiB-sector UFS partition `sda43` (`/dev/block/by-name/win`) with Android LUNs isolated (`SanPolicy = 4`); native Linux installer available ([`docs/LINUX_INSTALL.md`](docs/LINUX_INSTALL.md), [`scripts/linux/install_s23_linux.py`](scripts/linux/install_s23_linux.py)); Windows-host automation still pending. |
 | Display | **WORKS ✅** | Native `1080×2340 @ 120 Hz` AMOLED presentation with high-resolution VSync, native brightness slider and Night Light ([`drivers/s23gpu/`](drivers/s23gpu/), [`display_research/`](display_research/)). Display idle-off/sleep-wake hardening still pending. |
 | GPU / WDDM acceleration | **WORKS ✅** | Experimental Adreno 740 WDDM 2.0 display + 3D KMD ([`drivers/s23gpu/`](drivers/s23gpu/)): GMU + SQE + ZAP + KGSL-SMMU, Mesa Freedreno D3D11 (`d3d10umd`) and **OpenGL 4.6** WGL ICD (ARM64 + x64), live Task Manager GPU utilization & TSENS temperature. Broad stability/Vulkan hardening still pending. |
 | Touchscreen | **WORKS ✅** | STM `FTS2BA61Y` HID multitouch minidriver on QUP1 SE4 GENI SPI (`0x00A90000`, IRQ `gpio25`, [`drivers/s23touch/`](drivers/s23touch/)). Everyday multitouch works; suspend/resume qualification pending. |
@@ -74,12 +79,12 @@ Driver versions are tracked in each driver's `.inf` (`DriverVer`) and in the com
 - [ ] Full-capacity / stress qualification.
 - [ ] Memory retention across suspend.
 
-### UFS / installation — 3/5 complete
+### UFS / installation — 4/5 complete
 
 - [x] 4 KiB-sector UFS filesystem integration (`sda43` `/dev/block/by-name/win`).
 - [x] Windows-compatible GPT partition layout (Android LUNs isolated via `SanPolicy = 4`, `sdb`/`sde` untouched).
 - [x] Installed Windows 11 boots directly from internal storage.
-- [ ] Reproducible public installation/servicing workflow.
+- [x] Reproducible Linux installation/servicing workflow ([`docs/LINUX_INSTALL.md`](docs/LINUX_INSTALL.md), [`scripts/linux/install_s23_linux.py`](scripts/linux/install_s23_linux.py)); Windows-host automation pending.
 - [ ] Power-loss and storage-performance qualification.
 
 ### Display — 4/5 complete
@@ -280,13 +285,16 @@ powershell -ExecutionPolicy Bypass -File .\drivers\s23bthx\sign_and_cat.ps1
 python .\drivers\s23gpuprobe\verify_pe.py .\drivers\s23bthx\pkg\s23bthx.sys <path-to-phone-ntoskrnl.exe>
 ```
 
-### MSVC driver (`s23gpu`)
+### MSVC / WDK drivers (`s23gpu`, `s23audio`, `s23modem`, `s23mbb`)
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\drivers\s23gpu\build.ps1
+powershell -ExecutionPolicy Bypass -File .\drivers\s23gpu\build.ps1            # or add -SkipMesa without WSL Mesa DLLs
+powershell -ExecutionPolicy Bypass -File .\drivers\s23audio\build.ps1
+powershell -ExecutionPolicy Bypass -File .\drivers\s23modem\build.ps1
+powershell -ExecutionPolicy Bypass -File .\drivers\s23mbb\build.ps1
 ```
 
-`build.ps1` compiles the KMD with `Hostx64\arm64` `cl.exe`/`link.exe`, builds the user-mode test tools, pulls the Mesa UMD/WGL DLLs from the WSL Mesa build, signs everything and runs `verify_pe.py`.
+`drivers\s23gpu\build.ps1` compiles the KMD with `Hostx64\arm64` `cl.exe`/`link.exe`, builds the user-mode test tools, pulls the Mesa UMD/WGL DLLs from the WSL Mesa build (unless `-SkipMesa` is passed), signs everything and runs `verify_pe.py`. The `s23audio`, `s23modem`, and `s23mbb` scripts build and test-sign those WDK drivers plus their user-mode installers/CLI tools.
 
 > [!NOTE]
 > Always verify and deploy the **signed** `pkg\*.sys` (never the unsigned `out\*.sys`). When compiling by hand, use `Hostx64\arm64`, never `Hostx64\x64`.
@@ -344,7 +352,4 @@ Proprietary Samsung/Qualcomm firmware, partition images, logs and all compiled b
    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=MahanYTT/s23-windows-11&type=date&legend=top-left" />
    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=MahanYTT/s23-windows-11&type=date&legend=top-left" />
  </picture>
-</a>
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=MahanYTT/s23-windows-11&type=Date" />
-  </picture>
 </a>

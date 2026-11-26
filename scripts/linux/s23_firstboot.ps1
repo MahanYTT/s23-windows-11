@@ -31,6 +31,14 @@ $certObj = Get-ChildItem Cert:\CurrentUser\My, Cert:\LocalMachine\My -ErrorActio
 $infs = Get-ChildItem -Path $drvRoot -Filter '*.inf' -Recurse -ErrorAction SilentlyContinue
 foreach ($inf in $infs) {
     $pkgDir = $inf.DirectoryName
+    if ($inf.BaseName -eq 's23gpu') {
+        $umd = Join-Path $pkgDir 's23gpu_umd.dll'
+        $wgl = Join-Path $pkgDir 'libgallium_wgl.dll'
+        if (-not (Test-Path $umd) -or -not (Test-Path $wgl)) {
+            Write-Output 'Skipping s23gpu.inf (drop Mesa Freedreno s23gpu_umd.dll & libgallium_wgl.dll alongside it first)'
+            continue
+        }
+    }
     $catPath = Join-Path $pkgDir ($inf.BaseName + '.cat')
     if (-not (Test-Path $catPath) -and $certObj) {
         New-FileCatalog -Path $pkgDir -CatalogFilePath $catPath -CatalogVersion 2 | Out-Null
@@ -40,7 +48,13 @@ foreach ($inf in $infs) {
     & pnputil /add-driver $inf.FullName /install
 }
 
-# 4. Create Desktop SMS shortcut if s23sms.ps1 was staged
+# 4. Install s23modemd.exe to System32 and create Desktop SMS shortcut if staged
+$modemdSrc = Join-Path $drvRoot 's23modem\s23modemd.exe'
+if (Test-Path $modemdSrc) {
+    Copy-Item $modemdSrc 'C:\Windows\System32\s23modemd.exe' -Force
+    Write-Output 'Installed s23modemd.exe to C:\Windows\System32\s23modemd.exe'
+}
+
 $smsScript = Join-Path $drvRoot 's23sms.ps1'
 if (Test-Path $smsScript) {
     New-Item -ItemType Directory -Force -Path 'C:\s23mbb_pkg' | Out-Null

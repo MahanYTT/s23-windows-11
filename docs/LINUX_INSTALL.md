@@ -6,7 +6,7 @@ You do **not** need a Windows host PC or Windows VM to partition the S23, pull d
 
 | Component | Source | Notes |
 |---|---|---|
-| **Open-source S23 Windows drivers** (`s23touch`, `s23batt`, `s23keys`, `s23bthx`, `s23perf`, `s23audio`, `s23mbb`, `s23modem_xprt`, `s23gpu.sys` KMD) + `s23modemd.exe`, `s23sms.ps1`, `s23perfctl.ps1`, `s23_firstboot.ps1`, `s23test.cer` | **[GitHub Releases](https://github.com/MahanYTT/s23-windows-11/releases)** (`s23-drivers-arm64.zip`) or [`.github/workflows/build-drivers.yml`](../.github/workflows/build-drivers.yml) | Pre-built and test-signed (`CN=S23TouchTest2020`) automatically via GitHub Actions — zero local Windows needed. |
+| **Open-source S23 Windows drivers** (`s23touch`, `s23batt`, `s23keys`, `s23bthx`, `s23perf`, `s23audio`, `s23mbb`, `s23modem_xprt`, `s23gpu.sys` KMD) + root-devnode installers (`install_root_audio.exe`, `install_root_mbb.exe`, `s23gpu_install.exe`), `s23modemd.exe`, `s23sms.ps1`, `s23perfctl.ps1`, `fix_bt_settings_ui.ps1`, `s23_firstboot.ps1`, `s23test.cer` | **[GitHub Releases](https://github.com/MahanYTT/s23-windows-11/releases)** (`s23-drivers-arm64.zip`) or [`.github/workflows/build-drivers.yml`](../.github/workflows/build-drivers.yml) | Pre-built and test-signed (`CN=S23TouchTest2020`) automatically via GitHub Actions — zero local Windows needed. |
 | **Stock Samsung/Qualcomm phone firmware** (`modem`, `apnhlos`, `dsp`, `vendor` GPU/Wi-Fi/BT/audio blobs) | **Pulled from your own phone** via `install_s23_linux.py pull-fw` | Proprietary + bound to your device's TrustZone rollback fuses (bit 8 / bit 9); see [`modem_5g_research/FIRMWARE_GROUND_TRUTH.md`](../modem_5g_research/FIRMWARE_GROUND_TRUTH.md). |
 | **Qualcomm Wi-Fi 6E driver** (`qcwlan8280.sys`) | User-supplied proprietary Qualcomm WHQL package | See [`wifi_research/qca6490_bringup/QCA6490_DRIVER_AND_FW_GUIDE.md`](../wifi_research/qca6490_bringup/QCA6490_DRIVER_AND_FW_GUIDE.md) and [`wifi_research/WIFI_BRINGUP_FIXES.md`](../wifi_research/WIFI_BRINGUP_FIXES.md). |
 | **Project Mu UEFI `boot.img`** (`Mu-dm1q.img`) | **[`MahanYTT/Mu-Silicium`](https://github.com/MahanYTT/Mu-Silicium)** ([Releases](https://github.com/MahanYTT/Mu-Silicium/releases)) | Built cleanly on Linux from [`Platforms/Samsung/dm1qPkg`](https://github.com/MahanYTT/Mu-Silicium/tree/main/Platforms/Samsung/dm1qPkg) (`S23DisplayFixDxe`, `S23Pcie0Dxe`, `MemoryMapLib`, `AcpiTables`, `dm1q.dtb`) + upstream `Project-Silicium/Device-Binaries` (`dm2q`) XBL DXEs. Prebuilt CI `Mu-dm1q.img` is published on GitHub Releases. |
@@ -64,7 +64,7 @@ gh release download --pattern 's23-drivers-arm64.zip' && unzip s23-drivers-arm64
 gh workflow run build-drivers.yml
 ```
 
-This contains all signed `.sys` drivers (`s23touch`, `s23batt`, `s23keys`, `s23bthx`, `s23perf`, `s23audio`, `s23mbb`, `s23modem_xprt`, `s23gpu`), `s23modemd.exe`, `s23sms.ps1`, `s23perfctl.ps1`, `s23test.cer`, and `s23_firstboot.ps1`.
+This contains all signed `.sys` drivers (`s23touch`, `s23batt`, `s23keys`, `s23bthx`, `s23perf`, `s23audio`, `s23mbb`, `s23modem_xprt`, `s23gpu`), root-devnode installers (`install_root_audio.exe`, `install_root_mbb.exe`, `s23gpu_install.exe`), `s23modemd.exe`, `s23sms.ps1`, `s23perfctl.ps1`, `fix_bt_settings_ui.ps1`, `s23test.cer`, and `s23_firstboot.ps1`.
 
 ### Option B: Build & sign the Clang drivers locally on Linux
 
