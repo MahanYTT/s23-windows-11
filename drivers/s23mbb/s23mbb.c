@@ -226,6 +226,19 @@ typedef struct _S23MBB_SESSION_STATE {
     UINT32  V6Mtu;
 } S23MBB_SESSION_STATE;
 
+#define S23MBB_MAX_SMS_SLOTS        32U
+
+typedef struct _S23MBB_SMS_SLOT {
+    BOOLEAN InUse;
+    UINT32  Index;
+    UINT32  Status; /* 0=New, 1=Old, 2=Draft, 3=Sent */
+    BOOLEAN BackingQmi;
+    UINT8   QmiStorage; /* 0=UIM, 1=NV */
+    UINT32  QmiIndex;
+    UINT32  PduLen;
+    UINT8   Pdu[256];
+} S23MBB_SMS_SLOT;
+
 typedef struct _S23MBB_DEV_CTX {
     WDFDEVICE               Device;
     WDFIOTARGET             XprtTarget;
@@ -331,6 +344,15 @@ typedef struct _S23MBB_DEV_CTX {
     UINT32                  DataRxTail;
     S23MODEM_IPA_PKT       *IpaIoPkt;
     S23MODEM_IPA_STATUS    *IpaStatus;
+
+    /* Native MBIM 1.0 SMS cache & QMI WMS (0x05) state */
+    S23MBB_SMS_SLOT        *SmsCache;
+    UINT8                  *PendingWmsIndBuf;
+    UINT32                  PendingWmsIndLen;
+    BOOLEAN                 WmsInitialized;
+    char                    SmscAddr[32];
+    UINT32                  SmsMaxMessages;
+    UINT32                  NextRamSmsIndex;
 } S23MBB_DEV_CTX, *PS23MBB_DEV_CTX;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(S23MBB_DEV_CTX, S23MbbGetDeviceContext)
@@ -493,7 +515,8 @@ static BOOLEAN QmiCall(PS23MBB_DEV_CTX ctx, UINT32 svc, UINT16 msgId,
     BOOLEAN isSlowUim = (svc == QMI_SVC_UIM) &&
                         (msgId == 0x003BU || msgId == 0x0042U || msgId == 0x003FU ||
                          msgId == 0x0046U || msgId == 0x0031U || msgId == 0x0030U);
-    LONGLONG timeoutMs = isSlowUim ? 20000LL : 3500LL;
+    BOOLEAN isSlowSms = (svc == QMI_SVC_WMS && msgId == 0x0020U);
+    LONGLONG timeoutMs = (isSlowUim || isSlowSms) ? 20000LL : 3500LL;
 
     for (UINT32 attempt = 0; attempt < 200U; attempt++) {
         S23MODEM_QRTR_PKT *rx = ctx->QrtrRxPkt;
@@ -533,6 +556,10 @@ static BOOLEAN QmiCall(PS23MBB_DEV_CTX ctx, UINT32 svc, UINT16 msgId,
             if (rMsgId == 0x0048U || rMsgId == 0x0032U) {
                 ctx->PendingUimRefresh = TRUE;
                 KeQuerySystemTimePrecise(&ctx->PendingRefreshTime);
+            } else if (svc == QMI_SVC_WMS && rMsgId == 0x0001U &&
+                       ctx->PendingWmsIndBuf && rLen > 0U && rLen <= 1024U) {
+                RtlCopyMemory(ctx->PendingWmsIndBuf, rx->Payload + 7U, rLen);
+                ctx->PendingWmsIndLen = rLen;
             }
             continue;
         }
@@ -1070,6 +1097,8 @@ static VOID EnsureEuiccSlotActive(PS23MBB_DEV_CTX ctx)
     }
 }
 
+static VOID QmiInitializeWms(PS23MBB_DEV_CTX ctx);
+
 static VOID QmiInitializeModemOnOpen(PS23MBB_DEV_CTX ctx)
 {
     if (!EnsureXprtConnected(ctx)) return;
@@ -1120,6 +1149,7 @@ static VOID QmiInitializeModemOnOpen(PS23MBB_DEV_CTX ctx)
     /* Default to Slot 0 (pSIM1) if physical SIM inserted, else Slot 1 (embedded eSIM) */
     ctx->ActiveWinSlot = ctx->Slot0Present ? 0U : 1U;
     QmiEnsureGwPrimaryProvisioned(ctx);
+    QmiInitializeWms(ctx);
     MbbLogFmt("[INIT] Open complete: FwRev='%s' ActiveWinSlot=%u gwPri=0x%04x\r\n",
               ctx->FwRev, ctx->ActiveWinSlot, ctx->GwPriVal);
     MbbLogFlush();
@@ -2026,6 +2056,615 @@ static VOID HandleMbimConnect(PS23MBB_DEV_CTX ctx, UINT32 txId, UINT32 cmdType,
 }
 
 /* ============================================================================
+ * QMI WMS (0x05) & Native MBIM 1.0 SMS (UUID_SMS) Support
+ * ========================================================================== */
+static VOID QmiWmsRefreshSmscAndMax(PS23MBB_DEV_CTX ctx)
+{
+    UINT16 tlvLen = 0, qRes = 0, qErr = 0;
+
+    if (QmiCall(ctx, QMI_SVC_WMS, 0x0034U, NULL, 0, ctx->QmiTlvBuf, 512U, &tlvLen, &qRes, &qErr) && qRes == 0U) {
+        UINT16 ln01 = 0;
+        const UINT8 *v01 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x01U, &ln01);
+        /* QMI WMS GET_SMSC_ADDRESS TLV 0x01: smsc_address_type[3] + digLen(u8) + digAscii[] */
+        if (v01 && ln01 >= 5U && v01[0] >= '0' && v01[0] <= '9') {
+            UINT8 digLen = v01[3];
+            if (digLen > 0U && 4U + (UINT32)digLen <= ln01) {
+                UINT32 outPos = 0U;
+                if (v01[0] == '1' && v01[1] == '4' && v01[2] == '5' && v01[4] != '+') {
+                    ctx->SmscAddr[outPos++] = '+';
+                }
+                UINT32 cp = ((UINT32)digLen < (UINT32)(sizeof(ctx->SmscAddr) - 1U - outPos))
+                                ? (UINT32)digLen : (UINT32)(sizeof(ctx->SmscAddr) - 1U - outPos);
+                RtlCopyMemory(ctx->SmscAddr + outPos, v01 + 4U, cp);
+                ctx->SmscAddr[outPos + cp] = '\0';
+            }
+        } else if (v01 && ln01 >= 2U) {
+            UINT8 typeLen = v01[0];
+            if (1U + (UINT32)typeLen + 1U <= ln01) {
+                const UINT8 *typeStr = v01 + 1U;
+                UINT8 digLen = v01[1U + typeLen];
+                if (2U + (UINT32)typeLen + (UINT32)digLen <= ln01 && digLen > 0U) {
+                    UINT32 outPos = 0U;
+                    if (typeLen == 3U && typeStr[0] == '1' && typeStr[1] == '4' && typeStr[2] == '5' &&
+                        v01[2U + typeLen] != '+') {
+                        ctx->SmscAddr[outPos++] = '+';
+                    }
+                    UINT32 cp = ((UINT32)digLen < (UINT32)(sizeof(ctx->SmscAddr) - 1U - outPos))
+                                    ? (UINT32)digLen : (UINT32)(sizeof(ctx->SmscAddr) - 1U - outPos);
+                    RtlCopyMemory(ctx->SmscAddr + outPos, v01 + 2U + typeLen, cp);
+                    ctx->SmscAddr[outPos + cp] = '\0';
+                }
+            }
+        }
+    }
+
+    UINT32 maxMsgs = 0U;
+    for (UINT8 storage = 0U; storage <= 1U; storage++) {
+        UINT8 req[8] = { 0x01U, 1U, 0U, storage, 0x10U, 1U, 0U, 1U };
+        if (QmiCall(ctx, QMI_SVC_WMS, 0x0037U, req, sizeof(req), ctx->QmiTlvBuf, 256U, &tlvLen, &qRes, &qErr) && qRes == 0U) {
+            UINT16 ln01 = 0;
+            const UINT8 *v01 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x01U, &ln01);
+            if (v01 && ln01 >= 4U) {
+                UINT32 m = Le32(v01);
+                if (m > maxMsgs) maxMsgs = m;
+            }
+        }
+    }
+    ctx->SmsMaxMessages = (maxMsgs > 0U) ? maxMsgs : 50U;
+}
+
+static VOID QmiInitializeWms(PS23MBB_DEV_CTX ctx)
+{
+    UINT16 tlvLen = 0, qRes = 0, qErr = 0;
+    UINT8 evReq[4] = { 0x10U, 1U, 0U, 1U }; /* report_mt_message = 1 */
+    (void)QmiCall(ctx, QMI_SVC_WMS, 0x0001U, evReq, sizeof(evReq), ctx->QmiTlvBuf, 256U, &tlvLen, &qRes, &qErr);
+
+    /* Configure GW point-to-point MT routes: Class 0/1/3/None -> TRANSFER_AND_ACK, Class 2 -> UIM STORE_AND_NOTIFY */
+    UINT8 rReq[32];
+    UINT32 rp = 0U;
+    rReq[rp++] = 0x01U; rReq[rp++] = 22U; rReq[rp++] = 0U;
+    rReq[rp++] = 5U; rReq[rp++] = 0U; /* num_routes = 5 */
+    static const UINT8 kGwRoutes[5][4] = {
+        { 0x00U, 0x00U, 0xFFU, 0x03U },
+        { 0x00U, 0x01U, 0xFFU, 0x03U },
+        { 0x00U, 0x02U, 0x00U, 0x01U },
+        { 0x00U, 0x03U, 0xFFU, 0x03U },
+        { 0x00U, 0x04U, 0xFFU, 0x03U }
+    };
+    for (UINT32 i = 0U; i < 5U; i++) {
+        RtlCopyMemory(rReq + rp, kGwRoutes[i], 4U);
+        rp += 4U;
+    }
+    rReq[rp++] = 0x10U; rReq[rp++] = 1U; rReq[rp++] = 0U; rReq[rp++] = 1U; /* transfer_status_report = 1 */
+    (void)QmiCall(ctx, QMI_SVC_WMS, 0x0032U, rReq, (UINT16)rp, ctx->QmiTlvBuf, 256U, &tlvLen, &qRes, &qErr);
+
+    QmiWmsRefreshSmscAndMax(ctx);
+    ctx->WmsInitialized = TRUE;
+    MbbLogFmt("[WMS] Init: routesRes=%u err=0x%x smsc='%s' maxMsgs=%u\r\n",
+              qRes, qErr, ctx->SmscAddr[0] ? ctx->SmscAddr : "-", ctx->SmsMaxMessages);
+    MbbLogFlush();
+}
+
+static VOID QmiWmsSendAck(PS23MBB_DEV_CTX ctx, UINT32 txId)
+{
+    UINT8 req[9];
+    req[0] = 0x01U; req[1] = 6U; req[2] = 0U;
+    RtlCopyMemory(req + 3U, &txId, 4U);
+    req[7] = 0x02U; /* WCDMA / GW */
+    req[8] = 0x01U; /* success = 1 */
+    UINT16 tlvLen = 0, qRes = 0, qErr = 0;
+    (void)QmiCall(ctx, QMI_SVC_WMS, 0x003DU, req, sizeof(req), ctx->QmiTlvBuf, 256U, &tlvLen, &qRes, &qErr);
+}
+
+static S23MBB_SMS_SLOT *SmsCacheInsert(PS23MBB_DEV_CTX ctx, const UINT8 *pdu, UINT32 pduLen,
+                                       UINT32 status, BOOLEAN backingQmi, UINT8 qmiStorage, UINT32 qmiIndex)
+{
+    if (!ctx->SmsCache || pduLen == 0U || pduLen > 256U) return NULL;
+
+    if (backingQmi) {
+        for (UINT32 i = 0U; i < S23MBB_MAX_SMS_SLOTS; i++) {
+            S23MBB_SMS_SLOT *s = &ctx->SmsCache[i];
+            if (s->InUse && s->BackingQmi && s->QmiStorage == qmiStorage && s->QmiIndex == qmiIndex) {
+                return s;
+            }
+        }
+    }
+
+    S23MBB_SMS_SLOT *chosen = NULL;
+    for (UINT32 i = 0U; i < S23MBB_MAX_SMS_SLOTS; i++) {
+        if (!ctx->SmsCache[i].InUse) {
+            chosen = &ctx->SmsCache[i];
+            break;
+        }
+    }
+    if (!chosen) {
+        UINT32 bestIdx = 0U;
+        UINT32 lowestOld = 0xFFFFFFFFU;
+        for (UINT32 i = 0U; i < S23MBB_MAX_SMS_SLOTS; i++) {
+            if (ctx->SmsCache[i].Status == 1U && ctx->SmsCache[i].Index < lowestOld) {
+                lowestOld = ctx->SmsCache[i].Index;
+                bestIdx = i;
+            }
+        }
+        chosen = &ctx->SmsCache[bestIdx];
+    }
+
+    BOOLEAN hasSca = (pdu[0] == 0U) ||
+                     (pdu[0] <= 12U && (1U + (UINT32)pdu[0]) < pduLen && (pdu[1] & 0x80U) == 0x80U);
+    UINT32 prefix = (!hasSca && pduLen < 256U) ? 1U : 0U;
+
+    RtlZeroMemory(chosen, sizeof(*chosen));
+    chosen->InUse      = TRUE;
+    chosen->Index      = ctx->NextRamSmsIndex++;
+    if (ctx->NextRamSmsIndex == 0U) ctx->NextRamSmsIndex = 1U;
+    chosen->Status     = status;
+    chosen->BackingQmi = backingQmi;
+    chosen->QmiStorage = qmiStorage;
+    chosen->QmiIndex   = qmiIndex;
+    chosen->PduLen     = pduLen + prefix;
+    if (prefix) chosen->Pdu[0] = 0x00U;
+    RtlCopyMemory(chosen->Pdu + prefix, pdu, pduLen);
+    return chosen;
+}
+
+static BOOLEAN QmiWmsReadSingle(PS23MBB_DEV_CTX ctx, UINT8 storage, UINT32 qmiIdx,
+                                UINT8 *outTag, UINT8 *outPdu, UINT32 *outPduLen)
+{
+    UINT8 req[12];
+    req[0] = 0x01U; req[1] = 5U; req[2] = 0U; req[3] = storage;
+    RtlCopyMemory(req + 4U, &qmiIdx, 4U);
+    req[8] = 0x10U; req[9] = 1U; req[10] = 0U; req[11] = 1U; /* GW */
+
+    UINT16 tlvLen = 0, qRes = 0, qErr = 0;
+    if (!QmiCall(ctx, QMI_SVC_WMS, 0x0022U, req, sizeof(req),
+                 ctx->QmiTlvBuf, 1024U, &tlvLen, &qRes, &qErr) || qRes != 0U) {
+        return FALSE;
+    }
+    UINT16 ln01 = 0;
+    const UINT8 *v01 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x01U, &ln01);
+    if (!v01 || ln01 < 4U) return FALSE;
+    UINT8 tag = v01[0];
+    UINT8 fmt = v01[1];
+    UINT16 dlen = Le16(v01 + 2U);
+    if (fmt != 0x06U || dlen == 0U || dlen > 256U || 4U + (UINT32)dlen > ln01) return FALSE;
+    *outTag = tag;
+    *outPduLen = (UINT32)dlen;
+    RtlCopyMemory(outPdu, v01 + 4U, dlen);
+    return TRUE;
+}
+
+static UINT32 MapWmsTagToMbimStatus(UINT8 qmiTag)
+{
+    if (qmiTag == 0U) return 1U; /* MT_READ -> Old */
+    if (qmiTag == 1U) return 0U; /* MT_NOT_READ -> New */
+    if (qmiTag == 2U) return 3U; /* MO_SENT -> Sent */
+    return 2U;                   /* MO_NOT_SENT -> Draft */
+}
+
+static VOID QmiWmsSyncStoredMessages(PS23MBB_DEV_CTX ctx)
+{
+    if (!ctx->SmsCache) return;
+    UINT8 *tmpPdu = (UINT8 *)ExAllocatePool2(POOL_FLAG_NON_PAGED, 256U, S23MBB_TAG);
+    UINT32 *idxArr = (UINT32 *)ExAllocatePool2(POOL_FLAG_NON_PAGED, 32U * sizeof(UINT32), S23MBB_TAG);
+    if (!tmpPdu || !idxArr) {
+        if (tmpPdu) ExFreePoolWithTag(tmpPdu, S23MBB_TAG);
+        if (idxArr) ExFreePoolWithTag(idxArr, S23MBB_TAG);
+        return;
+    }
+
+    for (UINT8 storage = 0U; storage <= 1U; storage++) {
+        UINT8 req[8] = { 0x01U, 1U, 0U, storage, 0x11U, 1U, 0U, 1U };
+        UINT16 tlvLen = 0, qRes = 0, qErr = 0;
+        if (!QmiCall(ctx, QMI_SVC_WMS, 0x0031U, req, sizeof(req),
+                     ctx->QmiTlvBuf, 2048U, &tlvLen, &qRes, &qErr) || qRes != 0U) {
+            continue;
+        }
+        UINT16 ln01 = 0;
+        const UINT8 *v01 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x01U, &ln01);
+        if (!v01 || ln01 < 4U) continue;
+        UINT32 cnt = Le32(v01);
+        if (cnt > 32U) cnt = 32U;
+        UINT32 actual = 0U;
+        for (UINT32 i = 0U; i < cnt && (4U + (i + 1U) * 5U <= ln01); i++) {
+            idxArr[actual++] = Le32(v01 + 4U + i * 5U);
+        }
+        for (UINT32 i = 0U; i < actual; i++) {
+            UINT8 tag = 1U;
+            UINT32 pduLen = 0U;
+            if (QmiWmsReadSingle(ctx, storage, idxArr[i], &tag, tmpPdu, &pduLen)) {
+                (void)SmsCacheInsert(ctx, tmpPdu, pduLen, MapWmsTagToMbimStatus(tag), TRUE, storage, idxArr[i]);
+            }
+        }
+    }
+
+    ExFreePoolWithTag(tmpPdu, S23MBB_TAG);
+    ExFreePoolWithTag(idxArr, S23MBB_TAG);
+}
+
+static UINT32 BuildSmsStatusInfo(PS23MBB_DEV_CTX ctx, MBIM_SMS_STATUS_INFO *outInfo)
+{
+    UINT32 used = 0U;
+    UINT32 newestNew = 0U;
+    UINT32 highestIdx = 0U;
+    if (ctx->SmsCache) {
+        for (UINT32 i = 0U; i < S23MBB_MAX_SMS_SLOTS; i++) {
+            if (!ctx->SmsCache[i].InUse) continue;
+            used++;
+            if (ctx->SmsCache[i].Index > highestIdx) highestIdx = ctx->SmsCache[i].Index;
+            if (ctx->SmsCache[i].Status == 0U && ctx->SmsCache[i].Index > newestNew) {
+                newestNew = ctx->SmsCache[i].Index;
+            }
+        }
+    }
+    if (newestNew > 0U) {
+        outInfo->Flag         = 2U; /* NewMessage */
+        outInfo->MessageIndex = newestNew;
+    } else if (used >= S23MBB_MAX_SMS_SLOTS) {
+        outInfo->Flag         = 1U; /* MessageStoreFull */
+        outInfo->MessageIndex = highestIdx;
+    } else {
+        outInfo->Flag         = 0U; /* None */
+        outInfo->MessageIndex = 0U;
+    }
+    return sizeof(*outInfo);
+}
+
+static VOID IndicateSingleSmsToWindows(PS23MBB_DEV_CTX ctx, const S23MBB_SMS_SLOT *slot)
+{
+    if (!ctx->MbimOpen || !slot) return;
+    UINT8 *ind = ctx->MbimRspBuf;
+    MBIM_SMS_READ_INFO_HDR *ri = (MBIM_SMS_READ_INFO_HDR *)ind;
+    ri->Format       = 0U;
+    ri->ElementCount = 1U;
+    UINT32 recOff = (UINT32)sizeof(MBIM_SMS_READ_INFO_HDR) + (UINT32)sizeof(MBIM_OL_PAIR);
+    MBIM_SMS_PDU_RECORD_HDR *rec = (MBIM_SMS_PDU_RECORD_HDR *)(ind + recOff);
+    rec->MessageIndex  = slot->Index;
+    rec->MessageStatus = slot->Status;
+    rec->PduDataOffset = (UINT32)sizeof(MBIM_SMS_PDU_RECORD_HDR);
+    rec->PduDataSize   = slot->PduLen;
+    RtlCopyMemory(ind + recOff + sizeof(MBIM_SMS_PDU_RECORD_HDR), slot->Pdu, slot->PduLen);
+    UINT32 recSz = (UINT32)sizeof(MBIM_SMS_PDU_RECORD_HDR) + slot->PduLen;
+    UINT32 alignedRec = (recSz + 3U) & ~3U;
+    if (alignedRec > recSz) {
+        RtlZeroMemory(ind + recOff + recSz, alignedRec - recSz);
+    }
+    MBIM_OL_PAIR ol = { recOff, alignedRec };
+    RtlCopyMemory(ind + sizeof(MBIM_SMS_READ_INFO_HDR), &ol, sizeof(ol));
+    SendMbimIndicateStatus(ctx, UUID_SMS, MBIM_CID_SMS_READ, ind, recOff + alignedRec);
+
+    MBIM_SMS_STATUS_INFO stInfo;
+    stInfo.Flag         = 2U; /* NewMessage */
+    stInfo.MessageIndex = slot->Index;
+    SendMbimIndicateStatus(ctx, UUID_SMS, MBIM_CID_SMS_MESSAGE_STORE_STATUS,
+                           (const UINT8 *)&stInfo, sizeof(stInfo));
+}
+
+static VOID ProcessQmiWmsEventInd(PS23MBB_DEV_CTX ctx, const UINT8 *tlvs, UINT16 tlvLen)
+{
+    UINT16 ln11 = 0U, ln10 = 0U;
+    const UINT8 *v11 = QmiFindTlv(tlvs, tlvLen, 0x11U, &ln11);
+    const UINT8 *v10 = QmiFindTlv(tlvs, tlvLen, 0x10U, &ln10);
+
+    if (v11 && ln11 >= 8U) {
+        UINT8  ackInd = v11[0];
+        UINT32 txId   = Le32(v11 + 1U);
+        UINT8  fmt    = v11[5];
+        UINT16 rawLen = Le16(v11 + 6U);
+        if (fmt == 0x06U && rawLen > 0U && rawLen <= 256U && 8U + (UINT32)rawLen <= ln11) {
+            S23MBB_SMS_SLOT *slot = SmsCacheInsert(ctx, v11 + 8U, (UINT32)rawLen, 0U, FALSE, 0U, 0U);
+            if (ackInd == 0U) {
+                QmiWmsSendAck(ctx, txId);
+            }
+            if (slot) {
+                MbbLogFmt("[WMS] MT Transfer-Route SMS idx=%u len=%u ack=%u\r\n",
+                          slot->Index, slot->PduLen, ackInd == 0U ? 1U : 0U);
+                MbbLogFlush();
+                IndicateSingleSmsToWindows(ctx, slot);
+            }
+        }
+        return;
+    }
+
+    if (v10 && ln10 >= 5U) {
+        UINT8 storage = v10[0];
+        UINT32 qmiIdx = Le32(v10 + 1U);
+        UINT8 *tmpPdu = (UINT8 *)ExAllocatePool2(POOL_FLAG_NON_PAGED, 256U, S23MBB_TAG);
+        if (!tmpPdu) return;
+        UINT8 tag = 1U;
+        UINT32 pduLen = 0U;
+        if (QmiWmsReadSingle(ctx, storage, qmiIdx, &tag, tmpPdu, &pduLen)) {
+            S23MBB_SMS_SLOT *slot = SmsCacheInsert(ctx, tmpPdu, pduLen, 0U, TRUE, storage, qmiIdx);
+            if (slot) {
+                MbbLogFmt("[WMS] MT Stored SMS storage=%u qmiIdx=%u -> winIdx=%u len=%u\r\n",
+                          storage, qmiIdx, slot->Index, slot->PduLen);
+                MbbLogFlush();
+                IndicateSingleSmsToWindows(ctx, slot);
+            }
+        }
+        ExFreePoolWithTag(tmpPdu, S23MBB_TAG);
+    }
+}
+
+static VOID PollQmiWmsIndications(PS23MBB_DEV_CTX ctx)
+{
+    if (!ctx->MbimOpen || !ctx->XprtOpen) return;
+
+    if (ctx->PendingWmsIndLen > 0U && ctx->PendingWmsIndBuf) {
+        UINT16 len = (UINT16)ctx->PendingWmsIndLen;
+        ctx->PendingWmsIndLen = 0U;
+        ProcessQmiWmsEventInd(ctx, ctx->PendingWmsIndBuf, len);
+    }
+
+    UINT32 wmsPort = S23MBB_CLIENT_PORT_BASE + QMI_SVC_WMS;
+    for (UINT32 n = 0U; n < 4U; n++) {
+        S23MODEM_QRTR_PKT *rx = ctx->QrtrRxPkt;
+        RtlZeroMemory(rx, sizeof(*rx));
+        rx->DstPort   = wmsPort;
+        rx->TimeoutMs = 0U;
+        WDF_MEMORY_DESCRIPTOR rxIn, rxOut;
+        WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&rxIn, rx, sizeof(*rx));
+        WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&rxOut, rx, sizeof(*rx));
+        ULONG_PTR bytes = 0;
+        NTSTATUS st = WdfIoTargetSendIoctlSynchronously(ctx->XprtTarget, NULL,
+                                                        IOCTL_S23MODEM_QRTR_RX,
+                                                        &rxIn, &rxOut, NULL, &bytes);
+        if (!NT_SUCCESS(st) || st == STATUS_TIMEOUT || bytes < sizeof(S23MODEM_QRTR_PKT) || rx->PayloadLen < 7U) {
+            break;
+        }
+        UINT8 rFlags  = rx->Payload[0];
+        UINT16 rMsgId = Le16(rx->Payload + 3U);
+        UINT16 rLen   = Le16(rx->Payload + 5U);
+        if (7U + (UINT32)rLen > rx->PayloadLen) rLen = (UINT16)(rx->PayloadLen - 7U);
+        if (rFlags == 0x04U && rMsgId == 0x0001U && rLen > 0U) {
+            ProcessQmiWmsEventInd(ctx, rx->Payload + 7U, rLen);
+        }
+    }
+}
+
+static BOOLEAN SmsSlotMatchesFilter(const S23MBB_SMS_SLOT *s, UINT32 flag, UINT32 targetIdx)
+{
+    if (!s || !s->InUse) return FALSE;
+    switch (flag) {
+    case 0U: return TRUE;                        /* All */
+    case 1U: return (s->Index == targetIdx);     /* Index */
+    case 2U: return (s->Status == 0U);           /* New */
+    case 3U: return (s->Status == 1U);           /* Old */
+    case 4U: return (s->Status == 3U);           /* Sent */
+    case 5U: return (s->Status == 2U);           /* Draft */
+    default: return FALSE;
+    }
+}
+
+static VOID HandleMbimSms(PS23MBB_DEV_CTX ctx, UINT32 txId, UINT32 cid, UINT32 cmdType,
+                          const UINT8 *info, UINT32 infoLen)
+{
+    UINT8 *rsp = ctx->MbimRspBuf;
+    if (!ctx->WmsInitialized) {
+        QmiInitializeWms(ctx);
+    }
+
+    if (cid == MBIM_CID_SMS_CONFIGURATION) {
+        if (cmdType == MBIM_COMMAND_TYPE_SET) {
+            if (infoLen < sizeof(MBIM_SET_SMS_CONFIGURATION_HDR)) {
+                SendMbimCommandDone(ctx, txId, UUID_SMS, cid, MBIM_STATUS_INVALID_PARAMETERS, NULL, 0);
+                return;
+            }
+            const MBIM_SET_SMS_CONFIGURATION_HDR *req = (const MBIM_SET_SMS_CONFIGURATION_HDR *)info;
+            if (req->Format != 0U) {
+                SendMbimCommandDone(ctx, txId, UUID_SMS, cid, MBIM_STATUS_SMS_FORMAT_NOT_SUPPORTED, NULL, 0);
+                return;
+            }
+            if (req->ScAddressSize > 0U && req->ScAddressOffset + req->ScAddressSize <= infoLen) {
+                const UINT8 *wstr = info + req->ScAddressOffset;
+                UINT32 chars = req->ScAddressSize / 2U;
+                char scAscii[32];
+                if (chars > 30U) chars = 30U;
+                for (UINT32 i = 0U; i < chars; i++) scAscii[i] = (char)wstr[i * 2U];
+                scAscii[chars] = '\0';
+                const char *digs = (scAscii[0] == '+') ? (scAscii + 1) : scAscii;
+                const char *typ  = (scAscii[0] == '+') ? "145" : "129";
+                UINT16 digLen = (UINT16)strlen(digs);
+                UINT8 qReq[48];
+                UINT32 qp = 0U;
+                if (digLen > 0U && digLen <= 24U) {
+                    qReq[qp++] = 0x01U;
+                    RtlCopyMemory(qReq + qp, &digLen, 2U); qp += 2U;
+                    RtlCopyMemory(qReq + qp, digs, digLen); qp += digLen;
+                    qReq[qp++] = 0x10U; qReq[qp++] = 3U; qReq[qp++] = 0U;
+                    RtlCopyMemory(qReq + qp, typ, 3U); qp += 3U;
+                    UINT16 tlvLen = 0, qRes = 0, qErr = 0;
+                    (void)QmiCall(ctx, QMI_SVC_WMS, 0x0035U, qReq, (UINT16)qp,
+                                  ctx->QmiTlvBuf, 256U, &tlvLen, &qRes, &qErr);
+                }
+            }
+            QmiWmsRefreshSmscAndMax(ctx);
+        }
+
+        QmiWmsRefreshSmscAndMax(ctx);
+        RtlZeroMemory(rsp, sizeof(MBIM_SMS_CONFIGURATION_INFO_HDR) + 64U);
+        MBIM_SMS_CONFIGURATION_INFO_HDR *cfg = (MBIM_SMS_CONFIGURATION_INFO_HDR *)rsp;
+        BOOLEAN simReady = (ctx->ActiveWinSlot == 0U)
+                               ? (ctx->Slot0Present && ctx->Slot0AppCount > 0U)
+                               : (ctx->Slot1Present && ctx->Slot1AppCount > 0U);
+        cfg->SmsStorageState      = simReady ? 1U : 0U;
+        cfg->Format               = 0U; /* PDU */
+        cfg->MaxMessages          = ctx->SmsMaxMessages ? ctx->SmsMaxMessages : 50U;
+        cfg->CdmaShortMessageSize = 0U;
+        UINT32 pos = sizeof(MBIM_SMS_CONFIGURATION_INFO_HDR);
+        if (ctx->SmscAddr[0]) {
+            UINT32 bytes = MbimAsciiToUtf16(ctx->SmscAddr, rsp + pos, 24U);
+            cfg->ScAddressOffset = pos;
+            cfg->ScAddressSize   = bytes;
+            pos = (pos + bytes + 3U) & ~3U;
+        }
+        MbbLogFmt("[SMS] CONFIGURATION state=%u max=%u smsc='%s'\r\n",
+                  cfg->SmsStorageState, cfg->MaxMessages, ctx->SmscAddr[0] ? ctx->SmscAddr : "-");
+        MbbLogFlush();
+        SendMbimCommandDone(ctx, txId, UUID_SMS, cid, MBIM_STATUS_SUCCESS, rsp, pos);
+        return;
+    }
+
+    if (cid == MBIM_CID_SMS_READ) {
+        if (infoLen < sizeof(MBIM_SMS_READ_REQ)) {
+            SendMbimCommandDone(ctx, txId, UUID_SMS, cid, MBIM_STATUS_INVALID_PARAMETERS, NULL, 0);
+            return;
+        }
+        const MBIM_SMS_READ_REQ *req = (const MBIM_SMS_READ_REQ *)info;
+        if (req->Format != 0U) {
+            SendMbimCommandDone(ctx, txId, UUID_SMS, cid, MBIM_STATUS_SMS_FORMAT_NOT_SUPPORTED, NULL, 0);
+            return;
+        }
+
+        QmiWmsSyncStoredMessages(ctx);
+
+        UINT32 cnt = 0U;
+        if (ctx->SmsCache) {
+            for (UINT32 i = 0U; i < S23MBB_MAX_SMS_SLOTS; i++) {
+                if (SmsSlotMatchesFilter(&ctx->SmsCache[i], req->Flag, req->MessageIndex)) cnt++;
+            }
+        }
+
+        MBIM_SMS_READ_INFO_HDR *ri = (MBIM_SMS_READ_INFO_HDR *)rsp;
+        ri->Format       = 0U;
+        ri->ElementCount = cnt;
+        UINT32 olPos = sizeof(MBIM_SMS_READ_INFO_HDR);
+        UINT32 pos   = olPos + cnt * (UINT32)sizeof(MBIM_OL_PAIR);
+        UINT32 outIdx = 0U;
+
+        if (ctx->SmsCache) {
+            for (UINT32 i = 0U; i < S23MBB_MAX_SMS_SLOTS && outIdx < cnt; i++) {
+                S23MBB_SMS_SLOT *s = &ctx->SmsCache[i];
+                if (!SmsSlotMatchesFilter(s, req->Flag, req->MessageIndex)) continue;
+                UINT32 recSz = (UINT32)sizeof(MBIM_SMS_PDU_RECORD_HDR) + s->PduLen;
+                UINT32 alignedRec = (recSz + 3U) & ~3U;
+                if (pos + alignedRec > S23MBB_MAX_MSG_BYTES) break;
+
+                MBIM_SMS_PDU_RECORD_HDR *rec = (MBIM_SMS_PDU_RECORD_HDR *)(rsp + pos);
+                rec->MessageIndex  = s->Index;
+                rec->MessageStatus = s->Status;
+                rec->PduDataOffset = (UINT32)sizeof(MBIM_SMS_PDU_RECORD_HDR);
+                rec->PduDataSize   = s->PduLen;
+                RtlCopyMemory(rsp + pos + sizeof(MBIM_SMS_PDU_RECORD_HDR), s->Pdu, s->PduLen);
+                if (alignedRec > recSz) RtlZeroMemory(rsp + pos + recSz, alignedRec - recSz);
+
+                MBIM_OL_PAIR ol = { pos, alignedRec };
+                RtlCopyMemory(rsp + olPos + outIdx * sizeof(MBIM_OL_PAIR), &ol, sizeof(ol));
+                pos += alignedRec;
+                outIdx++;
+
+                if (s->Status == 0U) s->Status = 1U; /* Mark read as Old */
+            }
+        }
+        ri->ElementCount = outIdx;
+        MbbLogFmt("[SMS] READ flag=%u idx=%u -> %u msg(s)\r\n", req->Flag, req->MessageIndex, outIdx);
+        MbbLogFlush();
+        SendMbimCommandDone(ctx, txId, UUID_SMS, cid, MBIM_STATUS_SUCCESS, rsp, pos);
+        return;
+    }
+
+    if (cid == MBIM_CID_SMS_SEND) {
+        if (infoLen < sizeof(MBIM_SMS_SEND_REQ_HDR)) {
+            SendMbimCommandDone(ctx, txId, UUID_SMS, cid, MBIM_STATUS_INVALID_PARAMETERS, NULL, 0);
+            return;
+        }
+        const MBIM_SMS_SEND_REQ_HDR *req = (const MBIM_SMS_SEND_REQ_HDR *)info;
+        if (req->SmsFormat != 0U) {
+            SendMbimCommandDone(ctx, txId, UUID_SMS, cid, MBIM_STATUS_SMS_FORMAT_NOT_SUPPORTED, NULL, 0);
+            return;
+        }
+        UINT32 pduOff = (req->PduDataOffset >= sizeof(MBIM_SMS_SEND_REQ_HDR))
+                            ? req->PduDataOffset : (4U + req->PduDataOffset);
+        if (req->PduDataSize == 0U || req->PduDataSize > 256U ||
+            pduOff > infoLen || (pduOff + req->PduDataSize > infoLen)) {
+            SendMbimCommandDone(ctx, txId, UUID_SMS, cid, MBIM_STATUS_INVALID_PARAMETERS, NULL, 0);
+            return;
+        }
+
+        const UINT8 *pdu = info + pduOff;
+        MbbLogFmt("[SMS] SEND req off=%u->%u size=%u infoLen=%u\r\n",
+                  req->PduDataOffset, pduOff, req->PduDataSize, infoLen);
+        MbbLogFlush();
+        UINT16 pduLen16 = (UINT16)req->PduDataSize;
+        UINT16 valLen   = (UINT16)(3U + pduLen16);
+        UINT8 *qReq = (UINT8 *)ExAllocatePool2(POOL_FLAG_NON_PAGED, 3U + (SIZE_T)valLen, S23MBB_TAG);
+        if (!qReq) {
+            SendMbimCommandDone(ctx, txId, UUID_SMS, cid, MBIM_STATUS_FAILURE, NULL, 0);
+            return;
+        }
+        qReq[0] = 0x01U;
+        RtlCopyMemory(qReq + 1U, &valLen, 2U);
+        qReq[3] = 0x06U; /* QMI_WMS_MESSAGE_FORMAT_GW_PP */
+        RtlCopyMemory(qReq + 4U, &pduLen16, 2U);
+        RtlCopyMemory(qReq + 6U, pdu, pduLen16);
+
+        UINT16 tlvLen = 0, qRes = 0, qErr = 0;
+        BOOLEAN ok = QmiCall(ctx, QMI_SVC_WMS, 0x0020U, qReq, (UINT16)(3U + valLen),
+                             ctx->QmiTlvBuf, 512U, &tlvLen, &qRes, &qErr);
+        ExFreePoolWithTag(qReq, S23MBB_TAG);
+
+        if (!ok || qRes != 0U) {
+            MbbLogFmt("[SMS] SEND fail len=%u ok=%u res=%u err=0x%x\r\n", pduLen16, ok ? 1U : 0U, qRes, qErr);
+            MbbLogFlush();
+            UINT32 stCode = (!ok) ? MBIM_STATUS_SMS_NETWORK_TIMEOUT
+                                  : ((ctx->LastRegState != MBIM_REG_STATE_HOME && ctx->LastRegState != MBIM_REG_STATE_ROAMING)
+                                         ? MBIM_STATUS_NOT_REGISTERED : MBIM_STATUS_FAILURE);
+            SendMbimCommandDone(ctx, txId, UUID_SMS, cid, stCode, NULL, 0);
+            return;
+        }
+
+        UINT16 ln01 = 0;
+        const UINT8 *v01 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x01U, &ln01);
+        MBIM_SMS_SEND_STATUS sendSt;
+        sendSt.MessageReference = (v01 && ln01 >= 2U) ? (UINT32)Le16(v01) : 1U;
+        MbbLogFmt("[SMS] SEND OK len=%u msgRef=%u\r\n", pduLen16, sendSt.MessageReference);
+        MbbLogFlush();
+        SendMbimCommandDone(ctx, txId, UUID_SMS, cid, MBIM_STATUS_SUCCESS,
+                            (const UINT8 *)&sendSt, sizeof(sendSt));
+        return;
+    }
+
+    if (cid == MBIM_CID_SMS_DELETE) {
+        if (infoLen < sizeof(MBIM_SMS_DELETE_REQ)) {
+            SendMbimCommandDone(ctx, txId, UUID_SMS, cid, MBIM_STATUS_INVALID_PARAMETERS, NULL, 0);
+            return;
+        }
+        const MBIM_SMS_DELETE_REQ *req = (const MBIM_SMS_DELETE_REQ *)info;
+        UINT32 delCnt = 0U;
+        if (ctx->SmsCache) {
+            for (UINT32 i = 0U; i < S23MBB_MAX_SMS_SLOTS; i++) {
+                S23MBB_SMS_SLOT *s = &ctx->SmsCache[i];
+                if (!SmsSlotMatchesFilter(s, req->Flag, req->MessageIndex)) continue;
+                if (s->BackingQmi) {
+                    UINT8 dReq[15];
+                    dReq[0] = 0x01U; dReq[1] = 1U; dReq[2] = 0U; dReq[3] = s->QmiStorage;
+                    dReq[4] = 0x10U; dReq[5] = 4U; dReq[6] = 0U; RtlCopyMemory(dReq + 7U, &s->QmiIndex, 4U);
+                    dReq[11] = 0x12U; dReq[12] = 1U; dReq[13] = 0U; dReq[14] = 1U; /* GW */
+                    UINT16 tlvLen = 0, qRes = 0, qErr = 0;
+                    (void)QmiCall(ctx, QMI_SVC_WMS, 0x0024U, dReq, sizeof(dReq),
+                                  ctx->QmiTlvBuf, 256U, &tlvLen, &qRes, &qErr);
+                }
+                s->InUse = FALSE;
+                delCnt++;
+            }
+        }
+        MbbLogFmt("[SMS] DELETE flag=%u idx=%u -> removed %u\r\n", req->Flag, req->MessageIndex, delCnt);
+        MbbLogFlush();
+        SendMbimCommandDone(ctx, txId, UUID_SMS, cid, MBIM_STATUS_SUCCESS, NULL, 0);
+        return;
+    }
+
+    if (cid == MBIM_CID_SMS_MESSAGE_STORE_STATUS) {
+        MBIM_SMS_STATUS_INFO stInfo;
+        (void)BuildSmsStatusInfo(ctx, &stInfo);
+        SendMbimCommandDone(ctx, txId, UUID_SMS, cid, MBIM_STATUS_SUCCESS,
+                            (const UINT8 *)&stInfo, sizeof(stInfo));
+        return;
+    }
+
+    SendMbimCommandDone(ctx, txId, UUID_SMS, cid, MBIM_STATUS_NO_CID_SUPPORT, NULL, 0);
+}
+
+/* ============================================================================
  * Main MBIMEx 3.0 Command Dispatcher (Worker Thread PASSIVE_LEVEL)
  * ========================================================================== */
 static VOID DispatchMbimCommand(PS23MBB_DEV_CTX ctx, const UINT8 *msg, UINT32 msgLen)
@@ -2119,7 +2758,7 @@ static VOID DispatchMbimCommand(PS23MBB_DEV_CTX ctx, const UINT8 *msg, UINT32 ms
             dc->VoiceClass     = 1U; /* NoVoice */
             dc->SimClass       = 3U; /* Embedded(1) | Removable(2) */
             dc->DataClass      = MBIM_DATA_CLASS_LTE | MBIM_DATA_CLASS_5G | MBIM_DATA_CLASS_UMTS;
-            dc->SmsCaps        = 0U;
+            dc->SmsCaps        = MBIM_SMS_CAPS_PDU_RECEIVE | MBIM_SMS_CAPS_PDU_SEND;
             /* CRITICAL: wire bit 5 (0x20) -> mbbcx shifts <<3 -> WWAN_CTRL_CAPS_ESIM (0x100)! */
             dc->ControlCaps    = 0x000000A1U; /* REG_MANUAL(0x01) | ESIM(0x20) | SIM_HOTSWAP(0x80) */
             dc->DataSubClass   = 0x00000003U; /* 5G_ENDC(1) | 5G_NR(2) */
@@ -2223,7 +2862,7 @@ static VOID DispatchMbimCommand(PS23MBB_DEV_CTX ctx, const UINT8 *msg, UINT32 ms
      * Service 4: UUID_SMS
      * ---------------------------------------------------------------------- */
     if (RtlEqualMemory(svc, UUID_SMS, 16U)) {
-        SendMbimCommandDone(ctx, txId, svc, cid, MBIM_STATUS_NO_CID_SUPPORT, NULL, 0);
+        HandleMbimSms(ctx, txId, cid, cmdType, info, infoLen);
         return;
     }
 
@@ -2241,15 +2880,17 @@ static VOID DispatchMbimCommand(PS23MBB_DEV_CTX ctx, const UINT8 *msg, UINT32 ms
         static const UINT32 kExtCids[]  = { 1,5,6,7,8,14,15 };
         static const UINT32 kUiccCids[] = { 1,2,3,4,5,6,7 };
         static const UINT32 kShutCids[] = { 1,2 };
+        static const UINT32 kSmsCids[]  = { 1,2,3,4,5 };
 
-        struct { const UINT8 *uuid; const UINT32 *cids; UINT32 cnt; } svcs[4] = {
+        struct { const UINT8 *uuid; const UINT32 *cids; UINT32 cnt; } svcs[5] = {
             { UUID_BASIC_CONNECT,            kBcCids,   RTL_NUMBER_OF(kBcCids) },
             { UUID_MS_BASIC_CONNECT_EXT,     kExtCids,  RTL_NUMBER_OF(kExtCids) },
             { UUID_MS_UICC_LOW_LEVEL_ACCESS, kUiccCids, RTL_NUMBER_OF(kUiccCids) },
-            { UUID_MS_HOSTSHUTDOWN,          kShutCids, RTL_NUMBER_OF(kShutCids) }
+            { UUID_MS_HOSTSHUTDOWN,          kShutCids, RTL_NUMBER_OF(kShutCids) },
+            { UUID_SMS,                      kSmsCids,  RTL_NUMBER_OF(kSmsCids) }
         };
 
-        UINT32 svcCnt = 4U, maxDss = 0U;
+        UINT32 svcCnt = 5U, maxDss = 0U;
         RtlCopyMemory(rsp + 0U, &svcCnt, 4U);
         RtlCopyMemory(rsp + 4U, &maxDss, 4U);
         UINT32 pos = 8U + svcCnt * 8U;
@@ -2265,7 +2906,7 @@ static VOID DispatchMbimCommand(PS23MBB_DEV_CTX ctx, const UINT8 *msg, UINT32 ms
             MBIM_OL_PAIR ol = { elStart, pos - elStart };
             RtlCopyMemory(rsp + 8U + i * 8U, &ol, 8U);
         }
-        MbbLogFmt("[MBIM] DEVICE_SERVICES -> 4 services, len=%u\r\n", pos);
+        MbbLogFmt("[MBIM] DEVICE_SERVICES -> 5 services, len=%u\r\n", pos);
         MbbLogFlush();
         SendMbimCommandDone(ctx, txId, svc, cid, MBIM_STATUS_SUCCESS, rsp, pos);
         return;
@@ -2285,7 +2926,7 @@ static VOID DispatchMbimCommand(PS23MBB_DEV_CTX ctx, const UINT8 *msg, UINT32 ms
         u[2] = 1U; /* NoVoice */
         u[3] = 3U; /* Embedded | Removable */
         u[4] = MBIM_DATA_CLASS_LTE | MBIM_DATA_CLASS_5G | MBIM_DATA_CLASS_UMTS;
-        u[5] = 0U;
+        u[5] = MBIM_SMS_CAPS_PDU_RECEIVE | MBIM_SMS_CAPS_PDU_SEND;
         u[6] = 0x000000A1U;
         u[7] = 8U;
         UINT32 pos = 64U;
@@ -2596,6 +3237,9 @@ static VOID S23MbbWorkerThreadProc(PVOID Context)
                 }
             }
         }
+
+        /* Poll QMI_WMS (0x05) MT SMS indications */
+        PollQmiWmsIndications(ctx);
 
         /* Handle deferred UIM refresh notification after profile add/enable/disable/delete */
         if (ctx->MbimOpen && ctx->PendingUimRefresh) {
@@ -3041,8 +3685,10 @@ static VOID EvtDeviceContextCleanup(WDFOBJECT DeviceObject)
     if (ctx->QmiTlvBuf)   ExFreePoolWithTag(ctx->QmiTlvBuf, S23MBB_TAG);
     if (ctx->MbimRspBuf)  ExFreePoolWithTag(ctx->MbimRspBuf, S23MBB_TAG);
     if (ctx->ApduWorkBuf) ExFreePoolWithTag(ctx->ApduWorkBuf, S23MBB_TAG);
-    if (ctx->IpaIoPkt)    ExFreePoolWithTag(ctx->IpaIoPkt, S23MBB_TAG);
-    if (ctx->IpaStatus)   ExFreePoolWithTag(ctx->IpaStatus, S23MBB_TAG);
+    if (ctx->IpaIoPkt)       ExFreePoolWithTag(ctx->IpaIoPkt, S23MBB_TAG);
+    if (ctx->IpaStatus)      ExFreePoolWithTag(ctx->IpaStatus, S23MBB_TAG);
+    if (ctx->SmsCache)       ExFreePoolWithTag(ctx->SmsCache, S23MBB_TAG);
+    if (ctx->PendingWmsIndBuf) ExFreePoolWithTag(ctx->PendingWmsIndBuf, S23MBB_TAG);
 
     MbbLogFmt("=== s23mbb.sys cleaned up ===\r\n");
     MbbLogFlush();
@@ -3104,9 +3750,14 @@ static NTSTATUS EvtDriverDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     ctx->ApduWorkBuf = (UINT8 *)ExAllocatePool2(POOL_FLAG_NON_PAGED, 4096U, S23MBB_TAG);
     ctx->IpaIoPkt    = (S23MODEM_IPA_PKT *)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(S23MODEM_IPA_PKT), S23MBB_TAG);
     ctx->IpaStatus   = (S23MODEM_IPA_STATUS *)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(S23MODEM_IPA_STATUS), S23MBB_TAG);
+    ctx->SmsCache    = (S23MBB_SMS_SLOT *)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(S23MBB_SMS_SLOT) * S23MBB_MAX_SMS_SLOTS, S23MBB_TAG);
+    ctx->PendingWmsIndBuf = (UINT8 *)ExAllocatePool2(POOL_FLAG_NON_PAGED, 1024U, S23MBB_TAG);
+    ctx->SmsMaxMessages   = 50U;
+    ctx->NextRamSmsIndex  = 1U;
 
     if (!ctx->ReasmBuf || !ctx->ModemStatus || !ctx->QrtrTxPkt || !ctx->QrtrRxPkt ||
-        !ctx->QmiTlvBuf || !ctx->MbimRspBuf || !ctx->ApduWorkBuf || !ctx->IpaIoPkt || !ctx->IpaStatus) {
+        !ctx->QmiTlvBuf || !ctx->MbimRspBuf || !ctx->ApduWorkBuf || !ctx->IpaIoPkt ||
+        !ctx->IpaStatus || !ctx->SmsCache || !ctx->PendingWmsIndBuf) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 

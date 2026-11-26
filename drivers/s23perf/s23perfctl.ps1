@@ -128,7 +128,7 @@ function Read-Telemetry {
     }
 }
 
-$access = if ($Command -eq 'profile') { 0xC0000000 } else { 0x80000000 }
+$access = if ($Command -eq 'profile') { [Convert]::ToUInt32('C0000000', 16) } else { [Convert]::ToUInt32('80000000', 16) }
 $h = Open-S23Perf -Access $access
 try {
     switch ($Command) {

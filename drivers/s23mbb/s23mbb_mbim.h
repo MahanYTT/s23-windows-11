@@ -101,6 +101,17 @@
 
 /* SMS CIDs */
 #define MBIM_CID_SMS_CONFIGURATION          1U
+#define MBIM_CID_SMS_READ                   2U
+#define MBIM_CID_SMS_SEND                   3U
+#define MBIM_CID_SMS_DELETE                 4U
+#define MBIM_CID_SMS_MESSAGE_STORE_STATUS   5U
+
+/* SMS Caps & Status Codes */
+#define MBIM_SMS_CAPS_PDU_RECEIVE           0x00000001U
+#define MBIM_SMS_CAPS_PDU_SEND              0x00000002U
+#define MBIM_STATUS_SMS_UNKNOWN_SMSC_ADDRESS 100U
+#define MBIM_STATUS_SMS_NETWORK_TIMEOUT     101U
+#define MBIM_STATUS_SMS_FORMAT_NOT_SUPPORTED 104U
 
 /* MBIMEx TLV Types */
 #define MBIM_TLV_TYPE_WCHAR_STR             0x000AU
@@ -481,6 +492,60 @@ typedef struct _MBIM_UICC_APP_INFO_HDR {
     UINT32 PinRefOffset;   /* Relative to this MBIM_UICC_APP_INFO_HDR */
     UINT32 PinRefSize;
 } MBIM_UICC_APP_INFO_HDR;
+
+/* MBIM 1.0 SMS Structures (UUID_SMS) */
+typedef struct _MBIM_SMS_CONFIGURATION_INFO_HDR {
+    UINT32 SmsStorageState;
+    UINT32 Format;
+    UINT32 MaxMessages;
+    UINT32 CdmaShortMessageSize;
+    UINT32 ScAddressOffset;
+    UINT32 ScAddressSize;
+} MBIM_SMS_CONFIGURATION_INFO_HDR;
+
+typedef struct _MBIM_SET_SMS_CONFIGURATION_HDR {
+    UINT32 Format;
+    UINT32 ScAddressOffset;
+    UINT32 ScAddressSize;
+} MBIM_SET_SMS_CONFIGURATION_HDR;
+
+typedef struct _MBIM_SMS_READ_REQ {
+    UINT32 Format;
+    UINT32 Flag;
+    UINT32 MessageIndex;
+} MBIM_SMS_READ_REQ;
+
+typedef struct _MBIM_SMS_READ_INFO_HDR {
+    UINT32 Format;
+    UINT32 ElementCount;
+} MBIM_SMS_READ_INFO_HDR;
+
+typedef struct _MBIM_SMS_PDU_RECORD_HDR {
+    UINT32 MessageIndex;
+    UINT32 MessageStatus;
+    UINT32 PduDataOffset;  /* Relative to this MBIM_SMS_PDU_RECORD_HDR (16U) */
+    UINT32 PduDataSize;
+} MBIM_SMS_PDU_RECORD_HDR;
+
+typedef struct _MBIM_SMS_SEND_REQ_HDR {
+    UINT32 SmsFormat;
+    UINT32 PduDataOffset;  /* Relative to byte offset 4 (MBIM_SMS_SEND_PDU) */
+    UINT32 PduDataSize;
+} MBIM_SMS_SEND_REQ_HDR;
+
+typedef struct _MBIM_SMS_SEND_STATUS {
+    UINT32 MessageReference;
+} MBIM_SMS_SEND_STATUS;
+
+typedef struct _MBIM_SMS_DELETE_REQ {
+    UINT32 Flag;
+    UINT32 MessageIndex;
+} MBIM_SMS_DELETE_REQ;
+
+typedef struct _MBIM_SMS_STATUS_INFO {
+    UINT32 Flag;
+    UINT32 MessageIndex;
+} MBIM_SMS_STATUS_INFO;
 
 #pragma pack(pop)
 

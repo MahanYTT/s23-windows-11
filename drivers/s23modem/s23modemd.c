@@ -1872,6 +1872,442 @@ static void RunIpaLoopbackTest(HANDLE hDev, const S23MODEM_STATUS_INFO *st) {
            stAfter.GsiErrorLog, stAfter.SmmuGfsr);
 }
 
+/* ============================================================================
+ * 4. QMI WMS (0x05) & 3GPP TS 23.040 SMS PDU Codec
+ * ========================================================================== */
+static const uint16_t kGsm7DefaultTable[128] = {
+    '@',  0x00A3, '$',  0x00A5, 0x00E8, 0x00E9, 0x00F9, 0x00EC,
+    0x00F2, 0x00C7, '\n', 0x00D8, 0x00F8, '\r', 0x00C5, 0x00E5,
+    0x0394, '_',  0x03A6, 0x0393, 0x039B, 0x03A9, 0x03A0, 0x03A8,
+    0x03A3, 0x0398, 0x039E, 0x001B, 0x00C6, 0x00E6, 0x00DF, 0x00C9,
+    ' ',  '!',  '"',  '#',  0x00A4, '%',  '&',  '\'',
+    '(',  ')',  '*',  '+',  ',',  '-',  '.',  '/',
+    '0',  '1',  '2',  '3',  '4',  '5',  '6',  '7',
+    '8',  '9',  ':',  ';',  '<',  '=',  '>',  '?',
+    0x00A1, 'A', 'B', 'C', 'D', 'E', 'F', 'G',
+    'H',  'I',  'J',  'K',  'L',  'M',  'N',  'O',
+    'P',  'Q',  'R',  'S',  'T',  'U',  'V',  'W',
+    'X',  'Y',  'Z',  0x00C4, 0x00D6, 0x00D1, 0x00DC, 0x00A7,
+    0x00BF, 'a', 'b', 'c', 'd', 'e', 'f', 'g',
+    'h',  'i',  'j',  'k',  'l',  'm',  'n',  'o',
+    'p',  'q',  'r',  's',  't',  'u',  'v',  'w',
+    'x',  'y',  'z',  0x00E4, 0x00F6, 0x00F1, 0x00FC, 0x00E0
+};
+
+static int AsciiToGsm7(char c, uint8_t *outSeptet) {
+    for (uint8_t idx = 0U; idx < 128U; idx++) {
+        if (kGsm7DefaultTable[idx] == (uint16_t)(unsigned char)c) {
+            *outSeptet = idx;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static uint32_t UnpackGsm7(const uint8_t *octets, uint32_t octetLen, uint32_t septetCount,
+                           uint32_t fillBits, char *outUtf8, uint32_t outCap) {
+    uint32_t outPos = 0U;
+    for (uint32_t i = 0U; i < septetCount; i++) {
+        uint32_t bitOff = fillBits + i * 7U;
+        uint32_t byteIdx = bitOff / 8U;
+        uint32_t shift = bitOff % 8U;
+        if (byteIdx >= octetLen) break;
+        uint16_t raw = (uint16_t)(octets[byteIdx] >> shift);
+        if (shift > 1U && byteIdx + 1U < octetLen) {
+            raw |= (uint16_t)(octets[byteIdx + 1U] << (8U - shift));
+        }
+        uint8_t septet = (uint8_t)(raw & 0x7FU);
+        if (septet == 0x1BU && i + 1U < septetCount) continue;
+        uint16_t ch = kGsm7DefaultTable[septet];
+        if (ch < 0x80U) {
+            if (outPos + 1U < outCap) outUtf8[outPos++] = (char)ch;
+        } else {
+            if (outPos + 2U < outCap) {
+                outUtf8[outPos++] = (char)(0xC0U | (ch >> 6));
+                outUtf8[outPos++] = (char)(0x80U | (ch & 0x3FU));
+            }
+        }
+    }
+    outUtf8[outPos] = '\0';
+    return outPos;
+}
+
+static void DecodeSmsAddress(const uint8_t *addrBytes, uint32_t digitsLen, uint8_t tonNpi,
+                             char *outAddr, uint32_t outCap) {
+    if ((tonNpi & 0x70U) == 0x50U) {
+        /* GSM 7-bit alphanumeric sender */
+        uint32_t octets = (digitsLen + 1U) / 2U;
+        uint32_t septets = (octets * 8U) / 7U;
+        UnpackGsm7(addrBytes, octets, septets, 0U, outAddr, outCap);
+        return;
+    }
+    uint32_t pos = 0U;
+    if ((tonNpi & 0x70U) == 0x10U && pos + 1U < outCap) {
+        outAddr[pos++] = '+';
+    }
+    static const char hex[] = "0123456789ABCDEF";
+    uint32_t octets = (digitsLen + 1U) / 2U;
+    for (uint32_t i = 0U; i < octets && pos + 2U < outCap; i++) {
+        uint8_t lo = addrBytes[i] & 0x0FU;
+        uint8_t hi = (addrBytes[i] >> 4) & 0x0FU;
+        if (lo != 0x0FU) outAddr[pos++] = hex[lo];
+        if (hi != 0x0FU) outAddr[pos++] = hex[hi];
+    }
+    outAddr[pos] = '\0';
+}
+
+static void DecodeSmsPdu(const char *tag, const uint8_t *pdu, uint32_t pduLen) {
+    if (!pdu || pduLen < 4U) {
+        printf("  %s: [invalid PDU len=%u]\n", tag, pduLen);
+        return;
+    }
+    uint32_t tpStart = 0U;
+    if (pdu[0] == 0U || (pdu[0] <= 12U && (1U + (uint32_t)pdu[0]) < pduLen && (pdu[1] & 0x80U) == 0x80U)) {
+        tpStart = 1U + (uint32_t)pdu[0];
+    }
+    if (tpStart >= pduLen) {
+        printf("  %s: [truncated SCA len=%u pduLen=%u]\n", tag, (unsigned)pdu[0], pduLen);
+        return;
+    }
+    const uint8_t *tpdu = pdu + tpStart;
+    uint32_t tlen = pduLen - tpStart;
+    uint32_t p = 0U;
+    uint8_t first = tpdu[p++];
+    uint8_t mti = first & 0x03U;
+    uint8_t udhi = (first & 0x40U) ? 1U : 0U;
+    if (mti == 0x01U && p < tlen) p++; /* skip TP-MR on SMS-SUBMIT */
+    if (p + 2U > tlen) return;
+    uint8_t addrDigits = tpdu[p++];
+    uint8_t addrTon = tpdu[p++];
+    uint32_t addrOctets = (addrDigits + 1U) / 2U;
+    if (p + addrOctets + 2U > tlen) return;
+    char addr[64] = {0};
+    DecodeSmsAddress(tpdu + p, addrDigits, addrTon, addr, sizeof(addr));
+    p += addrOctets;
+    (void)tpdu[p++]; /* TP-PID */
+    uint8_t dcs = tpdu[p++];
+
+    char sctsStr[32] = "-";
+    if (mti == 0x00U && p + 7U <= tlen) {
+        const uint8_t *s = tpdu + p;
+        snprintf(sctsStr, sizeof(sctsStr), "20%u%u-%u%u-%u%u %u%u:%u%u:%u%u",
+                 s[0] & 0x0FU, (s[0] >> 4) & 0x0FU,
+                 s[1] & 0x0FU, (s[1] >> 4) & 0x0FU,
+                 s[2] & 0x0FU, (s[2] >> 4) & 0x0FU,
+                 s[3] & 0x0FU, (s[3] >> 4) & 0x0FU,
+                 s[4] & 0x0FU, (s[4] >> 4) & 0x0FU,
+                 s[5] & 0x0FU, (s[5] >> 4) & 0x0FU);
+        p += 7U;
+    } else if (mti == 0x01U) {
+        uint8_t vpf = (first >> 3) & 0x03U;
+        if (vpf == 2U && p + 1U <= tlen) p += 1U;
+        else if ((vpf == 1U || vpf == 3U) && p + 7U <= tlen) p += 7U;
+    }
+
+    char body[512] = {0};
+    if (p < tlen) {
+        uint8_t udl = tpdu[p++];
+        const uint8_t *ud = tpdu + p;
+        uint32_t udOctets = tlen - p;
+        uint32_t fillBits = 0U, skipSeptets = 0U, udhBytes = 0U;
+        if (udhi && udOctets >= 1U) {
+            udhBytes = 1U + ud[0];
+            if (udhBytes <= udOctets) {
+                skipSeptets = (udhBytes * 8U + 6U) / 7U;
+                fillBits = (skipSeptets * 7U) - (udhBytes * 8U);
+            } else {
+                udhBytes = 0U;
+            }
+        }
+        uint8_t coding = (dcs & 0x0CU);
+        if (coding == 0x00U) {
+            uint32_t msgSeptets = (udl > skipSeptets) ? (udl - skipSeptets) : 0U;
+            UnpackGsm7(ud + udhBytes, (udOctets > udhBytes) ? (udOctets - udhBytes) : 0U,
+                       msgSeptets, fillBits, body, sizeof(body));
+        } else if (coding == 0x08U) {
+            uint32_t pos = 0U;
+            for (uint32_t i = udhBytes; i + 1U < udl && i + 1U < udOctets; i += 2U) {
+                uint16_t u16 = ((uint16_t)ud[i] << 8) | ud[i + 1U];
+                if (u16 < 0x80U && pos + 1U < sizeof(body)) {
+                    body[pos++] = (char)u16;
+                } else if (u16 < 0x800U && pos + 2U < sizeof(body)) {
+                    body[pos++] = (char)(0xC0U | (u16 >> 6));
+                    body[pos++] = (char)(0x80U | (u16 & 0x3FU));
+                } else if (pos + 3U < sizeof(body)) {
+                    body[pos++] = (char)(0xE0U | (u16 >> 12));
+                    body[pos++] = (char)(0x80U | ((u16 >> 6) & 0x3FU));
+                    body[pos++] = (char)(0x80U | (u16 & 0x3FU));
+                }
+            }
+            body[pos] = '\0';
+        } else {
+            FormatHex(ud, (udOctets < 128U) ? udOctets : 128U, body, sizeof(body));
+        }
+    }
+    printf("  %s [%s] %s (%s) dcs=0x%02x: %s\n",
+           tag, (mti == 0x00U) ? "RX" : (mti == 0x01U) ? "TX" : "PDU",
+           addr[0] ? addr : "-", sctsStr, dcs, body);
+}
+
+static uint32_t EncodeSmsSubmitPdu(const char *phone, const char *text, uint8_t *outPdu, uint32_t outCap) {
+    if (!phone || !text || outCap < 16U) return 0U;
+    uint32_t pos = 0U;
+    outPdu[pos++] = 0x00U; /* SCA = default SIM/NV SMSC */
+    outPdu[pos++] = 0x11U; /* TP-MTI=SMS-SUBMIT, TP-VPF=relative */
+    outPdu[pos++] = 0x00U; /* TP-MR */
+
+    int isIntl = (phone[0] == '+');
+    const char *digs = isIntl ? (phone + 1) : phone;
+    uint32_t dCount = 0U;
+    uint8_t cleanDigs[32];
+    for (uint32_t i = 0U; digs[i] != '\0' && dCount < 24U; i++) {
+        if (digs[i] >= '0' && digs[i] <= '9') {
+            cleanDigs[dCount++] = (uint8_t)(digs[i] - '0');
+        }
+    }
+    if (dCount == 0U) return 0U;
+    outPdu[pos++] = (uint8_t)dCount;
+    outPdu[pos++] = isIntl ? 0x91U : 0x81U;
+    for (uint32_t i = 0U; i < dCount; i += 2U) {
+        uint8_t lo = cleanDigs[i];
+        uint8_t hi = (i + 1U < dCount) ? cleanDigs[i + 1U] : 0x0FU;
+        outPdu[pos++] = (uint8_t)((hi << 4) | lo);
+    }
+    outPdu[pos++] = 0x00U; /* TP-PID */
+
+    uint8_t septets[160];
+    uint32_t sepCount = 0U;
+    int allGsm7 = 1;
+    for (uint32_t i = 0U; text[i] != '\0'; i++) {
+        uint8_t s = 0U;
+        if (sepCount >= 160U || !AsciiToGsm7(text[i], &s)) {
+            allGsm7 = 0;
+            break;
+        }
+        septets[sepCount++] = s;
+    }
+
+    if (allGsm7) {
+        outPdu[pos++] = 0x00U; /* TP-DCS: GSM 7-bit */
+        outPdu[pos++] = 0xA7U; /* TP-VP: 24 hours */
+        outPdu[pos++] = (uint8_t)sepCount;
+        uint32_t packedLen = (sepCount * 7U + 7U) / 8U;
+        if (pos + packedLen > outCap) return 0U;
+        memset(outPdu + pos, 0, packedLen);
+        for (uint32_t i = 0U; i < sepCount; i++) {
+            uint32_t bitOff = i * 7U;
+            uint32_t byteIdx = bitOff / 8U;
+            uint32_t shift = bitOff % 8U;
+            outPdu[pos + byteIdx] |= (uint8_t)(septets[i] << shift);
+            if (shift > 1U) {
+                outPdu[pos + byteIdx + 1U] |= (uint8_t)(septets[i] >> (8U - shift));
+            }
+        }
+        pos += packedLen;
+    } else {
+        outPdu[pos++] = 0x08U; /* TP-DCS: UCS-2 */
+        outPdu[pos++] = 0xA7U; /* TP-VP */
+        uint32_t udlPos = pos++;
+        uint32_t uBytes = 0U;
+        const uint8_t *u8 = (const uint8_t *)text;
+        while (*u8 && uBytes + 2U <= 140U && pos + 2U <= outCap) {
+            uint32_t cp = '?';
+            if ((u8[0] & 0x80U) == 0U) { cp = u8[0]; u8 += 1; }
+            else if ((u8[0] & 0xE0U) == 0xC0U && u8[1]) { cp = ((u8[0] & 0x1FU) << 6) | (u8[1] & 0x3FU); u8 += 2; }
+            else if ((u8[0] & 0xF0U) == 0xE0U && u8[1] && u8[2]) { cp = ((u8[0] & 0x0FU) << 12) | ((u8[1] & 0x3FU) << 6) | (u8[2] & 0x3FU); u8 += 3; }
+            else { u8 += 1; }
+            outPdu[pos++] = (uint8_t)((cp >> 8) & 0xFFU);
+            outPdu[pos++] = (uint8_t)(cp & 0xFFU);
+            uBytes += 2U;
+        }
+        outPdu[udlPos] = (uint8_t)uBytes;
+    }
+    return pos;
+}
+
+static void QuerySmsInfoAndList(HANDLE hDev, const S23MODEM_STATUS_INFO *st, int readContents) {
+    printf("=== [QMI WMS 0x05] SMS Store, SMSC & Route Inspection ===\n");
+    uint8_t tlvs[4096];
+    uint16_t tlvLen = 0, qRes = 0, qErr = 0;
+
+    if (QmiTransaction(hDev, st, QMI_SVC_WMS, 0x0034U, NULL, 0, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+        printf("  [WMS 0x0034 GET_SMSC_ADDRESS] res=%u err=0x%x\n", qRes, qErr);
+        uint16_t ln01 = 0;
+        const uint8_t *v01 = FindTlv(tlvs, tlvLen, 0x01U, &ln01);
+        if (qRes == 0U && v01 && ln01 >= 5U && v01[0] >= '0' && v01[0] <= '9') {
+            uint8_t dlen = v01[3];
+            if (dlen > 0U && 4U + (uint32_t)dlen <= ln01) {
+                printf("    SMSC: type='%.3s' addr='%.*s'\n",
+                       (const char *)v01, (int)dlen, (const char *)(v01 + 4U));
+            }
+        } else if (qRes == 0U && v01 && ln01 >= 2U) {
+            uint8_t tlen = v01[0];
+            if (2U + tlen <= ln01) {
+                uint8_t dlen = v01[1U + tlen];
+                if (2U + tlen + dlen <= ln01) {
+                    printf("    SMSC: type='%.*s' addr='%.*s'\n",
+                           (int)tlen, (const char *)(v01 + 1U),
+                           (int)dlen, (const char *)(v01 + 2U + tlen));
+                }
+            }
+        }
+    }
+
+    if (QmiTransaction(hDev, st, QMI_SVC_WMS, 0x0033U, NULL, 0, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+        printf("  [WMS 0x0033 GET_ROUTES] res=%u err=0x%x\n", qRes, qErr);
+        uint16_t ln01 = 0;
+        const uint8_t *v01 = FindTlv(tlvs, tlvLen, 0x01U, &ln01);
+        if (qRes == 0U && v01 && ln01 >= 2U) {
+            uint16_t cnt = Le16(v01);
+            printf("    Routes (%u):\n", cnt);
+            for (uint16_t i = 0; i < cnt && 2U + (i + 1U) * 4U <= ln01; i++) {
+                const uint8_t *r = v01 + 2U + i * 4U;
+                printf("      [%u] type=%u class=%u storage=0x%02x action=%u\n", i, r[0], r[1], r[2], r[3]);
+            }
+        }
+    }
+
+    static const char *sNames[2] = { "UIM(0)", "NV(1)" };
+    for (uint8_t s = 0U; s <= 1U; s++) {
+        uint8_t mReq[4] = { 0x01U, 1U, 0U, s };
+        if (QmiTransaction(hDev, st, QMI_SVC_WMS, 0x0037U, mReq, sizeof(mReq), tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+            uint16_t ln01 = 0, ln10 = 0;
+            const uint8_t *v01 = FindTlv(tlvs, tlvLen, 0x01U, &ln01);
+            const uint8_t *v10 = FindTlv(tlvs, tlvLen, 0x10U, &ln10);
+            printf("  [WMS 0x0037 MAX_SIZE %s] res=%u err=0x%x max=%u free=%u\n",
+                   sNames[s], qRes, qErr,
+                   (v01 && ln01 >= 4U) ? Le32(v01) : 0U,
+                   (v10 && ln10 >= 4U) ? Le32(v10) : 0U);
+        }
+
+        uint8_t lReq[8] = { 0x01U, 1U, 0U, s, 0x11U, 1U, 0U, 1U };
+        if (QmiTransaction(hDev, st, QMI_SVC_WMS, 0x0031U, lReq, sizeof(lReq), tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+            uint16_t ln01 = 0;
+            const uint8_t *v01 = FindTlv(tlvs, tlvLen, 0x01U, &ln01);
+            uint32_t cnt = (qRes == 0U && v01 && ln01 >= 4U) ? Le32(v01) : 0U;
+            printf("  [WMS 0x0031 LIST %s] res=%u err=0x%x count=%u\n", sNames[s], qRes, qErr, cnt);
+            uint32_t idxs[64];
+            uint8_t tags[64];
+            uint32_t actual = 0U;
+            for (uint32_t i = 0U; i < cnt && i < 64U && (4U + (i + 1U) * 5U <= ln01); i++) {
+                idxs[actual] = Le32(v01 + 4U + i * 5U);
+                tags[actual] = v01[4U + i * 5U + 4U];
+                actual++;
+            }
+            for (uint32_t i = 0U; i < actual; i++) {
+                printf("    slot %s idx=%u tag=%u\n", sNames[s], idxs[i], tags[i]);
+                if (readContents) {
+                    uint8_t rReq[12];
+                    rReq[0] = 0x01U; rReq[1] = 5U; rReq[2] = 0U; rReq[3] = s;
+                    memcpy(rReq + 4U, &idxs[i], 4U);
+                    rReq[8] = 0x10U; rReq[9] = 1U; rReq[10] = 0U; rReq[11] = 1U;
+                    if (QmiTransaction(hDev, st, QMI_SVC_WMS, 0x0022U, rReq, sizeof(rReq), tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr) && qRes == 0U) {
+                        uint16_t r01 = 0;
+                        const uint8_t *rv = FindTlv(tlvs, tlvLen, 0x01U, &r01);
+                        if (rv && r01 >= 4U) {
+                            uint16_t dlen = Le16(rv + 2U);
+                            if (4U + dlen <= r01) {
+                                char tagBuf[32];
+                                snprintf(tagBuf, sizeof(tagBuf), "[%s#%u]", sNames[s], idxs[i]);
+                                DecodeSmsPdu(tagBuf, rv + 4U, dlen);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void SendSmsViaWms(HANDLE hDev, const S23MODEM_STATUS_INFO *st, const char *phone, const char *text) {
+    printf("=== [QMI WMS 0x05] Sending SMS to '%s' ===\n", phone);
+    uint8_t pdu[256];
+    uint32_t pduLen = EncodeSmsSubmitPdu(phone, text, pdu, sizeof(pdu));
+    if (pduLen == 0U) {
+        printf("  [ERR] Failed to encode SMS-SUBMIT PDU\n");
+        return;
+    }
+    char hex[520] = {0};
+    FormatHex(pdu, pduLen, hex, sizeof(hex));
+    printf("  Encoded PDU (%u B): %s\n", pduLen, hex);
+
+    uint8_t req[300];
+    uint16_t valLen = (uint16_t)(3U + pduLen);
+    req[0] = 0x01U; memcpy(req + 1U, &valLen, 2U);
+    req[3] = 0x06U; /* GW_PP */
+    uint16_t pduLen16 = (uint16_t)pduLen;
+    memcpy(req + 4U, &pduLen16, 2U);
+    memcpy(req + 6U, pdu, pduLen);
+
+    uint8_t tlvs[512];
+    uint16_t tlvLen = 0, qRes = 0, qErr = 0;
+    if (QmiTransactionEx(hDev, st, QMI_SVC_WMS, 0x0020U, req, (uint16_t)(3U + valLen),
+                         tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr, 20000U)) {
+        uint16_t ln01 = 0;
+        const uint8_t *v01 = FindTlv(tlvs, tlvLen, 0x01U, &ln01);
+        printf("  [WMS 0x0020 RAW_SEND] res=%u err=0x%x msgId=%u\n",
+               qRes, qErr, (v01 && ln01 >= 2U) ? Le16(v01) : 0U);
+        DumpRawTlvs("WMS_RAW_SEND", tlvs, tlvLen);
+    } else {
+        printf("  [WMS 0x0020 RAW_SEND] timed out\n");
+    }
+}
+
+static void ListenSmsViaWms(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint32_t seconds) {
+    printf("=== [QMI WMS 0x05] Listening for incoming SMS (%u s) ===\n", seconds);
+    uint8_t tlvs[2048];
+    uint16_t tlvLen = 0, qRes = 0, qErr = 0;
+    uint8_t evReq[4] = { 0x10U, 1U, 0U, 1U };
+    (void)QmiTransaction(hDev, st, QMI_SVC_WMS, 0x0001U, evReq, sizeof(evReq), tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr);
+
+    ULONGLONG tStart = GetTickCount64();
+    while ((GetTickCount64() - tStart) < (ULONGLONG)seconds * 1000ULL) {
+        if (QmiWaitIndication(hDev, QMI_SVC_WMS, 0x0001U, tlvs, sizeof(tlvs), &tlvLen, 1000U)) {
+            uint16_t ln11 = 0, ln10 = 0;
+            const uint8_t *v11 = FindTlv(tlvs, tlvLen, 0x11U, &ln11);
+            const uint8_t *v10 = FindTlv(tlvs, tlvLen, 0x10U, &ln10);
+            if (v11 && ln11 >= 8U) {
+                uint8_t ackInd = v11[0];
+                uint32_t txId = Le32(v11 + 1U);
+                uint16_t rawLen = Le16(v11 + 6U);
+                if (8U + rawLen <= ln11) {
+                    DecodeSmsPdu("[MT TRANSFER]", v11 + 8U, rawLen);
+                }
+                if (ackInd == 0U) {
+                    uint8_t aReq[9];
+                    aReq[0] = 0x01U; aReq[1] = 6U; aReq[2] = 0U;
+                    memcpy(aReq + 3U, &txId, 4U);
+                    aReq[7] = 0x02U; aReq[8] = 0x01U;
+                    (void)QmiTransaction(hDev, st, QMI_SVC_WMS, 0x003DU, aReq, sizeof(aReq), tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr);
+                }
+            } else if (v10 && ln10 >= 5U) {
+                uint8_t storage = v10[0];
+                uint32_t idx = Le32(v10 + 1U);
+                printf("  [MT STORED] storage=%u idx=%u\n", storage, idx);
+                QuerySmsInfoAndList(hDev, st, 1);
+            }
+        }
+    }
+}
+
+static void DeleteSmsViaWms(HANDLE hDev, const S23MODEM_STATUS_INFO *st, const char *storeName, const char *idxStr) {
+    uint8_t storage = (_stricmp(storeName, "nv") == 0) ? 1U : 0U;
+    uint8_t req[15];
+    uint32_t rp = 0U;
+    req[rp++] = 0x01U; req[rp++] = 1U; req[rp++] = 0U; req[rp++] = storage;
+    if (_stricmp(idxStr, "all") != 0) {
+        uint32_t idx = (uint32_t)strtoul(idxStr, NULL, 10);
+        req[rp++] = 0x10U; req[rp++] = 4U; req[rp++] = 0U;
+        memcpy(req + rp, &idx, 4U); rp += 4U;
+    }
+    req[rp++] = 0x12U; req[rp++] = 1U; req[rp++] = 0U; req[rp++] = 1U;
+    uint8_t tlvs[256];
+    uint16_t tlvLen = 0, qRes = 0, qErr = 0;
+    if (QmiTransaction(hDev, st, QMI_SVC_WMS, 0x0024U, req, (uint16_t)rp, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+        printf("  [WMS 0x0024 DELETE storage=%u idx=%s] res=%u err=0x%x\n", storage, idxStr, qRes, qErr);
+    }
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     printf("=== s23modemd.exe v1.0.0.1 - Samsung Galaxy S23 5G & eSIM Control Daemon ===\n");
@@ -1971,6 +2407,31 @@ int main(int argc, char **argv) {
             return 0;
         } else if (strcmp(argv[i], "--ipa-test") == 0) {
             RunIpaLoopbackTest(hDev, &st);
+            CloseHandle(hDev);
+            return 0;
+        } else if (strcmp(argv[i], "--sms-info") == 0) {
+            QuerySmsInfoAndList(hDev, &st, 0);
+            CloseHandle(hDev);
+            return 0;
+        } else if (strcmp(argv[i], "--sms-list") == 0) {
+            QuerySmsInfoAndList(hDev, &st, 1);
+            CloseHandle(hDev);
+            return 0;
+        } else if (strcmp(argv[i], "--sms-send") == 0 && i + 2 < argc) {
+            SendSmsViaWms(hDev, &st, argv[i + 1], argv[i + 2]);
+            CloseHandle(hDev);
+            return 0;
+        } else if (strcmp(argv[i], "--sms-listen") == 0) {
+            uint32_t secs = 60U;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                secs = (uint32_t)strtoul(argv[++i], NULL, 10);
+                if (secs == 0U) secs = 60U;
+            }
+            ListenSmsViaWms(hDev, &st, secs);
+            CloseHandle(hDev);
+            return 0;
+        } else if (strcmp(argv[i], "--sms-delete") == 0 && i + 2 < argc) {
+            DeleteSmsViaWms(hDev, &st, argv[i + 1], argv[i + 2]);
             CloseHandle(hDev);
             return 0;
         } else if (strcmp(argv[i], "--crash-info") == 0) {
