@@ -32,4 +32,34 @@ nested messages), bounds-checked and transactional, tested under ASan + UBSan by
 need the `.proto` definitions, which are not in the dump as text. Deriving them is future work and
 must be checked against a live ADSP before anything depends on them.
 
-Nothing here talks to hardware. ADSP PIL is not up on Windows, so there is no on-device test yet.
+## `s23sensors.c` — Freestanding ARM64 WDM Sensors Driver (`s23sensors.sys`)
+
+`drivers/s23sensors/s23sensors.c` (built via `drivers/s23sensors/build_wsl.py` and signed via
+`drivers/s23sensors/sign.ps1`) pairs the zero-allocation `s23sns_pb.h` wire codec with the
+AP-direct sensors on S23 (`dm1q`). It reads `Mode` (`REG_DWORD`, default `0`) from
+`HKLM\SYSTEM\CurrentControlSet\Services\s23sensors\Parameters` and logs to
+`\??\C:\Users\Public\s23sensors.log`:
+
+- **`Mode = 0` (Default — Safe One-Shot Self-Test & Hall GPIO107 Read):**
+  1. Encodes Qualcomm SEE `sns_client_request_msg` frames targeting the well-known SUID Lookup
+     sensor (`suid_low = 0xABABABABABABABAB`, `suid_high = 0xABABABABABABABAB`,
+     `msg_id = 512` / `SNS_SUID_MSGID_SNS_SUID_REQ`) for all six QSH sensor data types
+     (`"accel"`, `"gyro"`, `"mag"`, `"pressure"`, `"ambient_light"`, `"proximity"`) using
+     `s23sns_pb.h` (`s23pb_writer_init`, `s23pb_submsg_begin`/`s23pb_submsg_end`,
+     `s23pb_write_fixed64`, `s23pb_write_varint`, `s23pb_write_str`).
+  2. Runs a self-test of the QSH `sns_std_sensor_event` decoder (`s23pb_reader_init`,
+     `s23pb_read_tag`, `s23pb_submsg_enter`, `s23pb_packed_fixed32_count`, `s23pb_f32_from_bits`)
+     on a 3-axis float sample (`x`, `y`, `z`) + `status`.
+  3. Maps `TLMM` (`0x0F100000`) and reads the AP-direct magnetic Hall flip-cover sensor on
+     `GPIO107` (`+0x6B000`: `CFG +0x00`, `IN_OUT +0x04`), logging the protobuf wire hex and
+     Hall state to `C:\Users\Public\s23sensors.log` before unloading cleanly.
+- **`Mode = 1` (Opt-In AP I2C Sensor Probe + `\Device\S23Sensors` IOCTL Interface):**
+  1. Performs all `Mode = 0` steps, then probes the two AP-visible I2C sensors:
+     - **Rear ALS / Flicker (`ams TSL2585` @ `0x39`)** on `QUPv3_I2C_HUB SE0` (`0x00980000`,
+       `GPIO16` SDA / `GPIO17` SCL, IRQ `GPIO62`), reading `AUXID` (`0x90`), `REVID` (`0x91`),
+       `ID` (`0x92`), and `STATUS` (`0x93`).
+     - **Grip / SAR Proximity (`Imagis ISG6320` @ `0x28`)** on bit-bang `GPIO169` (SDA) /
+       `GPIO170` (SCL) (IRQ `GPIO153`), reading `WHOAMI` (`0x00`) and `STATUS` (`0x01`).
+  2. Exposes `\Device\S23Sensors` (`\DosDevices\S23Sensors`) supporting
+     `IOCTL_S23SENSORS_GET_TELEMETRY` and `IOCTL_S23SENSORS_POLL_SENSORS` for querying live
+     Hall/ALS/SAR/QSH telemetry.

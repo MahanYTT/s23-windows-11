@@ -171,6 +171,18 @@
 #define MBIM_ACT_STATE_DEACTIVATED          3U
 #define MBIM_ACT_STATE_DEACTIVATING         4U
 
+/* MBIM Context IP Types (MBIM_CONTEXT_IP_TYPE) */
+#define MBIM_CONTEXT_IP_TYPE_DEFAULT        0U
+#define MBIM_CONTEXT_IP_TYPE_IPV4           1U
+#define MBIM_CONTEXT_IP_TYPE_IPV6           2U
+#define MBIM_CONTEXT_IP_TYPE_IPV4V6         3U
+#define MBIM_CONTEXT_IP_TYPE_IPV4_AND_IPV6  4U
+
+/* MBIM Data Subclasses (MBIMEx 3.0) */
+#define MBIM_DATA_SUBCLASS_NONE             0x00000000U
+#define MBIM_DATA_SUBCLASS_5G_ENDC          0x00000001U
+#define MBIM_DATA_SUBCLASS_5G_NR            0x00000002U
+
 /* Verified RFC 4122 Big-Endian Service UUIDs on the MBIM Wire */
 static const UINT8 UUID_BASIC_CONNECT[16] = {
     0xA2, 0x89, 0xCC, 0x33, 0xBC, 0xBB, 0x8B, 0x4F,

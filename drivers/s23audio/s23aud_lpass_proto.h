@@ -19,7 +19,9 @@
 #define S23AUD_LPASS_PROTO_H
 
 #include <stddef.h>
+#ifndef _STDINT
 #include <stdint.h>
+#endif
 
 #if defined(_MSC_VER) && !defined(__cplusplus)
 #define S23AUD_INLINE static __inline

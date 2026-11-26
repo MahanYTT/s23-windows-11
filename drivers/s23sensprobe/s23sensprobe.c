@@ -840,7 +840,7 @@ static uint32_t ProbeCirrus32Be(volatile uint8_t *se, const char *name, uint8_t 
                      ((uint32_t)rvb[2] << 8)  | (uint32_t)rvb[3];
 
     LogS("DEVID=0x"); LogHex(devid, 8);
-    if ((devid & 0xFFFFFFU) == 0x035A43U)      LogS(" [CONFIRMED CS35L43!]");
+    if ((devid & 0x00FFFFFFU) == 0x00035A42U || (devid & 0x00FFFFFFU) == 0x00035A43U) LogS(" [CONFIRMED CS35L43!]");
     else if ((devid & 0xFFFFFFU) == 0x035A40U) LogS(" [CONFIRMED CS35L41!]");
     else if ((devid & 0xFFFFFFU) == 0x40A260U) LogS(" [CONFIRMED CS40L26A!]");
     else if ((devid & 0xFFFFFFU) == 0x40A26BU) LogS(" [CONFIRMED CS40L26B!]");

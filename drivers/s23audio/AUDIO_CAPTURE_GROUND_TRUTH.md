@@ -1,7 +1,10 @@
 # Audio capture (DMIC) — ground truth and status
 
-**Status:** groundwork only. `s23aud_lpass_proto.h` is **not included** by `s23audio.sys`, and
-`waveInGetNumDevs` is still 0. This change alters no playback behaviour, INF or registry value.
+**Status:** `s23aud_lpass_proto.h` and `../s23haptics/cirrus_fw.h` are now wired into `s23audio.sys`
+(`drivers/s23audio/s23aud_hw.h` and `drivers/s23audio/s23aud_hw.c`) behind opt-in registry flags under
+`HKLM\SYSTEM\CurrentControlSet\Services\s23audio\Parameters` (`CaptureProbeMode` default `0`,
+`InspectSpkProtFw` default `0`). `waveInGetNumDevs` is still `0`, and default playback behaviour,
+INF, raw ASP bypass (`0x08`) and the `-6.0 dB` hardware volume ceiling remain unchanged.
 
 ## Evidence used
 
@@ -23,19 +26,40 @@
   (`usb_research/S23_USBC_ARCHITECTURE.md`). Capture must therefore go through an AudioReach graph
   (`CODEC_DMA_SOURCE` → `PCM_ENC`/`PCM_CNV` → `RD_SHARED_MEM_EP`), not through AP-side DMA.
 
+## Wired Registry Hooks in `s23aud_hw.c` (`HKLM\SYSTEM\CurrentControlSet\Services\s23audio\Parameters`)
+
+1. **`CaptureProbeMode` (`REG_DWORD`, default `0`)**:
+   - When `CaptureProbeMode == 1`, inside `S23AudHwStartStream()` — immediately after `EnsureAdspReadyLocked()`
+     and `PrmHwCoreReq(PARAM_ID_RSC_LPASS_CORE, 1, TRUE)` succeed so `LPASS_CORE` clocks are voted on —
+     `ProbeLpassVaTxMacrosLocked(hw)` maps `S23AUD_TX_MACRO_PA` (`0x06AE0000`, size `0x1000`) and
+     `S23AUD_VA_MACRO_PA` (`0x06D44000`, size `0x2000`) as `MmNonCached` (`MapIo`) and reads **only**
+     4-byte aligned offsets approved by `s23aud_lpass_probe_read_allowed(pa, 4)`:
+     - `VA_MACRO` `TOP_CSR` (`+0x80..+0x98`, including `+0x80` `CORE_ID` and `+0x84..+0x90` `DMIC0..3_CTL`),
+       `INP_MUX` (`+0x100..+0x120`), and `CDC_TX0..3` (`+0x400`, `+0x480`, `+0x500`, `+0x580`);
+     - `TX_MACRO` `TOP_CSR` (`+0x80..+0x98`), `INP_MUX` (`+0x100..+0x120`), and `CDC_TX0..7`
+       (`+0x400 + n*0x80`);
+   - Logs all read register values, the computed VA DMIC divider/CTL word (`9.6 MHz -> 2.4 MHz`, `div_sel=2`,
+     `factor=4`), and the AudioReach capture module IDs (`CODEC_DMA_SOURCE = 0x07001024`,
+     `PCM_ENC = 0x07001004`, `RD_SHARED_MEM_EP = 0x07001001`, `s23aud_codec_dma_ch_mask(2) = 0x3`) to
+     `C:\Users\Public\s23audio.log`, then unmaps cleanly with zero writes.
+
+2. **`InspectSpkProtFw` (`REG_DWORD`, default `0`)**:
+   - When `InspectSpkProtFw == 1`, during CS35L43 initialization in `InitCs35l43PairLocked(hw)`, the driver
+     attempts to load `\SystemRoot\System32\drivers\s23fw\cs35l43-bot-dsp1-spk-prot.wmfw` (`@0x40`) and
+     `\SystemRoot\System32\drivers\s23fw\cs35l43-rcv-dsp1-spk-prot.wmfw` (`@0x41`) into a temporary
+     non-paged pool buffer, validates them with `cirrus_wmfw_validate()`, and iterates their regions with
+     `cirrus_wmfw_iter_init()` / `cirrus_wmfw_iter_next()` while converting word offsets to Halo DSP byte
+     register addresses via `cirrus_halo_dsp_addr()`.
+   - Logs the region counts, memory/total payload byte counts, and Halo I2C target addresses to
+     `C:\Users\Public\s23audio.log`, while keeping the safe raw ASP bypass (`CS35L43_DACPCM1_INPUT = 0x08`)
+     and `-6.0 dB` ceiling active.
+
 ## Not done / unverified (TODO)
 
 1. Which DMIC lines (0..5) are populated on dm1q, and their LPI TLMM pins. ACDB/topology blobs not decoded.
 2. The S23 VA-macro MCLK rate (the header uses Linux's 9.6 MHz) and the DMIC clock.
 3. Capture channel count (`S23AUD_CAP_MAX_CH = 4` comes from a resourcemanager.xml note, unverified).
 4. The capture graph itself, the PortCls capture pin and the INF change that would make `waveInGetNumDevs > 0`.
-5. **CS35L43 Halo DSP speaker protection / calibration loader:** not started. The stock
-   `cs35l43-{bot,rcv}-dsp1-spk-prot.wmfw/.bin` parse cleanly with `drivers/s23haptics/cirrus_fw.h`
-   (see `drivers/s23haptics/CIRRUS_FW_GROUND_TRUTH.md`). Loading them needs thermal/excursion limits
-   validated on the device before any write to the amplifiers.
-
-## Next on-device step (future PR, opt-in)
-
-Mode=1 read-only probe: after the existing PRM resource request, read VA/TX `TOP_CSR`,
-`INP_MUX` and the `CDC_TXn` decimators through the whitelist while Android-equivalent capture is
-*not* running, and log them to `C:\Users\Public\s23audio.log`. No writes. Rollback: Mode=0 (default).
+5. **CS35L43 Halo DSP speaker protection / calibration active I2C upload:** `InspectSpkProtFw=1` validates
+   and logs the Halo WMFW regions read-only; streaming the firmware into the CS35L43 amplifiers and switching
+   `DACPCM1_INPUT` from `0x08` to `0x32` still requires on-device thermal/excursion limit verification.

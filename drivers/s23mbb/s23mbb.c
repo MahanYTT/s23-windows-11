@@ -35,6 +35,19 @@
 #define QMI_SVC_DPM                 0x2FU
 #define QMI_SVC_IPA                 0x31U
 
+/* Dedicated QRTR client port for WDS IPv6 session (independent of IPv4 WDS client state) */
+#define S23MBB_WDS_V6_CLIENT_PORT   (S23MBB_CLIENT_PORT_BASE + QMI_SVC_WDS + 0x40U)
+
+/* QMI NAS & WDS Message IDs */
+#define QMI_WDS_START_NET_IFACE     0x0020U
+#define QMI_WDS_STOP_NET_IFACE      0x0021U
+#define QMI_WDS_GET_CUR_SETTINGS    0x002DU
+#define QMI_WDS_SET_IP_FAMILY_PREF  0x004DU
+#define QMI_WDS_BIND_MUX_DATA_PORT  0x00A2U
+#define QMI_NAS_GET_SERVING_SYSTEM  0x0024U
+#define QMI_NAS_GET_SYS_INFO        0x004DU
+#define QMI_NAS_GET_SIG_INFO        0x004FU
+
 /* ============================================================================
  * File Logger (\??\C:\Users\Public\s23mbb.log)
  * ========================================================================== */
@@ -326,6 +339,7 @@ typedef struct _S23MBB_DEV_CTX {
     /* Registration & signal cache */
     UINT32                  LastRegState;
     UINT32                  LastDataClass;
+    UINT32                  LastDataSubClass;
     UINT32                  LastMcc;
     UINT32                  LastMnc;
     char                    LastPlmnName[32];
@@ -460,10 +474,10 @@ static BOOLEAN FindQrtrServer(const S23MODEM_STATUS_INFO *st, UINT32 svc, UINT32
     return FALSE;
 }
 
-static BOOLEAN QmiCall(PS23MBB_DEV_CTX ctx, UINT32 svc, UINT16 msgId,
-                       const UINT8 *reqTlvs, UINT16 reqTlvLen,
-                       UINT8 *outTlvBuf, UINT32 outTlvCap, UINT16 *outTlvLen,
-                       UINT16 *outQmiRes, UINT16 *outQmiErr)
+static BOOLEAN QmiCallPort(PS23MBB_DEV_CTX ctx, UINT32 svc, UINT32 myPort, UINT16 msgId,
+                           const UINT8 *reqTlvs, UINT16 reqTlvLen,
+                           UINT8 *outTlvBuf, UINT32 outTlvCap, UINT16 *outTlvLen,
+                           UINT16 *outQmiRes, UINT16 *outQmiErr)
 {
     if (outTlvLen) *outTlvLen = 0;
     if (outQmiRes) *outQmiRes = 0xFFFFU;
@@ -479,7 +493,7 @@ static BOOLEAN QmiCall(PS23MBB_DEV_CTX ctx, UINT32 svc, UINT16 msgId,
 
     UINT16 txid = ctx->NextQmiTxId++;
     if (ctx->NextQmiTxId == 0U) ctx->NextQmiTxId = 1U;
-    UINT32 myPort = S23MBB_CLIENT_PORT_BASE + (svc & 0xFFU);
+    if (myPort == 0U) myPort = S23MBB_CLIENT_PORT_BASE + (svc & 0xFFU);
 
     if (7U + (UINT32)reqTlvLen > S23MODEM_MAX_QRTR_PAYLOAD) return FALSE;
 
@@ -586,6 +600,15 @@ static BOOLEAN QmiCall(PS23MBB_DEV_CTX ctx, UINT32 svc, UINT16 msgId,
     MbbLogFmt("[QMI] Timeout svc=0x%02x msg=0x%04x txid=0x%04x\r\n", svc, msgId, txid);
     MbbLogFlush();
     return FALSE;
+}
+
+static BOOLEAN QmiCall(PS23MBB_DEV_CTX ctx, UINT32 svc, UINT16 msgId,
+                       const UINT8 *reqTlvs, UINT16 reqTlvLen,
+                       UINT8 *outTlvBuf, UINT32 outTlvCap, UINT16 *outTlvLen,
+                       UINT16 *outQmiRes, UINT16 *outQmiErr)
+{
+    return QmiCallPort(ctx, svc, S23MBB_CLIENT_PORT_BASE + (svc & 0xFFU), msgId,
+                       reqTlvs, reqTlvLen, outTlvBuf, outTlvCap, outTlvLen, outQmiRes, outQmiErr);
 }
 
 /* ============================================================================
@@ -1234,13 +1257,14 @@ static UINT32 BuildRegisterStateV3Buf(PS23MBB_DEV_CTX ctx, UINT8 *outBuf, UINT32
     UINT16 tlvLen = 0, qRes = 0, qErr = 0;
     UINT32 regState = MBIM_REG_STATE_DEREGISTERED;
     UINT32 dataClass = MBIM_DATA_CLASS_NONE;
+    UINT32 dataSubClass = MBIM_DATA_SUBCLASS_NONE;
     UINT32 cellClass = 0U;
     UINT32 mcc = 0U, mnc = 0U;
     char plmnId[8] = {0};
     char plmnName[24] = {0};
 
     if (ctx->SwRadioState &&
-        QmiCall(ctx, QMI_SVC_NAS, 0x0024U, NULL, 0, ctx->QmiTlvBuf, 2048U, &tlvLen, &qRes, &qErr) && qRes == 0U) {
+        QmiCall(ctx, QMI_SVC_NAS, QMI_NAS_GET_SERVING_SYSTEM, NULL, 0, ctx->QmiTlvBuf, 2048U, &tlvLen, &qRes, &qErr) && qRes == 0U) {
         UINT16 ln01 = 0, ln12 = 0;
         const UINT8 *v01 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x01U, &ln01);
         const UINT8 *v12 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x12U, &ln12);
@@ -1262,6 +1286,11 @@ static UINT32 BuildRegisterStateV3Buf(PS23MBB_DEV_CTX ctx, UINT8 *outBuf, UINT32
             if (regState >= MBIM_REG_STATE_HOME && regState <= MBIM_REG_STATE_PARTNER) {
                 cellClass = 1U; /* GSM — mbbcx.sys requires non-zero when registered! */
                 if (dataClass == 0U) dataClass = MBIM_DATA_CLASS_LTE;
+                if (dataClass & MBIM_DATA_CLASS_5G) {
+                    dataSubClass = (dataClass & MBIM_DATA_CLASS_LTE)
+                                       ? MBIM_DATA_SUBCLASS_5G_ENDC
+                                       : MBIM_DATA_SUBCLASS_5G_NR;
+                }
             }
         }
         if (v12 && ln12 >= 5U) {
@@ -1283,10 +1312,45 @@ static UINT32 BuildRegisterStateV3Buf(PS23MBB_DEV_CTX ctx, UINT8 *outBuf, UINT32
         }
     }
 
-    ctx->LastRegState  = regState;
-    ctx->LastDataClass = dataClass;
-    ctx->LastMcc       = mcc;
-    ctx->LastMnc       = mnc;
+    /* Inspect QMI_NAS_GET_SYS_INFO (0x004D) + QMI_NAS_GET_SIG_INFO (0x004F) for 5G NR NSA (EN-DC) / SA */
+    if (ctx->SwRadioState && regState >= MBIM_REG_STATE_HOME && regState <= MBIM_REG_STATE_PARTNER) {
+        if (QmiCall(ctx, QMI_SVC_NAS, QMI_NAS_GET_SYS_INFO, NULL, 0, ctx->QmiTlvBuf, 2048U, &tlvLen, &qRes, &qErr) && qRes == 0U) {
+            UINT16 l13 = 0, l3e = 0, l45 = 0, l4a = 0, l4b = 0;
+            const UINT8 *v13 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x13U, &l13); /* LTE srv_status_info */
+            const UINT8 *v3e = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x3EU, &l3e); /* LTE endc_available */
+            const UINT8 *v45 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x45U, &l45); /* NR5G endc / cell status */
+            const UINT8 *v4a = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x4AU, &l4a); /* NR5G srv_status_info */
+            const UINT8 *v4b = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x4BU, &l4b); /* NR5G sys_info */
+            BOOLEAN lteActive = ((dataClass & MBIM_DATA_CLASS_LTE) != 0U) || (v13 && l13 >= 1U && v13[0] == 2U);
+            BOOLEAN nr5gSys   = (v4a && l4a >= 1U && v4a[0] == 2U) || (v4b && l4b >= 1U);
+            BOOLEAN endcAvail = (v3e && l3e >= 1U && v3e[0] != 0U) || (v45 && l45 >= 1U && v45[0] != 0U);
+            if (nr5gSys || (lteActive && endcAvail)) {
+                dataClass |= MBIM_DATA_CLASS_5G;
+                dataSubClass = lteActive ? MBIM_DATA_SUBCLASS_5G_ENDC : MBIM_DATA_SUBCLASS_5G_NR;
+            }
+        }
+        if (QmiCall(ctx, QMI_SVC_NAS, QMI_NAS_GET_SIG_INFO, NULL, 0, ctx->QmiTlvBuf, 1024U, &tlvLen, &qRes, &qErr) && qRes == 0U) {
+            UINT16 l17 = 0;
+            const UINT8 *v17 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x17U, &l17); /* 5G NR signal info (rsrp, snr) */
+            if (v17 && l17 >= 4U) {
+                INT16 nrRsrp = LeS16(v17);
+                if (nrRsrp >= -150 && nrRsrp <= -30) {
+                    dataClass |= MBIM_DATA_CLASS_5G;
+                    if (dataClass & MBIM_DATA_CLASS_LTE) {
+                        dataSubClass = MBIM_DATA_SUBCLASS_5G_ENDC;
+                    } else if (dataSubClass == MBIM_DATA_SUBCLASS_NONE) {
+                        dataSubClass = MBIM_DATA_SUBCLASS_5G_NR;
+                    }
+                }
+            }
+        }
+    }
+
+    ctx->LastRegState     = regState;
+    ctx->LastDataClass    = dataClass;
+    ctx->LastDataSubClass = dataSubClass;
+    ctx->LastMcc          = mcc;
+    ctx->LastMnc          = mnc;
 
     RtlZeroMemory(outBuf, sizeof(MBIM_REGISTER_STATE_V3_HDR));
     MBIM_REGISTER_STATE_V3_HDR *hdr = (MBIM_REGISTER_STATE_V3_HDR *)outBuf;
@@ -1382,7 +1446,7 @@ static UINT32 BuildIpConfigBuf(PS23MBB_DEV_CTX ctx, UINT32 sessionId, UINT8 *out
     }
 
     if (sessionId == 0U && sess->Active && sess->HasV6 && pos + 80U <= cap) {
-        hdr->IPv6ConfigurationAvailable = 0x0FU;
+        hdr->IPv6ConfigurationAvailable = 0x0FU; /* Addr | Gw | DNS | MTU */
         hdr->IPv6AddressCount  = 1U;
         hdr->IPv6AddressOffset = pos;
         MBIM_IPV6_ELEMENT_WIRE el6;
@@ -1395,10 +1459,28 @@ static UINT32 BuildIpConfigBuf(PS23MBB_DEV_CTX ctx, UINT32 sessionId, UINT8 *out
         RtlCopyMemory(outBuf + pos, sess->V6Gw, 16U);
         pos += 16U;
 
-        hdr->IPv6DnsServerCount = 1U;
+        UINT32 dns6Cnt = 0U;
         hdr->IPv6DnsServerOffset = pos;
-        RtlCopyMemory(outBuf + pos, sess->V6Dns1, 16U);
-        pos += 16U;
+        BOOLEAN hasDns1 = FALSE, hasDns2 = FALSE;
+        for (UINT32 k = 0; k < 16U; k++) {
+            if (sess->V6Dns1[k] != 0U) hasDns1 = TRUE;
+            if (sess->V6Dns2[k] != 0U) hasDns2 = TRUE;
+        }
+        if (hasDns1) {
+            RtlCopyMemory(outBuf + pos, sess->V6Dns1, 16U);
+            pos += 16U;
+            dns6Cnt++;
+        }
+        if (hasDns2) {
+            RtlCopyMemory(outBuf + pos, sess->V6Dns2, 16U);
+            pos += 16U;
+            dns6Cnt++;
+        }
+        hdr->IPv6DnsServerCount = dns6Cnt;
+        if (dns6Cnt == 0U) {
+            hdr->IPv6DnsServerOffset = 0U;
+            hdr->IPv6ConfigurationAvailable &= ~0x04U;
+        }
 
         UINT32 mtu6 = sess->V6Mtu;
         if (mtu6 < 1280U || mtu6 > 1500U) mtu6 = 1420U;
@@ -1845,8 +1927,35 @@ static VOID HandleUiccLowLevelAccess(PS23MBB_DEV_CTX ctx, UINT32 txId, UINT32 ci
 }
 
 /* ============================================================================
- * MBIM Connect / WDS Data Call Handler
+ * MBIM Connect / WDS Dual-Stack (IPv4 + IPv6) Data Call Handler
  * ========================================================================== */
+static VOID HandleMbimDisconnect(PS23MBB_DEV_CTX ctx, S23MBB_SESSION_STATE *sess, UINT32 sid)
+{
+    if (sess->WdsHandleV4 != 0U) {
+        UINT8 sReq[7];
+        sReq[0] = 0x01U; sReq[1] = 4U; sReq[2] = 0U;
+        RtlCopyMemory(sReq + 3U, &sess->WdsHandleV4, 4U);
+        UINT16 tlvLen = 0, qRes = 0, qErr = 0;
+        (void)QmiCall(ctx, QMI_SVC_WDS, QMI_WDS_STOP_NET_IFACE, sReq, sizeof(sReq),
+                      ctx->QmiTlvBuf, 512U, &tlvLen, &qRes, &qErr);
+        sess->WdsHandleV4 = 0U;
+    }
+    if (sess->WdsHandleV6 != 0U) {
+        UINT8 sReq[7];
+        sReq[0] = 0x01U; sReq[1] = 4U; sReq[2] = 0U;
+        RtlCopyMemory(sReq + 3U, &sess->WdsHandleV6, 4U);
+        UINT16 tlvLen = 0, qRes = 0, qErr = 0;
+        (void)QmiCallPort(ctx, QMI_SVC_WDS, S23MBB_WDS_V6_CLIENT_PORT, QMI_WDS_STOP_NET_IFACE,
+                          sReq, sizeof(sReq), ctx->QmiTlvBuf, 512U, &tlvLen, &qRes, &qErr);
+        sess->WdsHandleV6 = 0U;
+    }
+    sess->Active = FALSE;
+    sess->HasV4  = FALSE;
+    sess->HasV6  = FALSE;
+    MbbLogFmt("[WDS] Deactivated session %u (v4/v6 stopped)\r\n", sid);
+    MbbLogFlush();
+}
+
 static VOID HandleMbimConnect(PS23MBB_DEV_CTX ctx, UINT32 txId, UINT32 cmdType,
                               const UINT8 *info, UINT32 infoLen)
 {
@@ -1867,6 +1976,7 @@ static VOID HandleMbimConnect(PS23MBB_DEV_CTX ctx, UINT32 txId, UINT32 cmdType,
 
     const MBIM_SET_CONNECT_V3_HDR *req = (const MBIM_SET_CONNECT_V3_HDR *)info;
     UINT32 sid = req->SessionId;
+    UINT32 reqIpType = req->IpType;
 
     /* Extract AccessString (first TLV Type 0x000A at +0x28) */
     char apn[104] = {0};
@@ -1885,30 +1995,7 @@ static VOID HandleMbimConnect(PS23MBB_DEV_CTX ctx, UINT32 txId, UINT32 cmdType,
     }
 
     if (req->ActivationCommand == 0U) {
-        /* Deactivate */
-        if (sess->WdsHandleV4 != 0U) {
-            UINT8 sReq[7];
-            sReq[0] = 0x01U; sReq[1] = 4U; sReq[2] = 0U;
-            RtlCopyMemory(sReq + 3U, &sess->WdsHandleV4, 4U);
-            UINT16 tlvLen = 0, qRes = 0, qErr = 0;
-            (void)QmiCall(ctx, QMI_SVC_WDS, 0x0021U, sReq, sizeof(sReq),
-                          ctx->QmiTlvBuf, 512U, &tlvLen, &qRes, &qErr);
-            sess->WdsHandleV4 = 0U;
-        }
-        if (sess->WdsHandleV6 != 0U) {
-            UINT8 sReq[7];
-            sReq[0] = 0x01U; sReq[1] = 4U; sReq[2] = 0U;
-            RtlCopyMemory(sReq + 3U, &sess->WdsHandleV6, 4U);
-            UINT16 tlvLen = 0, qRes = 0, qErr = 0;
-            (void)QmiCall(ctx, QMI_SVC_WDS, 0x0021U, sReq, sizeof(sReq),
-                          ctx->QmiTlvBuf, 512U, &tlvLen, &qRes, &qErr);
-            sess->WdsHandleV6 = 0U;
-        }
-        sess->Active = FALSE;
-        sess->HasV4  = FALSE;
-        sess->HasV6  = FALSE;
-        MbbLogFmt("[WDS] Deactivated session %u\r\n", sid);
-        MbbLogFlush();
+        HandleMbimDisconnect(ctx, sess, sid);
         UINT32 len = BuildConnectV3Buf(ctx, sid, rsp, 1024U);
         SendMbimCommandDone(ctx, txId, UUID_BASIC_CONNECT, MBIM_CID_CONNECT, MBIM_STATUS_SUCCESS, rsp, len);
         return;
@@ -1924,10 +2011,12 @@ static VOID HandleMbimConnect(PS23MBB_DEV_CTX ctx, UINT32 txId, UINT32 cmdType,
                                                 NULL, &ipaDesc, NULL, &b);
     }
 
-    {
-        UINT16 tlvLen = 0, qRes = 0, qErr = 0;
-        UINT32 epType = 4U, ifaceId = 1U;
+    UINT16 tlvLen = 0, qRes = 0, qErr = 0;
+    UINT32 epType = 4U, ifaceId = 1U;
+    UINT8 bindReq[24];
+    UINT32 bp = 0U;
 
+    {
         if (!ctx->DpmPortOpened) {
             UINT32 consPipe = 2U, prodPipe = 24U;
             UINT8 dpmReq[24];
@@ -1960,9 +2049,7 @@ static VOID HandleMbimConnect(PS23MBB_DEV_CTX ctx, UINT32 txId, UINT32 cmdType,
         (void)QmiCall(ctx, QMI_SVC_WDA, 0x0020U, wdaReq, (UINT16)wp, ctx->QmiTlvBuf, 512U, &tlvLen, &qRes, &qErr);
         MbbLogFmt("[WDA] SET_DATA_FORMAT(ep=4,if=1,qmap=5) -> res=%u err=0x%x\r\n", qRes, qErr);
 
-        /* WDS_BIND_MUX_DATA_PORT (0x00A2): ep_id (0x10) + mux_id (0x11) + client_type=1 (0x13) */
-        UINT8 bindReq[24];
-        UINT32 bp = 0;
+        /* Prepare WDS_BIND_MUX_DATA_PORT (0x00A2): ep_id (0x10) + mux_id (0x11) + client_type=1 (0x13) */
         UINT32 clientType = 1U;
         bindReq[bp++] = 0x10U; bindReq[bp++] = 8U; bindReq[bp++] = 0U;
         RtlCopyMemory(bindReq + bp, &epType, 4U); bp += 4U;
@@ -1970,81 +2057,177 @@ static VOID HandleMbimConnect(PS23MBB_DEV_CTX ctx, UINT32 txId, UINT32 cmdType,
         bindReq[bp++] = 0x11U; bindReq[bp++] = 1U; bindReq[bp++] = 0U; bindReq[bp++] = (UINT8)(1U + sid);
         bindReq[bp++] = 0x13U; bindReq[bp++] = 4U; bindReq[bp++] = 0U;
         RtlCopyMemory(bindReq + bp, &clientType, 4U); bp += 4U;
-        (void)QmiCall(ctx, QMI_SVC_WDS, 0x00A2U, bindReq, (UINT16)bp, ctx->QmiTlvBuf, 512U, &tlvLen, &qRes, &qErr);
-        MbbLogFmt("[WDS] BIND_MUX_DATA_PORT(mux=%u) -> res=%u err=0x%x\r\n", 1U + sid, qRes, qErr);
     }
 
-    UINT8 startReq[140];
-    UINT32 sp = 0;
-    if (apn[0]) {
-        UINT16 alen = (UINT16)strlen(apn);
-        startReq[sp++] = 0x14U; /* APN Name */
-        RtlCopyMemory(startReq + sp, &alen, 2U); sp += 2U;
-        RtlCopyMemory(startReq + sp, apn, alen); sp += alen;
-    }
-    /* TLV 0x19: IP family pref (4=IPv4, 6=IPv6) */
-    startReq[sp++] = 0x19U; startReq[sp++] = 1U; startReq[sp++] = 0U;
-    startReq[sp++] = (req->IpType == 2U) ? 6U : 4U;
+    sess->HasV4       = FALSE;
+    sess->HasV6       = FALSE;
+    sess->WdsHandleV4 = 0U;
+    sess->WdsHandleV6 = 0U;
 
-    UINT16 tlvLen = 0, qRes = 0, qErr = 0;
-    if (!QmiCall(ctx, QMI_SVC_WDS, 0x0020U, startReq, (UINT16)sp,
-                 ctx->QmiTlvBuf, 2048U, &tlvLen, &qRes, &qErr) || qRes != 0U) {
-        MbbLogFmt("[WDS] START_NETWORK_INTERFACE('%s') fail res=%u err=0x%x\r\n", apn, qRes, qErr);
-        MbbLogFlush();
+    BOOLEAN wantV4 = (reqIpType != MBIM_CONTEXT_IP_TYPE_IPV6);
+    BOOLEAN wantV6 = (reqIpType == MBIM_CONTEXT_IP_TYPE_DEFAULT ||
+                      reqIpType == MBIM_CONTEXT_IP_TYPE_IPV6 ||
+                      reqIpType == MBIM_CONTEXT_IP_TYPE_IPV4V6 ||
+                      reqIpType == MBIM_CONTEXT_IP_TYPE_IPV4_AND_IPV6);
+    BOOLEAN v4Started = FALSE;
+    BOOLEAN v6Started = FALSE;
+
+    /* 1. IPv4 WDS Session on primary WDS client port */
+    if (wantV4) {
+        (void)QmiCall(ctx, QMI_SVC_WDS, QMI_WDS_BIND_MUX_DATA_PORT, bindReq, (UINT16)bp,
+                      ctx->QmiTlvBuf, 512U, &tlvLen, &qRes, &qErr);
+        MbbLogFmt("[WDS-V4] BIND_MUX_DATA_PORT(mux=%u) -> res=%u err=0x%x\r\n", 1U + sid, qRes, qErr);
+
+        UINT8 fam4Req[4] = { 0x01U, 1U, 0U, 0x04U };
+        (void)QmiCall(ctx, QMI_SVC_WDS, QMI_WDS_SET_IP_FAMILY_PREF, fam4Req, sizeof(fam4Req),
+                      ctx->QmiTlvBuf, 256U, &tlvLen, &qRes, &qErr);
+
+        UINT8 startReq[140];
+        UINT32 sp = 0U;
+        if (apn[0]) {
+            UINT16 alen = (UINT16)strlen(apn);
+            startReq[sp++] = 0x14U;
+            RtlCopyMemory(startReq + sp, &alen, 2U); sp += 2U;
+            RtlCopyMemory(startReq + sp, apn, alen); sp += alen;
+        }
+        startReq[sp++] = 0x19U; startReq[sp++] = 1U; startReq[sp++] = 0U; startReq[sp++] = 0x04U; /* IPv4 */
+
+        if (QmiCall(ctx, QMI_SVC_WDS, QMI_WDS_START_NET_IFACE, startReq, (UINT16)sp,
+                    ctx->QmiTlvBuf, 2048U, &tlvLen, &qRes, &qErr) && qRes == 0U) {
+            UINT16 ln01 = 0;
+            const UINT8 *v01 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x01U, &ln01);
+            sess->WdsHandleV4 = (v01 && ln01 >= 4U) ? Le32(v01) : 1U;
+            v4Started = TRUE;
+
+            UINT8 getReq[7] = { 0x10U, 4U, 0U, 0x10U, 0x1FU, 0x00U, 0x00U };
+            if (QmiCall(ctx, QMI_SVC_WDS, QMI_WDS_GET_CUR_SETTINGS, getReq, sizeof(getReq),
+                        ctx->QmiTlvBuf, 2048U, &tlvLen, &qRes, &qErr) && qRes == 0U) {
+                UINT16 l1e = 0, l20 = 0, l21 = 0, l15 = 0, l16 = 0, l29 = 0;
+                const UINT8 *v1e = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x1EU, &l1e);
+                const UINT8 *v20 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x20U, &l20);
+                const UINT8 *v21 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x21U, &l21);
+                const UINT8 *v15 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x15U, &l15);
+                const UINT8 *v16 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x16U, &l16);
+                const UINT8 *v29 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x29U, &l29);
+                if (v1e && l1e >= 4U) {
+                    sess->V4Addr[0] = v1e[3]; sess->V4Addr[1] = v1e[2]; sess->V4Addr[2] = v1e[1]; sess->V4Addr[3] = v1e[0];
+                    sess->HasV4     = TRUE;
+                    sess->V4Prefix  = 24U;
+                    if (v21 && l21 >= 4U) {
+                        UINT32 mask = Le32(v21);
+                        UINT32 pfx = 0U;
+                        while (mask & 0x80000000U) { pfx++; mask <<= 1; }
+                        if (pfx >= 1U && pfx <= 32U) sess->V4Prefix = pfx;
+                    }
+                    if (v20 && l20 >= 4U) {
+                        sess->V4Gw[0] = v20[3]; sess->V4Gw[1] = v20[2]; sess->V4Gw[2] = v20[1]; sess->V4Gw[3] = v20[0];
+                    } else {
+                        RtlCopyMemory(sess->V4Gw, sess->V4Addr, 4U);
+                    }
+                    RtlZeroMemory(sess->V4Dns1, 4U);
+                    RtlZeroMemory(sess->V4Dns2, 4U);
+                    if (v15 && l15 >= 4U) {
+                        sess->V4Dns1[0] = v15[3]; sess->V4Dns1[1] = v15[2]; sess->V4Dns1[2] = v15[1]; sess->V4Dns1[3] = v15[0];
+                    }
+                    if (v16 && l16 >= 4U) {
+                        sess->V4Dns2[0] = v16[3]; sess->V4Dns2[1] = v16[2]; sess->V4Dns2[2] = v16[1]; sess->V4Dns2[3] = v16[0];
+                    }
+                    sess->V4Mtu = (v29 && l29 >= 4U) ? Le32(v29) : 1420U;
+                    MbbLogFmt("[WDS-V4] Connected '%s': IP=%u.%u.%u.%u/%u GW=%u.%u.%u.%u MTU=%u\r\n",
+                              apn, sess->V4Addr[0], sess->V4Addr[1], sess->V4Addr[2], sess->V4Addr[3],
+                              sess->V4Prefix, sess->V4Gw[0], sess->V4Gw[1], sess->V4Gw[2], sess->V4Gw[3],
+                              sess->V4Mtu);
+                }
+            }
+        } else {
+            MbbLogFmt("[WDS-V4] START_NETWORK_INTERFACE('%s') fail res=%u err=0x%x\r\n", apn, qRes, qErr);
+        }
+    }
+
+    /* 2. IPv6 WDS Session on dedicated S23MBB_WDS_V6_CLIENT_PORT */
+    if (wantV6) {
+        (void)QmiCallPort(ctx, QMI_SVC_WDS, S23MBB_WDS_V6_CLIENT_PORT, QMI_WDS_BIND_MUX_DATA_PORT,
+                          bindReq, (UINT16)bp, ctx->QmiTlvBuf, 512U, &tlvLen, &qRes, &qErr);
+        MbbLogFmt("[WDS-V6] BIND_MUX_DATA_PORT(mux=%u) -> res=%u err=0x%x\r\n", 1U + sid, qRes, qErr);
+
+        UINT8 fam6Req[4] = { 0x01U, 1U, 0U, 0x06U };
+        (void)QmiCallPort(ctx, QMI_SVC_WDS, S23MBB_WDS_V6_CLIENT_PORT, QMI_WDS_SET_IP_FAMILY_PREF,
+                          fam6Req, sizeof(fam6Req), ctx->QmiTlvBuf, 256U, &tlvLen, &qRes, &qErr);
+        MbbLogFmt("[WDS-V6] SET_CLIENT_IP_FAMILY_PREF(6) -> res=%u err=0x%x\r\n", qRes, qErr);
+
+        UINT8 startReq6[140];
+        UINT32 sp6 = 0U;
+        if (apn[0]) {
+            UINT16 alen = (UINT16)strlen(apn);
+            startReq6[sp6++] = 0x14U;
+            RtlCopyMemory(startReq6 + sp6, &alen, 2U); sp6 += 2U;
+            RtlCopyMemory(startReq6 + sp6, apn, alen); sp6 += alen;
+        }
+        startReq6[sp6++] = 0x19U; startReq6[sp6++] = 1U; startReq6[sp6++] = 0U; startReq6[sp6++] = 0x06U; /* IPv6 */
+
+        if (QmiCallPort(ctx, QMI_SVC_WDS, S23MBB_WDS_V6_CLIENT_PORT, QMI_WDS_START_NET_IFACE,
+                        startReq6, (UINT16)sp6, ctx->QmiTlvBuf, 2048U, &tlvLen, &qRes, &qErr) && qRes == 0U) {
+            UINT16 ln01 = 0;
+            const UINT8 *v01 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x01U, &ln01);
+            sess->WdsHandleV6 = (v01 && ln01 >= 4U) ? Le32(v01) : 1U;
+            v6Started = TRUE;
+
+            /* Request settings mask 0x0001FFFF (includes IPv6 addr 0x25, gw 0x26, dns1 0x27, dns2 0x28, mtu 0x29) */
+            UINT8 getReq6[7] = { 0x10U, 4U, 0U, 0xFFU, 0xFFU, 0x01U, 0x00U };
+            if (QmiCallPort(ctx, QMI_SVC_WDS, S23MBB_WDS_V6_CLIENT_PORT, QMI_WDS_GET_CUR_SETTINGS,
+                            getReq6, sizeof(getReq6), ctx->QmiTlvBuf, 2048U, &tlvLen, &qRes, &qErr) && qRes == 0U) {
+                UINT16 l25 = 0, l26 = 0, l27 = 0, l28 = 0, l29 = 0;
+                const UINT8 *v25 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x25U, &l25); /* 16B IPv6 addr + 1B prefix */
+                const UINT8 *v26 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x26U, &l26); /* 16B IPv6 gw + 1B prefix */
+                const UINT8 *v27 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x27U, &l27); /* 16B IPv6 DNS1 */
+                const UINT8 *v28 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x28U, &l28); /* 16B IPv6 DNS2 */
+                const UINT8 *v29 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x29U, &l29); /* u32 MTU */
+                if (v25 && l25 >= 17U) {
+                    RtlCopyMemory(sess->V6Addr, v25, 16U);
+                    sess->V6Prefix = (v25[16] >= 1U && v25[16] <= 128U) ? (UINT32)v25[16] : 64U;
+                    sess->HasV6    = TRUE;
+                    if (v26 && l26 >= 16U) {
+                        RtlCopyMemory(sess->V6Gw, v26, 16U);
+                    } else {
+                        RtlCopyMemory(sess->V6Gw, sess->V6Addr, 16U);
+                    }
+                    RtlZeroMemory(sess->V6Dns1, 16U);
+                    RtlZeroMemory(sess->V6Dns2, 16U);
+                    if (v27 && l27 >= 16U) RtlCopyMemory(sess->V6Dns1, v27, 16U);
+                    if (v28 && l28 >= 16U) RtlCopyMemory(sess->V6Dns2, v28, 16U);
+                    sess->V6Mtu = (v29 && l29 >= 4U) ? Le32(v29) : 1420U;
+                    MbbLogFmt("[WDS-V6] Connected '%s': Prefix=%u MTU=%u\r\n",
+                              apn, sess->V6Prefix, sess->V6Mtu);
+                }
+            }
+        } else {
+            MbbLogFmt("[WDS-V6] START_NETWORK_INTERFACE('%s') res=%u err=0x%x (dual-stack optional=%u)\r\n",
+                      apn, qRes, qErr, (reqIpType != MBIM_CONTEXT_IP_TYPE_IPV6) ? 1U : 0U);
+        }
+    }
+
+    if ((reqIpType == MBIM_CONTEXT_IP_TYPE_IPV6 && !v6Started) ||
+        (reqIpType == MBIM_CONTEXT_IP_TYPE_IPV4 && !v4Started) ||
+        (!v4Started && !v6Started)) {
+        HandleMbimDisconnect(ctx, sess, sid);
         UINT32 len = BuildConnectV3Buf(ctx, sid, rsp, 1024U);
         SendMbimCommandDone(ctx, txId, UUID_BASIC_CONNECT, MBIM_CID_CONNECT, MBIM_STATUS_NOT_REGISTERED, rsp, len);
         return;
     }
 
-    UINT16 ln01 = 0;
-    const UINT8 *v01 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x01U, &ln01);
-    sess->WdsHandleV4 = (v01 && ln01 >= 4U) ? Le32(v01) : 1U;
-    sess->Active      = TRUE;
-    sess->IpType      = (req->IpType == 2U) ? 2U : 1U;
+    sess->Active = TRUE;
+    if (v4Started && v6Started) {
+        sess->IpType = (reqIpType == MBIM_CONTEXT_IP_TYPE_IPV4_AND_IPV6)
+                           ? MBIM_CONTEXT_IP_TYPE_IPV4_AND_IPV6
+                           : MBIM_CONTEXT_IP_TYPE_IPV4V6;
+    } else if (v6Started) {
+        sess->IpType = MBIM_CONTEXT_IP_TYPE_IPV6;
+    } else {
+        sess->IpType = MBIM_CONTEXT_IP_TYPE_IPV4;
+    }
     RtlCopyMemory(sess->ContextType, req->ContextType, 16U);
     RtlZeroMemory(sess->ApnAscii, sizeof(sess->ApnAscii));
     if (apn[0]) RtlCopyMemory(sess->ApnAscii, apn, strlen(apn));
-
-    /* Query WDS_GET_CURRENT_SETTINGS (0x002D) for IPv4 addr/gw/mask/dns/mtu */
-    UINT8 getReq[7] = { 0x10U, 4U, 0U, 0x10U, 0x1FU, 0x00U, 0x00U }; /* mask: IPv4 addr+gw+dns+mtu */
-    if (QmiCall(ctx, QMI_SVC_WDS, 0x002DU, getReq, sizeof(getReq),
-                ctx->QmiTlvBuf, 2048U, &tlvLen, &qRes, &qErr) && qRes == 0U) {
-        UINT16 l1e = 0, l20 = 0, l21 = 0, l15 = 0, l16 = 0, l29 = 0;
-        const UINT8 *v1e = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x1EU, &l1e); /* IPv4 addr (LE u32) */
-        const UINT8 *v20 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x20U, &l20); /* IPv4 gw */
-        const UINT8 *v21 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x21U, &l21); /* IPv4 subnet mask */
-        const UINT8 *v15 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x15U, &l15); /* DNS1 */
-        const UINT8 *v16 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x16U, &l16); /* DNS2 */
-        const UINT8 *v29 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x29U, &l29); /* MTU */
-        if (v1e && l1e >= 4U) {
-            /* QMI WDS IPv4 is host-order LE u32 -> convert to network byte order */
-            sess->V4Addr[0] = v1e[3]; sess->V4Addr[1] = v1e[2]; sess->V4Addr[2] = v1e[1]; sess->V4Addr[3] = v1e[0];
-            sess->HasV4     = TRUE;
-            sess->V4Prefix  = 24U;
-            if (v21 && l21 >= 4U) {
-                UINT32 mask = Le32(v21);
-                UINT32 pfx = 0U;
-                while (mask & 0x80000000U) { pfx++; mask <<= 1; }
-                if (pfx >= 1U && pfx <= 32U) sess->V4Prefix = pfx;
-            }
-            if (v20 && l20 >= 4U) {
-                sess->V4Gw[0] = v20[3]; sess->V4Gw[1] = v20[2]; sess->V4Gw[2] = v20[1]; sess->V4Gw[3] = v20[0];
-            } else {
-                RtlCopyMemory(sess->V4Gw, sess->V4Addr, 4U);
-            }
-            if (v15 && l15 >= 4U) {
-                sess->V4Dns1[0] = v15[3]; sess->V4Dns1[1] = v15[2]; sess->V4Dns1[2] = v15[1]; sess->V4Dns1[3] = v15[0];
-            }
-            if (v16 && l16 >= 4U) {
-                sess->V4Dns2[0] = v16[3]; sess->V4Dns2[1] = v16[2]; sess->V4Dns2[2] = v16[1]; sess->V4Dns2[3] = v16[0];
-            }
-            sess->V4Mtu = (v29 && l29 >= 4U) ? Le32(v29) : 1420U;
-            MbbLogFmt("[WDS] Connected '%s': IP=%u.%u.%u.%u/%u GW=%u.%u.%u.%u MTU=%u\r\n",
-                      apn, sess->V4Addr[0], sess->V4Addr[1], sess->V4Addr[2], sess->V4Addr[3],
-                      sess->V4Prefix, sess->V4Gw[0], sess->V4Gw[1], sess->V4Gw[2], sess->V4Gw[3],
-                      sess->V4Mtu);
-        }
-    }
     MbbLogFlush();
 
     UINT32 len = BuildConnectV3Buf(ctx, sid, rsp, 1024U);
@@ -3022,7 +3205,9 @@ static VOID DispatchMbimCommand(PS23MBB_DEV_CTX ctx, const UINT8 *msg, UINT32 ms
         ps.UplinkSpeed               = reg ? 100000000ULL : 0ULL;
         ps.DownlinkSpeed             = reg ? 500000000ULL : 0ULL;
         ps.FrequencyRange            = (ps.HighestAvailableDataClass & MBIM_DATA_CLASS_5G) ? 1U : 0U;
-        ps.CurrentDataSubClass       = (ps.HighestAvailableDataClass & MBIM_DATA_CLASS_5G) ? 2U : 0U;
+        ps.CurrentDataSubClass       = (ps.HighestAvailableDataClass & MBIM_DATA_CLASS_5G)
+                                           ? (ctx->LastDataSubClass ? ctx->LastDataSubClass : MBIM_DATA_SUBCLASS_5G_ENDC)
+                                           : MBIM_DATA_SUBCLASS_NONE;
         ps.TaiMcc                    = (UINT16)ctx->LastMcc;
         ps.TaiMnc                    = (UINT16)ctx->LastMnc;
         SendMbimCommandDone(ctx, txId, svc, cid, MBIM_STATUS_SUCCESS, (const UINT8 *)&ps, sizeof(ps));
@@ -3042,10 +3227,22 @@ static VOID DispatchMbimCommand(PS23MBB_DEV_CTX ctx, const UINT8 *msg, UINT32 ms
 
         UINT16 tlvLen = 0, qRes = 0, qErr = 0;
         if (ctx->SwRadioState &&
-            QmiCall(ctx, QMI_SVC_NAS, 0x004FU, NULL, 0, ctx->QmiTlvBuf, 1024U, &tlvLen, &qRes, &qErr) && qRes == 0U) {
-            UINT16 ln14 = 0;
-            const UINT8 *v14 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x14U, &ln14);
-            if (v14 && ln14 >= 6U) {
+            QmiCall(ctx, QMI_SVC_NAS, QMI_NAS_GET_SIG_INFO, NULL, 0, ctx->QmiTlvBuf, 1024U, &tlvLen, &qRes, &qErr) && qRes == 0U) {
+            UINT16 ln14 = 0, ln17 = 0;
+            const UINT8 *v14 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x14U, &ln14); /* LTE signal info */
+            const UINT8 *v17 = QmiFindTlv(ctx->QmiTlvBuf, tlvLen, 0x17U, &ln17); /* 5G NR signal info (i16 rsrp, i16 snr) */
+            if (v17 && ln17 >= 4U && (!v14 || (ctx->LastDataClass & MBIM_DATA_CLASS_5G) != 0U)) {
+                INT16 nrRsrp = LeS16(v17);
+                if (nrRsrp >= -44 && nrRsrp <= -20) {
+                    ss.Rssi = 31U;
+                } else if (nrRsrp >= -140 && nrRsrp < -44) {
+                    ss.Rssi = (UINT32)(((INT32)nrRsrp + 140) * 31 / 96);
+                    if (ss.Rssi == 0U) ss.Rssi = 1U;
+                } else if (nrRsrp < -140 && nrRsrp >= -160) {
+                    ss.Rssi = 0U;
+                }
+            }
+            if (ss.Rssi == 99U && v14 && ln14 >= 6U) {
                 INT8 rssiDbm = (INT8)v14[0];
                 if (rssiDbm <= -51 && rssiDbm >= -113) {
                     ss.Rssi = (UINT32)((rssiDbm + 113) / 2);
@@ -3216,8 +3413,9 @@ static VOID S23MbbWorkerThreadProc(PVOID Context)
                 ctx->LastNasPollTime = now;
                 UINT32 prevReg = ctx->LastRegState;
                 UINT32 prevDc  = ctx->LastDataClass;
+                UINT32 prevSub = ctx->LastDataSubClass;
                 UINT32 nl = BuildRegisterStateV3Buf(ctx, ctx->MbimRspBuf, 512U);
-                if (ctx->LastRegState != prevReg || ctx->LastDataClass != prevDc) {
+                if (ctx->LastRegState != prevReg || ctx->LastDataClass != prevDc || ctx->LastDataSubClass != prevSub) {
                     SendMbimIndicateStatus(ctx, UUID_BASIC_CONNECT, MBIM_CID_REGISTER_STATE, ctx->MbimRspBuf, nl);
                     MBIM_PACKET_SERVICE_V3_WIRE ps;
                     RtlZeroMemory(&ps, sizeof(ps));
@@ -3227,12 +3425,14 @@ static VOID S23MbbWorkerThreadProc(PVOID Context)
                     ps.UplinkSpeed               = reg ? 100000000ULL : 0ULL;
                     ps.DownlinkSpeed             = reg ? 500000000ULL : 0ULL;
                     ps.FrequencyRange            = (ps.HighestAvailableDataClass & MBIM_DATA_CLASS_5G) ? 1U : 0U;
-                    ps.CurrentDataSubClass       = (ps.HighestAvailableDataClass & MBIM_DATA_CLASS_5G) ? 2U : 0U;
+                    ps.CurrentDataSubClass       = (ps.HighestAvailableDataClass & MBIM_DATA_CLASS_5G)
+                                                       ? (ctx->LastDataSubClass ? ctx->LastDataSubClass : MBIM_DATA_SUBCLASS_5G_ENDC)
+                                                       : MBIM_DATA_SUBCLASS_NONE;
                     ps.TaiMcc                    = (UINT16)ctx->LastMcc;
                     ps.TaiMnc                    = (UINT16)ctx->LastMnc;
                     SendMbimIndicateStatus(ctx, UUID_BASIC_CONNECT, MBIM_CID_PACKET_SERVICE, (const UINT8 *)&ps, sizeof(ps));
-                    MbbLogFmt("[NAS] Registration transition %u->%u dc=0x%x -> indicated WwanSvc\r\n",
-                              prevReg, ctx->LastRegState, ctx->LastDataClass);
+                    MbbLogFmt("[NAS] Registration transition %u->%u dc=0x%x sub=0x%x -> indicated WwanSvc\r\n",
+                              prevReg, ctx->LastRegState, ctx->LastDataClass, ctx->LastDataSubClass);
                     MbbLogFlush();
                 }
             }

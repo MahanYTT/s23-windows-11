@@ -12,11 +12,13 @@
  *   - QMI WMS (0x05): SMS routes & status
  */
 #include <windows.h>
+#include <winhttp.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include "s23modem_xprt.h"
+#include "qmi_tlv.h"
 
 #define QMI_SVC_WDS     0x01U
 #define QMI_SVC_DMS     0x02U
@@ -30,13 +32,32 @@
 #define CLIENT_PORT_BASE 0x4100U
 
 static uint16_t Le16(const uint8_t *p) {
-    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+    return qmi_get_le16(p);
 }
 static uint32_t Le32(const uint8_t *p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    return qmi_get_le32(p);
 }
 static int16_t LeS16(const uint8_t *p) {
-    return (int16_t)Le16(p);
+    return (int16_t)qmi_get_le16(p);
+}
+
+static void QmiResultCheck(const uint8_t *tlvs, uint16_t tlvLen, uint16_t *outRes, uint16_t *outErr) {
+    uint16_t qRes = 0U, qErr = 0U;
+    qmi_tlv_t resTlv;
+    if (qmi_tlv_find(tlvs, (size_t)tlvLen, QMI_RESULT_TLV, &resTlv) == 1) {
+        (void)qmi_result_decode(resTlv.value, (size_t)resTlv.len, &qRes, &qErr);
+    } else {
+        qmi_tlv_iter_t it;
+        qmi_tlv_t t;
+        qmi_tlv_iter_init(&it, tlvs, (size_t)tlvLen);
+        while (qmi_tlv_next(&it, &t) == 1) {
+            if (t.type == QMI_RESULT_TLV && t.len == 4U) {
+                (void)qmi_result_decode(t.value, (size_t)t.len, &qRes, &qErr);
+            }
+        }
+    }
+    if (outRes) *outRes = qRes;
+    if (outErr) *outErr = qErr;
 }
 
 static int FindQrtrServer(const S23MODEM_STATUS_INFO *st, uint32_t svc, uint32_t *outNode, uint32_t *outPort) {
@@ -115,20 +136,7 @@ static int QmiTransactionEx(HANDLE hDev, const S23MODEM_STATUS_INFO *st,
                 uint32_t cp = (rLen < outTlvCap) ? rLen : outTlvCap;
                 memcpy(outTlvBuf, rx.Payload + 7U, cp);
             }
-            uint16_t qRes = 0U, qErr = 0U;
-            uint32_t off = 0U;
-            const uint8_t *tlvs = rx.Payload + 7U;
-            while (off + 3U <= rLen) {
-                uint8_t t = tlvs[off]; uint16_t ln = Le16(tlvs + off + 1U); off += 3U;
-                if (off + ln > rLen) break;
-                if (t == 0x02U && ln >= 4U) {
-                    qRes = Le16(tlvs + off);
-                    qErr = Le16(tlvs + off + 2U);
-                }
-                off += ln;
-            }
-            if (outQmiResult) *outQmiResult = qRes;
-            if (outQmiError)  *outQmiError  = qErr;
+            QmiResultCheck(rx.Payload + 7U, rLen, outQmiResult, outQmiError);
             return 1;
         }
     }
@@ -177,17 +185,18 @@ static int QmiWaitIndication(HANDLE hDev, uint32_t svc, uint16_t msgId,
 }
 
 static const uint8_t *FindTlv(const uint8_t *tlvs, uint16_t tlvLen, uint8_t targetType, uint16_t *outLen) {
-    uint32_t off = 0U;
-    while (off + 3U <= tlvLen) {
-        uint8_t  t  = tlvs[off];
-        uint16_t ln = Le16(tlvs + off + 1U);
-        off += 3U;
-        if (off + ln > tlvLen) break;
-        if (t == targetType) {
-            if (outLen) *outLen = ln;
-            return tlvs + off;
+    qmi_tlv_t t;
+    if (qmi_tlv_find(tlvs, (size_t)tlvLen, targetType, &t) == 1) {
+        if (outLen) *outLen = t.len;
+        return t.value;
+    }
+    qmi_tlv_iter_t it;
+    qmi_tlv_iter_init(&it, tlvs, (size_t)tlvLen);
+    while (qmi_tlv_next(&it, &t) == 1) {
+        if (t.type == targetType) {
+            if (outLen) *outLen = t.len;
+            return t.value;
         }
-        off += ln;
     }
     if (outLen) *outLen = 0U;
     return NULL;
@@ -217,20 +226,18 @@ static void FormatHex(const uint8_t *buf, uint32_t len, char *outStr, uint32_t o
 
 static void DumpRawTlvs(const char *label, const uint8_t *tlvs, uint16_t tlvLen) {
     printf("  [RAW TLVs] %s (len=%u):\n", label, tlvLen);
-    uint32_t off = 0U;
-    while (off + 3U <= tlvLen) {
-        uint8_t  t  = tlvs[off];
-        uint16_t ln = Le16(tlvs + off + 1U);
-        off += 3U;
-        if (off + ln > tlvLen) {
-            printf("    [CORRUPT: tag=0x%02X len=%u remaining=%u]\n", t, ln, tlvLen - off);
-            break;
-        }
+    qmi_tlv_iter_t it;
+    qmi_tlv_t t;
+    int r;
+    qmi_tlv_iter_init(&it, tlvs, (size_t)tlvLen);
+    while ((r = qmi_tlv_next(&it, &t)) == 1) {
         char h[260] = {0};
-        uint32_t showLen = (ln < 128U) ? ln : 128U;
-        FormatHex(tlvs + off, showLen, h, sizeof(h));
-        printf("    Tag 0x%02X: len=%u val=%s%s\n", t, ln, h, (ln > 128U) ? "..." : "");
-        off += ln;
+        uint32_t showLen = (t.len < 128U) ? t.len : 128U;
+        FormatHex(t.value, showLen, h, sizeof(h));
+        printf("    Tag 0x%02X: len=%u val=%s%s\n", t.type, t.len, h, (t.len > 128U) ? "..." : "");
+    }
+    if (r < 0) {
+        printf("    [CORRUPT: offset=%u remaining=%u]\n", (unsigned)it.off, (unsigned)(tlvLen - it.off));
     }
 }
 
@@ -1381,6 +1388,316 @@ static int EsimRemoveNotification(HANDLE hDev, const S23MODEM_STATUS_INFO *st, u
     return 0;
 }
 
+static uint32_t Base64EncodeBytes(const uint8_t *src, uint32_t srcLen, char *dst, uint32_t dstCap) {
+    static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    uint32_t outPos = 0U;
+    for (uint32_t i = 0U; i < srcLen; i += 3U) {
+        if (outPos + 5U > dstCap) break;
+        uint32_t v = ((uint32_t)src[i] << 16);
+        if (i + 1U < srcLen) v |= ((uint32_t)src[i + 1U] << 8);
+        if (i + 2U < srcLen) v |= (uint32_t)src[i + 2U];
+        dst[outPos++] = b64[(v >> 18) & 0x3FU];
+        dst[outPos++] = b64[(v >> 12) & 0x3FU];
+        dst[outPos++] = (i + 1U < srcLen) ? b64[(v >> 6) & 0x3FU] : '=';
+        dst[outPos++] = (i + 2U < srcLen) ? b64[v & 0x3FU] : '=';
+    }
+    if (outPos < dstCap) dst[outPos] = '\0';
+    return outPos;
+}
+
+static int Es9PlusDeliverPendingNotification(const char *notifAddr, const char *b64Pending, DWORD *outHttpStatus) {
+    if (outHttpStatus) *outHttpStatus = 0U;
+    if (!notifAddr || !notifAddr[0] || !b64Pending || !b64Pending[0]) return 0;
+
+    const char *hostStart = notifAddr;
+    if (_strnicmp(hostStart, "https://", 8) == 0) hostStart += 8;
+    else if (_strnicmp(hostStart, "http://", 7) == 0) hostStart += 7;
+
+    char hostA[256] = {0};
+    INTERNET_PORT port = INTERNET_DEFAULT_HTTPS_PORT;
+    const char *slash = strchr(hostStart, '/');
+    size_t hostPartLen = slash ? (size_t)(slash - hostStart) : strlen(hostStart);
+    if (hostPartLen == 0U || hostPartLen >= sizeof(hostA)) return 0;
+    memcpy(hostA, hostStart, hostPartLen);
+    hostA[hostPartLen] = '\0';
+
+    char *colon = strchr(hostA, ':');
+    if (colon) {
+        *colon = '\0';
+        unsigned long p = strtoul(colon + 1, NULL, 10);
+        if (p > 0UL && p <= 65535UL) port = (INTERNET_PORT)p;
+    }
+
+    WCHAR hostW[256] = {0};
+    if (MultiByteToWideChar(CP_UTF8, 0, hostA, -1, hostW, 256) <= 0) return 0;
+
+    size_t b64Len = strlen(b64Pending);
+    size_t jsonCap = b64Len + 64U;
+    char *jsonBody = (char *)malloc(jsonCap);
+    if (!jsonBody) return 0;
+    int jsonLen = snprintf(jsonBody, jsonCap, "{\"pendingNotification\":\"%s\"}", b64Pending);
+    if (jsonLen <= 0 || (size_t)jsonLen >= jsonCap) {
+        free(jsonBody);
+        return 0;
+    }
+
+    HINTERNET hSession = WinHttpOpen(L"gsma-rsp-lpad",
+                                     WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                     WINHTTP_NO_PROXY_NAME,
+                                     WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) {
+        free(jsonBody);
+        return 0;
+    }
+    WinHttpSetTimeouts(hSession, 10000, 10000, 15000, 15000);
+
+    HINTERNET hConnect = WinHttpConnect(hSession, hostW, port, 0);
+    if (!hConnect) {
+        WinHttpCloseHandle(hSession);
+        free(jsonBody);
+        return 0;
+    }
+
+    static const WCHAR kEs9Path[] = L"/gsma/rsp2/es9plus/handleNotification";
+    static const WCHAR kEs9Hdrs[] =
+        L"Content-Type: application/json\r\n"
+        L"User-Agent: gsma-rsp-lpad\r\n"
+        L"X-Admin-Protocol: gsma/rsp/v2.2.0\r\n";
+
+    DWORD statusCode = 0U;
+    int delivered = 0;
+
+    for (int pass = 0; pass < 2; pass++) {
+        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", kEs9Path,
+                                                NULL, WINHTTP_NO_REFERER,
+                                                WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                                WINHTTP_FLAG_SECURE);
+        if (!hRequest) break;
+
+        if (pass == 1) {
+            /* Fallback for GSMA CI-signed SM-DP+ certificates not in Windows Root store */
+            DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+                             SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+                             SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
+            WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
+        }
+
+        BOOL sent = WinHttpSendRequest(hRequest, kEs9Hdrs, (DWORD)-1L,
+                                       (LPVOID)jsonBody, (DWORD)jsonLen, (DWORD)jsonLen, 0);
+        if (!sent) {
+            DWORD err = GetLastError();
+            WinHttpCloseHandle(hRequest);
+            if (pass == 0 && err == ERROR_WINHTTP_SECURE_FAILURE) continue;
+            printf("  [ES9+ WinHTTP] WinHttpSendRequest to %s failed (err=%lu)\n", hostA, err);
+            break;
+        }
+        if (!WinHttpReceiveResponse(hRequest, NULL)) {
+            DWORD err = GetLastError();
+            WinHttpCloseHandle(hRequest);
+            if (pass == 0 && err == ERROR_WINHTTP_SECURE_FAILURE) continue;
+            printf("  [ES9+ WinHTTP] WinHttpReceiveResponse from %s failed (err=%lu)\n", hostA, err);
+            break;
+        }
+
+        DWORD sz = sizeof(statusCode);
+        if (WinHttpQueryHeaders(hRequest,
+                                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                WINHTTP_HEADER_NAME_BY_INDEX,
+                                &statusCode, &sz, WINHTTP_NO_HEADER_INDEX)) {
+            if (outHttpStatus) *outHttpStatus = statusCode;
+            delivered = (statusCode == 200U || statusCode == 204U);
+        }
+        WinHttpCloseHandle(hRequest);
+        break;
+    }
+
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    free(jsonBody);
+    return delivered;
+}
+
+static int EsimRetrieveSinglePendingNotifTlv(HANDLE hDev, const S23MODEM_STATUS_INFO *st,
+                                             uint8_t slot, uint8_t channelId, uint64_t seq,
+                                             uint8_t *outTlv, uint32_t outCap, uint32_t *outTlvLen) {
+    *outTlvLen = 0U;
+    uint8_t seqBytes[9];
+    uint8_t sn = BuildSignedBigEndianSeq(seq, seqBytes);
+    uint8_t *rsp = (uint8_t *)malloc(16384U);
+    if (!rsp) return 0;
+
+    /* Try SGP.22 searchCriteria [A0 -> [80 seqNumber]] first, then implicit [80 seqNumber] fallback */
+    for (int mode = 0; mode < 2; mode++) {
+        uint8_t cmd[28];
+        uint32_t pos = 0U;
+        cmd[pos++] = EsimPropCla(channelId); cmd[pos++] = 0xE2U; cmd[pos++] = 0x91U; cmd[pos++] = 0x00U;
+        if (mode == 0) {
+            cmd[pos++] = (uint8_t)(7U + sn); /* Lc */
+            cmd[pos++] = 0xBFU; cmd[pos++] = 0x2BU; cmd[pos++] = (uint8_t)(4U + sn);
+            cmd[pos++] = 0xA0U; cmd[pos++] = (uint8_t)(2U + sn);
+            cmd[pos++] = 0x80U; cmd[pos++] = sn;
+        } else {
+            cmd[pos++] = (uint8_t)(5U + sn); /* Lc */
+            cmd[pos++] = 0xBFU; cmd[pos++] = 0x2BU; cmd[pos++] = (uint8_t)(2U + sn);
+            cmd[pos++] = 0x80U; cmd[pos++] = sn;
+        }
+        memcpy(cmd + pos, seqBytes, sn); pos += sn;
+        cmd[pos++] = 0x00U; /* Le */
+
+        uint32_t rspLen = 0U;
+        if (!UimTransceiveApdu(hDev, st, slot, channelId, cmd, (uint16_t)pos, rsp, 16384U, &rspLen) || rspLen < 2U) {
+            continue;
+        }
+        uint8_t sw1 = rsp[rspLen - 2U], sw2 = rsp[rspLen - 1U];
+        uint32_t rpos = 0U, tag = 0U, vlen = 0U;
+        const uint8_t *val = NULL;
+        if (sw1 == 0x90U && sw2 == 0x00U && ReadBerTlv(rsp, rspLen - 2U, &rpos, &tag, &val, &vlen) && tag == 0xBF2BU) {
+            uint32_t lpos = 0U, ltag = 0U, llen = 0U;
+            const uint8_t *lval = NULL;
+            if (ReadBerTlv(val, vlen, &lpos, &ltag, &lval, &llen) && ltag == 0xA0U) {
+                uint32_t epos = 0U;
+                while (epos < llen) {
+                    uint32_t elemStart = epos;
+                    uint32_t etag = 0U, elen = 0U;
+                    const uint8_t *eval = NULL;
+                    if (!ReadBerTlv(lval, llen, &epos, &etag, &eval, &elen)) break;
+                    uint32_t fullLen = epos - elemStart;
+                    if ((etag == 0xBF30U || etag == 0xA0U) && fullLen > 0U && fullLen <= outCap) {
+                        memcpy(outTlv, lval + elemStart, fullLen);
+                        *outTlvLen = fullLen;
+                        free(rsp);
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
+    free(rsp);
+    return 0;
+}
+
+/* Automated GSMA SGP.22 ES9+ HandleNotification delivery over WinHTTP (--esim-flush-notifs [slot]) */
+static void EsimFlushNotifications(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t slot) {
+    printf("=== [GSMA SGP.22 ES10b/ES9+ Notification Flush on Logical Slot %u] ===\n", slot);
+    static const uint8_t isdrAid[16] = {
+        0xA0, 0x00, 0x00, 0x05, 0x59, 0x10, 0x10, 0xFF,
+        0xFF, 0xFF, 0xFF, 0x89, 0x00, 0x00, 0x01, 0x00
+    };
+    uint8_t chId = 0U;
+    if (!UimOpenLogicalChannel(hDev, st, slot, isdrAid, sizeof(isdrAid), &chId)) {
+        if (slot == 2U && SwitchUimSlot(hDev, st, 2U, 3U)) {
+            Sleep(1200);
+            (void)UimOpenLogicalChannel(hDev, st, slot, isdrAid, sizeof(isdrAid), &chId);
+        }
+    }
+    if (chId == 0U) {
+        printf("  [eSIM Flush] Could not open ISD-R logical channel on slot %u\n", slot);
+        return;
+    }
+
+    uint8_t *rsp = (uint8_t *)malloc(16384U);
+    uint8_t *notifTlv = (uint8_t *)malloc(16384U);
+    char    *b64Buf   = (char *)malloc(24576U);
+    if (!rsp || !notifTlv || !b64Buf) {
+        if (rsp) free(rsp);
+        if (notifTlv) free(notifTlv);
+        if (b64Buf) free(b64Buf);
+        UimCloseLogicalChannel(hDev, st, slot, chId);
+        return;
+    }
+
+    typedef struct {
+        uint64_t seq;
+        uint8_t  opByte;
+        char     addr[256];
+    } NotifItem;
+    NotifItem items[32];
+    uint32_t itemCount = 0U;
+
+    uint32_t rspLen = 0U;
+    uint8_t cmdList[9] = { EsimPropCla(chId), 0xE2U, 0x91U, 0x00U, 0x03U, 0xBFU, 0x28U, 0x00U, 0x00U };
+    if (UimTransceiveApdu(hDev, st, slot, chId, cmdList, sizeof(cmdList), rsp, 16384U, &rspLen) && rspLen >= 2U) {
+        uint8_t sw1 = rsp[rspLen - 2U], sw2 = rsp[rspLen - 1U];
+        uint32_t pos = 0U, tag = 0U, vlen = 0U;
+        const uint8_t *val = NULL;
+        if (sw1 == 0x90U && sw2 == 0x00U && ReadBerTlv(rsp, rspLen - 2U, &pos, &tag, &val, &vlen) && tag == 0xBF28U) {
+            uint32_t lpos = 0U, ltag = 0U, llen = 0U;
+            const uint8_t *lval = NULL;
+            if (ReadBerTlv(val, vlen, &lpos, &ltag, &lval, &llen) && ltag == 0xA0U) {
+                uint32_t epos = 0U, etag = 0U, elen = 0U;
+                const uint8_t *eval = NULL;
+                while (ReadBerTlv(lval, llen, &epos, &etag, &eval, &elen) && itemCount < 32U) {
+                    if (etag == 0xBF2FU) {
+                        NotifItem *it = &items[itemCount];
+                        ZeroMemory(it, sizeof(*it));
+                        int hasSeq = 0;
+                        uint32_t fpos = 0U, ftag = 0U, flen = 0U;
+                        const uint8_t *fval = NULL;
+                        while (ReadBerTlv(eval, elen, &fpos, &ftag, &fval, &flen)) {
+                            if (ftag == 0x80U && flen > 0U) {
+                                it->seq = ParseBigEndianUint(fval, flen);
+                                hasSeq = 1;
+                            } else if (ftag == 0x81U && flen >= 2U) {
+                                it->opByte = fval[1];
+                            } else if (ftag == 0x0CU && flen > 0U) {
+                                uint32_t cp = (flen < sizeof(it->addr) - 1U) ? flen : (uint32_t)(sizeof(it->addr) - 1U);
+                                memcpy(it->addr, fval, cp);
+                                it->addr[cp] = '\0';
+                            }
+                        }
+                        if (hasSeq) {
+                            char pfx[32];
+                            snprintf(pfx, sizeof(pfx), "[Pending #%u]", itemCount + 1U);
+                            PrintNotificationMetadata(pfx, eval, elen);
+                            itemCount++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (itemCount == 0U) {
+        printf("  [eSIM Flush] 0 pending notifications on eUICC.\n");
+    } else {
+        uint32_t flushedCount = 0U;
+        for (uint32_t i = 0U; i < itemCount; i++) {
+            NotifItem *it = &items[i];
+            if (!it->addr[0]) {
+                printf("  [eSIM Flush] seq=%llu has empty notificationAddress -> skipping HTTP POST\n",
+                       (unsigned long long)it->seq);
+                continue;
+            }
+            uint32_t tlvBytes = 0U;
+            if (!EsimRetrieveSinglePendingNotifTlv(hDev, st, slot, chId, it->seq, notifTlv, 16384U, &tlvBytes) || tlvBytes == 0U) {
+                printf("  [eSIM Flush] seq=%llu RetrieveNotificationsList (BF2B) returned no PendingNotification TLV\n",
+                       (unsigned long long)it->seq);
+                continue;
+            }
+            Base64EncodeBytes(notifTlv, tlvBytes, b64Buf, 24576U);
+            DWORD httpStatus = 0U;
+            printf("  [eSIM Flush] POST https://%s/gsma/rsp2/es9plus/handleNotification (seq=%llu op=0x%02x tlv=%u B)...\n",
+                   it->addr, (unsigned long long)it->seq, it->opByte, tlvBytes);
+            if (Es9PlusDeliverPendingNotification(it->addr, b64Buf, &httpStatus)) {
+                printf("  [eSIM Flush] ES9+ HandleNotification HTTP %lu OK -> calling RemoveNotificationFromList (BF30 seq=%llu)\n",
+                       httpStatus, (unsigned long long)it->seq);
+                if (EsimRemoveNotification(hDev, st, slot, chId, it->seq)) {
+                    flushedCount++;
+                }
+            } else {
+                printf("  [eSIM Flush] ES9+ HandleNotification failed (HTTP status=%lu) -> keeping seq=%llu on eUICC\n",
+                       httpStatus, (unsigned long long)it->seq);
+            }
+        }
+        printf("  [eSIM Flush] Summary: %u/%u notification(s) delivered & removed.\n", flushedCount, itemCount);
+    }
+
+    free(b64Buf);
+    free(notifTlv);
+    free(rsp);
+    UimCloseLogicalChannel(hDev, st, slot, chId);
+}
+
 static void QueryEsimEuiccViaApdu(HANDLE hDev, const S23MODEM_STATUS_INFO *st, uint8_t slot,
                                   const char *enableIccid, const char *disableIccid,
                                   const char *deleteIccid, const char *deleteAidHex,
@@ -1547,6 +1864,83 @@ static const char *NasRadioIfName(uint8_t r) {
         case 0x08U: return "LTE";
         case 0x0CU: return "5G_NR";
         default:    return "RADIO";
+    }
+}
+
+/* QMI_NAS_SET_SYSTEM_SELECTION_PREFERENCE (0x0033): TLV 0x10 u16 mode_pref */
+static void SetNasRatPreference(HANDLE hDev, const S23MODEM_STATUS_INFO *st, const char *ratMode) {
+    uint16_t modePref = 0x0054U; /* WCDMA (0x04) | LTE (0x10) | NR5G (0x40) */
+    const char *label = "auto/5g (WCDMA|LTE|NR5G = 0x0054)";
+    if (!ratMode || _stricmp(ratMode, "auto") == 0 || _stricmp(ratMode, "5g") == 0) {
+        modePref = 0x0054U;
+    } else if (_stricmp(ratMode, "lte") == 0) {
+        modePref = 0x0014U; /* WCDMA (0x04) | LTE (0x10) */
+        label = "lte (WCDMA|LTE = 0x0014)";
+    } else {
+        printf("  [NAS] Invalid --set-rat mode '%s' (expected: auto, 5g, or lte)\n", ratMode);
+        return;
+    }
+
+    printf("=== [QMI NAS 0x03] NAS_SET_SYSTEM_SELECTION_PREFERENCE (0x0033 -> %s) ===\n", label);
+    uint8_t req[16];
+    size_t rpos = 0U;
+    uint8_t modeBytes[2];
+    qmi_put_le16(modeBytes, modePref);
+    (void)qmi_tlv_put(req, sizeof(req), &rpos, 0x10U, modeBytes, sizeof(modeBytes));
+
+    uint8_t tlvs[1024];
+    uint16_t tlvLen = 0, qRes = 0, qErr = 0;
+    if (QmiTransaction(hDev, st, QMI_SVC_NAS, 0x0033U, req, (uint16_t)rpos, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+        printf("  [NAS 0x0033 SET_SYS_SEL_PREF(0x%04x)] res=%u err=0x%x\n", modePref, qRes, qErr);
+    } else {
+        printf("  [NAS 0x0033 SET_SYS_SEL_PREF] timed out\n");
+    }
+
+    if (QmiTransaction(hDev, st, QMI_SVC_NAS, 0x0034U, NULL, 0, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+        uint16_t ln11 = 0;
+        const uint8_t *v11 = FindTlv(tlvs, tlvLen, 0x11U, &ln11);
+        printf("  [NAS 0x0034 GET_SYS_SEL_PREF] res=%u err=0x%x cur_mode_pref=0x%04x\n",
+               qRes, qErr, (v11 && ln11 >= 2U) ? Le16(v11) : 0U);
+        DumpRawTlvs("NAS_GET_SYS_SEL_PREF", tlvs, tlvLen);
+    }
+}
+
+static void FormatIpv6Str(const uint8_t ip6[16], char *outStr, size_t outCap) {
+    snprintf(outStr, outCap,
+             "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+             ip6[0], ip6[1], ip6[2], ip6[3], ip6[4], ip6[5], ip6[6], ip6[7],
+             ip6[8], ip6[9], ip6[10], ip6[11], ip6[12], ip6[13], ip6[14], ip6[15]);
+}
+
+static void PrintWdsIpv6SettingsTlvs(const uint8_t *tlvs, uint16_t tlvLen) {
+    uint16_t l25 = 0, l26 = 0, l27 = 0, l28 = 0, l29 = 0;
+    const uint8_t *v25 = FindTlv(tlvs, tlvLen, 0x25U, &l25);
+    const uint8_t *v26 = FindTlv(tlvs, tlvLen, 0x26U, &l26);
+    const uint8_t *v27 = FindTlv(tlvs, tlvLen, 0x27U, &l27);
+    const uint8_t *v28 = FindTlv(tlvs, tlvLen, 0x28U, &l28);
+    const uint8_t *v29 = FindTlv(tlvs, tlvLen, 0x29U, &l29);
+    if (v25 && l25 >= 17U) {
+        char addr6[64];
+        FormatIpv6Str(v25, addr6, sizeof(addr6));
+        printf("    IPv6 Address (0x25): %s/%u\n", addr6, v25[16]);
+    }
+    if (v26 && l26 >= 17U) {
+        char gw6[64];
+        FormatIpv6Str(v26, gw6, sizeof(gw6));
+        printf("    IPv6 Gateway (0x26): %s/%u\n", gw6, v26[16]);
+    }
+    if (v27 && l27 >= 16U) {
+        char dns1[64];
+        FormatIpv6Str(v27, dns1, sizeof(dns1));
+        printf("    IPv6 DNS1    (0x27): %s\n", dns1);
+    }
+    if (v28 && l28 >= 16U) {
+        char dns2[64];
+        FormatIpv6Str(v28, dns2, sizeof(dns2));
+        printf("    IPv6 DNS2    (0x28): %s\n", dns2);
+    }
+    if (v29 && l29 >= 4U) {
+        printf("    WDS MTU      (0x29): %u\n", Le32(v29));
     }
 }
 
@@ -2389,6 +2783,19 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--esim-remove-notif") == 0 && i + 1 < argc) {
             doEsimOnly = 1;
             esimRemoveNotifSeq = _atoi64(argv[++i]);
+        } else if (strcmp(argv[i], "--esim-flush-notifs") == 0) {
+            uint8_t flushSlot = 2U;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                flushSlot = (uint8_t)atoi(argv[++i]);
+                if (flushSlot == 0U) flushSlot = 2U;
+            }
+            EsimFlushNotifications(hDev, &st, flushSlot);
+            CloseHandle(hDev);
+            return 0;
+        } else if (strcmp(argv[i], "--set-rat") == 0 && i + 1 < argc) {
+            SetNasRatPreference(hDev, &st, argv[++i]);
+            CloseHandle(hDev);
+            return 0;
         } else if (strcmp(argv[i], "--enable") == 0 && i + 1 < argc) {
             doEsimOnly = 1;
             enableIccid = argv[++i];
@@ -2541,16 +2948,47 @@ int main(int argc, char **argv) {
                 if (qRes == 0U) {
                     uint16_t l01 = 0; const uint8_t *v01 = FindTlv(tlvs, tlvLen, 0x01U, &l01);
                     uint32_t handle = (v01 && l01 >= 4U) ? Le32(v01) : 0U;
-                    uint8_t getReq[7] = { 0x10U, 4U, 0U, 0x10U, 0x1FU, 0x00U, 0x00U };
+                    uint8_t getReq[7] = { 0x10U, 4U, 0U, 0xFFU, 0xFFU, 0x01U, 0x00U };
                     if (QmiTransaction(hDev, &st, QMI_SVC_WDS, 0x002DU, getReq, sizeof(getReq), tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
-                        printf("  [WDS 0x002D GET_CURRENT_SETTINGS] res=%u err=0x%x\n", qRes, qErr);
-                        DumpRawTlvs("WDS_CUR_SETTINGS", tlvs, tlvLen);
+                        printf("  [WDS 0x002D GET_CURRENT_SETTINGS (v4)] res=%u err=0x%x\n", qRes, qErr);
+                        DumpRawTlvs("WDS_CUR_SETTINGS_V4", tlvs, tlvLen);
+                        PrintWdsIpv6SettingsTlvs(tlvs, tlvLen);
                     }
                     if (handle != 0U) {
                         uint8_t stopReq[7] = { 0x01U, 4U, 0U, 0, 0, 0, 0 };
                         memcpy(stopReq + 3U, &handle, 4U);
                         QmiTransaction(hDev, &st, QMI_SVC_WDS, 0x0021U, stopReq, sizeof(stopReq), tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr);
                         printf("  [WDS 0x0021 STOP_NET(0x%08x)] res=%u err=0x%x\n", handle, qRes, qErr);
+                    }
+                }
+            }
+
+            /* 5. Test Dual-Stack / IPv6 WDS session (WDS_SET_CLIENT_IP_FAMILY_PREF 0x004D = 6, START_NET TLV 0x19 = 6) */
+            uint8_t famReq[4] = { 0x01U, 1U, 0U, 0x06U };
+            if (QmiTransaction(hDev, &st, QMI_SVC_WDS, 0x004DU, famReq, sizeof(famReq), tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+                printf("  [WDS 0x004D SET_CLIENT_IP_FAMILY_PREF(6=IPv6)] res=%u err=0x%x\n", qRes, qErr);
+            }
+            sp = 0;
+            startReq[sp++] = 0x14U; memcpy(startReq + sp, &alen, 2U); sp += 2U;
+            memcpy(startReq + sp, apn, alen); sp += alen;
+            startReq[sp++] = 0x19U; startReq[sp++] = 1U; startReq[sp++] = 0U; startReq[sp++] = 6U; /* IPv6 */
+            if (QmiTransactionEx(hDev, &st, QMI_SVC_WDS, 0x0020U, startReq, (uint16_t)sp, tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr, 15000U)) {
+                printf("  [WDS 0x0020 START_NET('internet.proximus.be', v6)] res=%u err=0x%x tlvLen=%u\n", qRes, qErr, tlvLen);
+                DumpRawTlvs("WDS_START_V6", tlvs, tlvLen);
+                if (qRes == 0U) {
+                    uint16_t l01 = 0; const uint8_t *v01 = FindTlv(tlvs, tlvLen, 0x01U, &l01);
+                    uint32_t handle6 = (v01 && l01 >= 4U) ? Le32(v01) : 0U;
+                    uint8_t getReq6[7] = { 0x10U, 4U, 0U, 0xFFU, 0xFFU, 0x01U, 0x00U }; /* mask 0x0001FFFF includes 0x25..0x29 */
+                    if (QmiTransaction(hDev, &st, QMI_SVC_WDS, 0x002DU, getReq6, sizeof(getReq6), tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr)) {
+                        printf("  [WDS 0x002D GET_CURRENT_SETTINGS (v6)] res=%u err=0x%x\n", qRes, qErr);
+                        DumpRawTlvs("WDS_CUR_SETTINGS_V6", tlvs, tlvLen);
+                        PrintWdsIpv6SettingsTlvs(tlvs, tlvLen);
+                    }
+                    if (handle6 != 0U) {
+                        uint8_t stopReq6[7] = { 0x01U, 4U, 0U, 0, 0, 0, 0 };
+                        memcpy(stopReq6 + 3U, &handle6, 4U);
+                        QmiTransaction(hDev, &st, QMI_SVC_WDS, 0x0021U, stopReq6, sizeof(stopReq6), tlvs, sizeof(tlvs), &tlvLen, &qRes, &qErr);
+                        printf("  [WDS 0x0021 STOP_NET_V6(0x%08x)] res=%u err=0x%x\n", handle6, qRes, qErr);
                     }
                 }
             }

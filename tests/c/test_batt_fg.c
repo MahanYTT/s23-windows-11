@@ -1,6 +1,11 @@
-/* Host tests for the s23batt MAX77705 fuel-gauge decoding (drivers/s23batt/s23batt.c, extracted
- * verbatim by tests/c/extract_batt.py; the driver itself is not modified):
- *   S23BattReadHardware  register -> SOC / mV / mA / tenths-Kelvin / mWh / Windows power state
+/* Host tests for the s23batt MAX77705 fuel-gauge decoding & fast-charge configuration
+ * (drivers/s23batt/s23batt.c, extracted verbatim by tests/c/extract_batt.py; the driver itself
+ * is not modified):
+ *   S23BattConfigureFastCharge  CNFG_06 unlock (0xBD=0x6D), abnormalOff (0x08/0x0B) 0x04->0x05
+ *                               recovery toggle on CNFG_00 (0xB7), normal mode preservation,
+ *                               4400 mV float (0xBB=0x18), 2500 mA CC (0xB9=0x32), 3000 mA CHGIN
+ *                               (0xC0=0xF7), CHGIN/WCIN select (0xC3=0x68), I2C write failure handling
+ *   S23BattReadHardware         register -> SOC / mV / mA / tenths-Kelvin / mWh / Windows power state
  *   S23BattDumpStatus, S23LogHex4, Append* (log formatting, buffer bounds)
  * The bit-bang I2C layer is replaced by a fake register file (FG 0x36 words, CHG 0x69 bytes).
  *
@@ -62,7 +67,22 @@ static void MemZero(void *dst, size_t n) { memset(dst, 0, n); }
 static uint16_t g_fg[256];
 static uint8_t g_chg[256];
 static int g_failReg = -1;
+static int g_failChgWrite = 0;
 static int g_fastChargeCalls;
+static uint32_t g_stallUsTotal;
+
+typedef struct {
+    uint8_t reg;
+    uint8_t val;
+} chg_write_op;
+
+static chg_write_op g_chgWrites[64];
+static size_t g_chgWriteCount;
+
+static void KeStallExecutionProcessor(ULONG us)
+{
+    g_stallUsTotal += us;
+}
 static uint32_t Rd32(volatile uint8_t *base, uint32_t off) { (void)base; return 0xA5000000u | off; }
 static void Wr32(volatile uint8_t *base, uint32_t off, uint32_t v) { (void)base; CHECK(v == (0xA5000000u | off)); }
 static void I2cBusRecover(volatile uint8_t *t, uint32_t sda, uint32_t scl) { (void)t; (void)sda; (void)scl; }
@@ -81,11 +101,23 @@ static int I2cRegRead8(volatile uint8_t *t, uint32_t sda, uint32_t scl, uint8_t 
     *out = g_chg[reg];
     return 0;
 }
-static void S23BattConfigureFastCharge(volatile uint8_t *t, uint32_t sda, uint32_t scl, BOOLEAN onLine, uint8_t dtls)
+static int I2cRegWrite8(volatile uint8_t *t, uint32_t sda, uint32_t scl, uint8_t addr7, uint8_t reg, uint8_t val)
 {
-    (void)t; (void)sda; (void)scl; (void)dtls;
-    CHECK(onLine);
-    g_fastChargeCalls++;
+    (void)t; (void)sda; (void)scl;
+    CHECK(addr7 == MAX77705_CHG_ADDR);
+    if (g_chgWriteCount == 0u) {
+        g_fastChargeCalls++;
+    }
+    if (g_chgWriteCount < sizeof(g_chgWrites) / sizeof(g_chgWrites[0])) {
+        g_chgWrites[g_chgWriteCount].reg = reg;
+        g_chgWrites[g_chgWriteCount].val = val;
+    }
+    g_chgWriteCount++;
+    if (g_failChgWrite) {
+        return -1;
+    }
+    g_chg[reg] = val;
+    return 0;
 }
 
 /* captured log output (S23LogRaw) and status file (ZwWriteFile from S23BattDumpStatus) */
@@ -134,7 +166,10 @@ static void regs_nominal(void)
     memset(g_fg, 0, sizeof(g_fg));
     memset(g_chg, 0, sizeof(g_chg));
     g_failReg = -1;
+    g_failChgWrite = 0;
     g_fastChargeCalls = 0;
+    g_chgWriteCount = 0;
+    g_stallUsTotal = 0;
     g_fg[0x00] = 0x0000;          /* status: battery present (bit 3 clear) */
     g_fg[0x06] = 0x3200;          /* RepSOC 50.00 % */
     g_fg[0x08] = 0x1900;          /* Temp 25.0 C */
@@ -432,6 +467,108 @@ static void test_logging_bounds(void)
     CHECK(g_statusLen > 0U && g_statusLen <= 512U);
 }
 
+static void test_configure_fast_charge(void)
+{
+    /* Off-line: S23BattConfigureFastCharge must be a no-op */
+    regs_nominal();
+    S23BattConfigureFastCharge(g_fakeTlmm, TLMM_GPIO206, TLMM_GPIO207, FALSE, 0x08u);
+    CHECK_EQ_U64(g_chgWriteCount, 0u);
+
+    /* (a) CNFG_06 (0xBD) unlock write 0x6D (bits [3:2] = 0x3, bit 0 = WDT kick) &
+     * (d) Float voltage 4400 mV (CNFG_04 0xBB = 0x18), 2500 mA fast-charge current
+     *     (CNFG_02 0xB9 = 0x32), 3000 mA CHGIN input limit (CNFG_09 0xC0 = 0xF7),
+     *     and wireless/CHGIN config (CNFG_12 0xC3 = 0x68) from cold/unconfigured state */
+    regs_nominal();
+    g_logLen = 0;
+    S23BattConfigureFastCharge(g_fakeTlmm, TLMM_GPIO206, TLMM_GPIO207, TRUE, 0x01u);
+
+    /* 1 initial WDT kick + 9 programming writes = 10 writes total */
+    CHECK_EQ_U64(g_chgWriteCount, 10u);
+    CHECK_EQ_U64(g_chgWrites[0].reg, 0xBDu);
+    CHECK_EQ_U64(g_chgWrites[0].val, 0x6Du);
+    CHECK_EQ_U64((g_chgWrites[0].val >> 2) & 0x03u, 0x03u);
+
+    CHECK_EQ_U64(g_chgWrites[1].reg, 0xBDu);
+    CHECK_EQ_U64(g_chgWrites[1].val, 0x6Du);
+    CHECK_EQ_U64(g_chgWrites[2].reg, 0xC3u);
+    CHECK_EQ_U64(g_chgWrites[2].val, 0x68u); /* CNFG_12: CHGINSEL | WCINSEL | 4.6V */
+    CHECK_EQ_U64(g_chgWrites[3].reg, 0xB7u);
+    CHECK_EQ_U64(g_chgWrites[3].val, 0x04u); /* CNFG_00: Buck ON, Charger OFF toggle */
+    CHECK_EQ_U64(g_chgWrites[4].reg, 0xBBu);
+    CHECK_EQ_U64(g_chgWrites[4].val, 0x18u); /* CNFG_04: 4400 mV float voltage */
+    CHECK_EQ_U64(g_chgWrites[5].reg, 0xB8u);
+    CHECK_EQ_U64(g_chgWrites[5].val, 0x38u); /* CNFG_01: timer/restart disabled */
+    CHECK_EQ_U64(g_chgWrites[6].reg, 0xB9u);
+    CHECK_EQ_U64(g_chgWrites[6].val, 0x32u); /* CNFG_02: 2500 mA fast-charge current */
+    CHECK_EQ_U64(g_chgWrites[7].reg, 0xC0u);
+    CHECK_EQ_U64(g_chgWrites[7].val, 0xF7u); /* CNFG_09: 3000 mA CHGIN limit | CHG_EN */
+    CHECK_EQ_U64(g_chgWrites[8].reg, 0xC1u);
+    CHECK_EQ_U64(g_chgWrites[8].val, 0x3Fu); /* CNFG_10: 1600 mA WCIN limit */
+    CHECK_EQ_U64(g_chgWrites[9].reg, 0xB7u);
+    CHECK_EQ_U64(g_chgWrites[9].val, 0x05u); /* CNFG_00: Buck ON, Charger ON */
+    CHECK_EQ_U64(g_stallUsTotal, 60000u);
+
+    CHECK_EQ_U64(g_chg[0xBD], 0x6Du);
+    CHECK_EQ_U64(g_chg[0xC3], 0x68u);
+    CHECK_EQ_U64(g_chg[0xBB], 0x18u);
+    CHECK_EQ_U64(g_chg[0xB8], 0x38u);
+    CHECK_EQ_U64(g_chg[0xB9], 0x32u);
+    CHECK_EQ_U64(g_chg[0xC0], 0xF7u);
+    CHECK_EQ_U64(g_chg[0xC1], 0x3Fu);
+    CHECK_EQ_U64(g_chg[0xB7], 0x05u);
+
+    /* (c) Normal mode preservation on CNFG_00 (0x05):
+     *     When registers are already configured and chgDtls01 is normal (e.g. 0x01 CC / 0x02 CV),
+     *     only the WDT/unlock write (0xBD = 0x6D) is issued and CNFG_00 stays 0x05 without toggling to 0x04 */
+    g_chgWriteCount = 0;
+    g_stallUsTotal = 0;
+    S23BattConfigureFastCharge(g_fakeTlmm, TLMM_GPIO206, TLMM_GPIO207, TRUE, 0x01u);
+    CHECK_EQ_U64(g_chgWriteCount, 1u);
+    CHECK_EQ_U64(g_chgWrites[0].reg, 0xBDu);
+    CHECK_EQ_U64(g_chgWrites[0].val, 0x6Du);
+    CHECK_EQ_U64(g_chg[0xB7], 0x05u);
+    CHECK_EQ_U64(g_stallUsTotal, 0u);
+
+    /* (b) abnormalOff (0x08 / 0x0B) recovery toggle to 0x04 before 0x05 on CNFG_00 (0xB7),
+     *     even when all config registers already hold their fast-charge values */
+    static const uint8_t abnormal_dtls[2] = { 0x08u, 0x0Bu };
+    for (size_t k = 0; k < 2u; k++) {
+        g_chgWriteCount = 0;
+        g_stallUsTotal = 0;
+        S23BattConfigureFastCharge(g_fakeTlmm, TLMM_GPIO206, TLMM_GPIO207, TRUE,
+                                   (uint8_t)(0xA0u | abnormal_dtls[k]));
+        CHECK_EQ_U64(g_chgWriteCount, 10u);
+
+        int idx_04 = -1, idx_05 = -1;
+        for (size_t i = 0; i < g_chgWriteCount; i++) {
+            if (g_chgWrites[i].reg == 0xB7u && g_chgWrites[i].val == 0x04u && idx_04 < 0) {
+                idx_04 = (int)i;
+            }
+            if (g_chgWrites[i].reg == 0xB7u && g_chgWrites[i].val == 0x05u) {
+                idx_05 = (int)i;
+            }
+        }
+        CHECK(idx_04 >= 0 && idx_05 > idx_04);
+        CHECK_EQ_U64(g_chg[0xB7], 0x05u);
+        CHECK_EQ_U64(g_stallUsTotal, 60000u);
+    }
+
+    /* (d) Graceful handling of I2C write failure:
+     *     When I2cRegWrite8 fails (-1), S23BattConfigureFastCharge and S23BattReadHardware
+     *     must not crash, hang, or corrupt fuel-gauge telemetry */
+    regs_nominal();
+    g_chg[0xB2] = 0x40u; /* CHGIN online */
+    g_chg[0xB4] = 0x08u; /* abnormalOff */
+    g_failChgWrite = 1;
+    S23_BATT_STATE s;
+    CHECK_EQ_U64(run(&s), 0);
+    CHECK(s.Valid);
+    CHECK_EQ_U64(s.SocX100, 5000u);
+    CHECK_EQ_U64(s.VoltageMv, 4000u);
+    CHECK_EQ_U64(g_chgWriteCount, 10u);
+    CHECK_EQ_U64(g_chg[0xB7], 0x00u); /* unchanged because writes failed */
+}
+
 int main(void)
 {
     test_nominal_discharge();
@@ -443,5 +580,6 @@ int main(void)
     test_power_state_table();
     test_critical();
     test_logging_bounds();
+    test_configure_fast_charge();
     return test_report("test_batt_fg");
 }

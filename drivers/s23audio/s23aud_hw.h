@@ -5,8 +5,79 @@
 
 #include <wdm.h>
 
+#ifndef _VCRUNTIME_H
+#define _VCRUNTIME_H
+#endif
+#ifndef _VCRT_COMPILER_PREPROCESSOR
+#define _VCRT_COMPILER_PREPROCESSOR 1
+#endif
+#ifndef _VCRUNTIME_DISABLED_WARNINGS
+#define _VCRUNTIME_DISABLED_WARNINGS 4514
+#endif
+
+#ifndef _STDINT
+#define _STDINT
+typedef INT8    int8_t;
+typedef UINT8   uint8_t;
+typedef INT16   int16_t;
+typedef UINT16  uint16_t;
+typedef INT32   int32_t;
+typedef UINT32  uint32_t;
+typedef INT64   int64_t;
+typedef UINT64  uint64_t;
+#ifndef UINT8_MAX
+#define UINT8_MAX  0xFFU
+#endif
+#ifndef UINT16_MAX
+#define UINT16_MAX 0xFFFFU
+#endif
+#ifndef UINT32_MAX
+#define UINT32_MAX 0xFFFFFFFFU
+#endif
+#ifndef UINT64_MAX
+#define UINT64_MAX 0xFFFFFFFFFFFFFFFFULL
+#endif
+#endif
+
+#include "s23aud_lpass_proto.h"
+#include "../s23haptics/cirrus_fw.h"
+
 #ifdef __cplusplus
 extern "C" {
+#endif
+
+#ifndef CIRRUS_HALO_DSP_ADDR_DEFINED
+#define CIRRUS_HALO_DSP_ADDR_DEFINED
+#define CIRRUS_HALO_XM_PACKED_BASE   0x02000000U
+#define CIRRUS_HALO_XM_UNPACKED_BASE 0x02800000U
+#define CIRRUS_HALO_YM_PACKED_BASE   0x02C00000U
+#define CIRRUS_HALO_YM_UNPACKED_BASE 0x03400000U
+#define CIRRUS_HALO_PM_PACKED_BASE   0x03800000U
+
+S23AUD_INLINE uint32_t cirrus_halo_dsp_addr(uint16_t mem_type, uint32_t word_offset)
+{
+    if (word_offset >= 0x00200000U) {
+        return 0U;
+    }
+    switch (mem_type) {
+    case CIRRUS_WMFW_HALO_XM_PACKED:
+        return CIRRUS_HALO_XM_PACKED_BASE + (word_offset * 4U);
+    case CIRRUS_WMFW_XM:
+        return CIRRUS_HALO_XM_UNPACKED_BASE + (word_offset * 4U);
+    case CIRRUS_WMFW_HALO_YM_PACKED:
+        return CIRRUS_HALO_YM_PACKED_BASE + (word_offset * 4U);
+    case CIRRUS_WMFW_YM:
+        return CIRRUS_HALO_YM_UNPACKED_BASE + (word_offset * 4U);
+    case CIRRUS_WMFW_HALO_PM_PACKED:
+    case CIRRUS_WMFW_PM:
+        return CIRRUS_HALO_PM_PACKED_BASE + (word_offset * 4U);
+    case CIRRUS_WMFW_ABSOLUTE:
+    case CIRRUS_WMDR_ABSOLUTE:
+        return word_offset;
+    default:
+        return 0U;
+    }
+}
 #endif
 
 #define S23_AUDIO_TAG             'A32S'

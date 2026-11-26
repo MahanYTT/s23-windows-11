@@ -85,7 +85,7 @@ Write-Host '=== Building s23modemd.exe (ARM64 User-Mode Static CRT) ==='
 $umInc = @("/I$msvcInc", "/I$wdkInc\um", "/I$wdkInc\shared", "/I$wdkInc\ucrt", "/I$dir")
 $umLibPaths = @("/LIBPATH:$msvcLib", "/LIBPATH:$wdkLib\um\arm64", "/LIBPATH:$wdkLib\ucrt\arm64")
 $exeOut = Join-Path $outDir 's23modemd.exe'
-& $cl /nologo /MT /O2 /W3 /WX @umInc (Join-Path $dir 's23modemd.c') "/Fo$outDir\s23modemd.obj" /link /MACHINE:ARM64 @umLibPaths kernel32.lib "/OUT:$exeOut"
+& $cl /nologo /MT /O2 /W3 /WX @umInc (Join-Path $dir 's23modemd.c') "/Fo$outDir\s23modemd.obj" /link /MACHINE:ARM64 @umLibPaths kernel32.lib winhttp.lib crypt32.lib "/OUT:$exeOut"
 if ($LASTEXITCODE) { throw "cl.exe s23modemd.exe failed: $LASTEXITCODE" }
 
 Write-Host "BUILT & VERIFIED: $sysOut and $exeOut"

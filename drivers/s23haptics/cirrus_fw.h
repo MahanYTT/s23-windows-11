@@ -47,7 +47,9 @@
 #ifndef S23_CIRRUS_FW_H
 #define S23_CIRRUS_FW_H
 
+#ifndef _STDINT
 #include <stdint.h>
+#endif
 #include <stddef.h>
 
 /* ---- result codes ---------------------------------------------------------------------------- */

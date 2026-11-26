@@ -15,12 +15,18 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifndef _STDINT
+#define _STDINT
 typedef UINT8   uint8_t;
 typedef UINT16  uint16_t;
 typedef UINT32  uint32_t;
 typedef UINT64  uint64_t;
 typedef INT16   int16_t;
 typedef INT32   int32_t;
+#endif
+
+#include "s23aud_lpass_proto.h"
+#include "../s23haptics/cirrus_fw.h"
 
 extern VOID  S23SmcCall(ULONGLONG Regs[8]);
 extern ULONG S23MmioRd32(const volatile VOID *Addr);
@@ -321,6 +327,33 @@ static VOID SleepMs(ULONG ms) {
     KeDelayExecutionThread(KernelMode, FALSE, &li);
 }
 
+static ULONG S23AudReadRegDword(PCWSTR ValName, ULONG DefaultVal) {
+    UNICODE_STRING uk, uv;
+    OBJECT_ATTRIBUTES oa;
+    HANDLE hk = NULL;
+    ULONG val = DefaultVal;
+    UCHAR kvBuf[64];
+    ULONG rlen = 0U;
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL || !ValName) {
+        return val;
+    }
+    RtlInitUnicodeString(&uk, L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\s23audio\\Parameters");
+    InitializeObjectAttributes(&oa, &uk, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    if (!NT_SUCCESS(ZwOpenKey(&hk, KEY_READ, &oa))) {
+        return val;
+    }
+    RtlInitUnicodeString(&uv, ValName);
+    if (NT_SUCCESS(ZwQueryValueKey(hk, &uv, KeyValuePartialInformation, kvBuf, sizeof(kvBuf), &rlen))) {
+        KEY_VALUE_PARTIAL_INFORMATION *kv = (KEY_VALUE_PARTIAL_INFORMATION *)kvBuf;
+        if (kv->Type == REG_DWORD && kv->DataLength >= sizeof(ULONG)) {
+            RtlCopyMemory(&val, kv->Data, sizeof(ULONG));
+        }
+    }
+    ZwClose(hk);
+    return val;
+}
+
 static volatile uint8_t *MapIo(uint64_t pa, SIZE_T sz) {
     PHYSICAL_ADDRESS p; p.QuadPart = (LONGLONG)pa;
     return (volatile uint8_t *)MmMapIoSpaceEx(p, sz, PAGE_READWRITE | PAGE_NOCACHE);
@@ -526,6 +559,8 @@ struct _S23_AUD_HW {
     BOOLEAN             GraphOpen;
     BOOLEAN             AmpsPowered;
     uint32_t            MemHandle;
+    ULONG               CaptureProbeMode;
+    ULONG               InspectSpkProtFw;
 
     /* Attached WaveRT ring buffer */
     uint8_t            *RingVa;
@@ -1921,11 +1956,102 @@ static VOID UnlockMutex(PKMUTEX m) {
     (void)KeReleaseMutex(m, FALSE);
 }
 
-static BOOLEAN CsPowerUpPair(S23_AUD_HW *Hw) {
-    LockMutex(&Hw->I2cLock);
+#define S23AUD_SPKPROT_MAX_FW_BYTES 131072U
+
+typedef struct _S23_WMFW_INSPECT_SCRATCH {
+    cirrus_wmfw_summary Summary;
+    cirrus_wmfw_iter    Iter;
+    cirrus_wmfw_region  Region;
+    uint8_t             FwBuf[S23AUD_SPKPROT_MAX_FW_BYTES];
+} S23_WMFW_INSPECT_SCRATCH;
+
+static VOID InspectOneCs35l43Wmfw(PCWSTR Path, uint8_t I2cAddr, S23_WMFW_INSPECT_SCRATCH *Scratch) {
+    UNICODE_STRING u;
+    OBJECT_ATTRIBUTES oa;
+    IO_STATUS_BLOCK isb;
+    HANDLE fh = NULL;
+    LARGE_INTEGER off0;
+
+    RtlInitUnicodeString(&u, Path);
+    InitializeObjectAttributes(&oa, &u, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    NTSTATUS st = ZwCreateFile(&fh, GENERIC_READ, &oa, &isb, NULL, 0,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN,
+                               FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+    if (!NT_SUCCESS(st)) {
+        S23AudLogFmt("[CS35L43 @0x%02x] InspectSpkProtFw open %S skipped st=0x%08x (keeping ASP bypass 0x08 & -6.0 dB ceiling)\r\n",
+                     I2cAddr, Path, st);
+        return;
+    }
+
+    off0.QuadPart = 0;
+    st = ZwReadFile(fh, NULL, NULL, NULL, &isb, Scratch->FwBuf, S23AUD_SPKPROT_MAX_FW_BYTES, &off0, NULL);
+    ZwClose(fh);
+    ULONG fwLen = (ULONG)isb.Information;
+    if (!NT_SUCCESS(st) || fwLen == 0U) {
+        S23AudLogFmt("[CS35L43 @0x%02x] InspectSpkProtFw read %S failed st=0x%08x len=%u\r\n",
+                     I2cAddr, Path, st, fwLen);
+        return;
+    }
+
+    int vrc = cirrus_wmfw_validate(Scratch->FwBuf, (size_t)fwLen, &Scratch->Summary, NULL, NULL);
+    if (vrc != CIRRUS_FW_OK) {
+        S23AudLogFmt("[CS35L43 @0x%02x] InspectSpkProtFw validate %S failed rc=%d (%s) err_off=%u\r\n",
+                     I2cAddr, Path, vrc, cirrus_fw_strerror(vrc), (ULONG)Scratch->Summary.error_offset);
+        return;
+    }
+
+    uint32_t regCount = 0U, memRegCount = 0U, totalPayload = 0U;
+    uint32_t firstHaloAddr = 0U, lastHaloAddr = 0U;
+    int irc = cirrus_wmfw_iter_init(&Scratch->Iter, Scratch->FwBuf, (size_t)fwLen);
+    while (irc == CIRRUS_FW_OK) {
+        irc = cirrus_wmfw_iter_next(&Scratch->Iter, &Scratch->Region);
+        if (irc != CIRRUS_FW_OK) break;
+        regCount++;
+        totalPayload += Scratch->Region.len;
+        uint32_t haloAddr = cirrus_halo_dsp_addr(Scratch->Region.type, Scratch->Region.offset);
+        if (haloAddr != 0U) {
+            if (memRegCount < 4U) {
+                S23AudLogFmt("[CS35L43 @0x%02x] WMFW mem_reg[%u] type=0x%02x(%s) word_off=0x%06x halo_i2c_addr=0x%08x len=%u\r\n",
+                             I2cAddr, memRegCount, Scratch->Region.type,
+                             cirrus_wmfw_region_name(Scratch->Region.type),
+                             Scratch->Region.offset, haloAddr, Scratch->Region.len);
+            }
+            if (firstHaloAddr == 0U) firstHaloAddr = haloAddr;
+            lastHaloAddr = haloAddr;
+            memRegCount++;
+        }
+    }
+
+    S23AudLogFmt("[CS35L43 @0x%02x] WMFW %S OK: core=%u ver=%u rev=0x%04x regions=%u (mem=%u alg=%u coeffs=%u) mem_bytes=%llu total_payload=%u halo_i2c=[0x%08x..0x%08x] (raw ASP bypass 0x08 & -6.0 dB cap kept)\r\n",
+                 I2cAddr, Path,
+                 Scratch->Summary.hdr.core, Scratch->Summary.hdr.ver, Scratch->Summary.hdr.rev,
+                 regCount, Scratch->Summary.mem_regions, Scratch->Summary.alg_regions,
+                 Scratch->Summary.coeffs, (ULONGLONG)Scratch->Summary.mem_bytes,
+                 totalPayload, firstHaloAddr, lastHaloAddr);
+}
+
+static VOID InspectCs35l43SpkProtFwLocked(S23_AUD_HW *Hw) {
+    Hw->InspectSpkProtFw = S23AudReadRegDword(L"InspectSpkProtFw", Hw->InspectSpkProtFw);
+    if (Hw->InspectSpkProtFw != 1U) {
+        return;
+    }
+    S23_WMFW_INSPECT_SCRATCH *scratch = (S23_WMFW_INSPECT_SCRATCH *)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(S23_WMFW_INSPECT_SCRATCH), S23_AUDIO_TAG);
+    if (!scratch) {
+        S23AudLogFmt("[CS35L43] InspectSpkProtFw pool alloc failed\r\n");
+        return;
+    }
+    InspectOneCs35l43Wmfw(L"\\SystemRoot\\System32\\drivers\\s23fw\\cs35l43-bot-dsp1-spk-prot.wmfw", 0x40U, scratch);
+    InspectOneCs35l43Wmfw(L"\\SystemRoot\\System32\\drivers\\s23fw\\cs35l43-rcv-dsp1-spk-prot.wmfw", 0x41U, scratch);
+    ExFreePoolWithTag(scratch, S23_AUDIO_TAG);
+}
+
+static BOOLEAN InitCs35l43PairLocked(S23_AUD_HW *Hw) {
     volatile uint8_t *se = Hw->Se6;
     const uint8_t addrs[2] = { 0x41U, 0x40U }; /* idx 0 = Left/@0x41 (slot 0), idx 1 = Right/@0x40 (slot 1) */
     BOOLEAN ok = TRUE;
+
+    InspectCs35l43SpkProtFwLocked(Hw);
 
     for (int ch = 0; ch < 2; ch++) {
         uint8_t a = addrs[ch];
@@ -1982,6 +2108,12 @@ static BOOLEAN CsPowerUpPair(S23_AUD_HW *Hw) {
         if (err != 0U) { ok = FALSE; break; }
     }
     if (ok) Hw->AmpsPowered = TRUE;
+    return ok;
+}
+
+static BOOLEAN CsPowerUpPair(S23_AUD_HW *Hw) {
+    LockMutex(&Hw->I2cLock);
+    BOOLEAN ok = InitCs35l43PairLocked(Hw);
     UnlockMutex(&Hw->I2cLock);
     return ok;
 }
@@ -2164,6 +2296,105 @@ static BOOLEAN EnsureAdspReadyLocked(S23_AUD_HW *Hw) {
 }
 
 /* ============================================================================
+ * LPASS VA_MACRO + TX_MACRO Read-Only Whitelisted Capture Probe (Mode=1)
+ * ========================================================================== */
+static BOOLEAN ProbeWhitelistedReg32(const volatile uint8_t *base, uint32_t basePa, uint32_t off, uint32_t *outVal) {
+    uint32_t pa = basePa + off;
+    if (!base || !s23aud_lpass_probe_read_allowed(pa, 4U)) {
+        if (outVal) *outVal = 0xFFFFFFFFU;
+        return FALSE;
+    }
+    *outVal = Rd32(base, off);
+    return TRUE;
+}
+
+static VOID ProbeLpassVaTxMacrosLocked(S23_AUD_HW *Hw) {
+    (void)Hw;
+    volatile uint8_t *txMacro = MapIo(S23AUD_TX_MACRO_PA, S23AUD_TX_MACRO_SIZE);
+    volatile uint8_t *vaMacro = MapIo(S23AUD_VA_MACRO_PA, S23AUD_VA_MACRO_SIZE);
+    if (!txMacro || !vaMacro) {
+        S23AudLogFmt("[LPASS-PROBE] MapIo failed tx=%p va=%p\r\n", txMacro, vaMacro);
+        UnmapIo(&vaMacro, S23AUD_VA_MACRO_SIZE);
+        UnmapIo(&txMacro, S23AUD_TX_MACRO_SIZE);
+        return;
+    }
+
+    uint32_t vaCoreId = 0U, vaDmicCtl[4] = { 0U, 0U, 0U, 0U };
+    (void)ProbeWhitelistedReg32(vaMacro, S23AUD_VA_MACRO_PA, 0x0080U, &vaCoreId);
+    for (uint32_t p = 0U; p < S23AUD_VA_DMIC_CTL_COUNT; p++) {
+        uint32_t ctlOff = s23aud_va_dmic_ctl_off(p * 2U);
+        (void)ProbeWhitelistedReg32(vaMacro, S23AUD_VA_MACRO_PA, ctlOff, &vaDmicCtl[p]);
+    }
+    S23AudLogFmt("[LPASS-PROBE] VA_MACRO(0x%08x) TOP_CSR CORE_ID(+0x80)=0x%08x DMIC0..3_CTL(+0x84..+0x90)=0x%08x 0x%08x 0x%08x 0x%08x\r\n",
+                 S23AUD_VA_MACRO_PA, vaCoreId, vaDmicCtl[0], vaDmicCtl[1], vaDmicCtl[2], vaDmicCtl[3]);
+    for (uint32_t off = 0x0080U; off <= 0x0098U; off += 4U) {
+        uint32_t v = 0U;
+        if (ProbeWhitelistedReg32(vaMacro, S23AUD_VA_MACRO_PA, off, &v)) {
+            S23AudLogFmt("[LPASS-PROBE] VA_MACRO TOP_CSR +0x%03x (pa=0x%08x) = 0x%08x\r\n",
+                         off, S23AUD_VA_MACRO_PA + off, v);
+        }
+    }
+    for (uint32_t off = 0x0100U; off <= 0x0120U; off += 4U) {
+        uint32_t v = 0U;
+        if (ProbeWhitelistedReg32(vaMacro, S23AUD_VA_MACRO_PA, off, &v)) {
+            S23AudLogFmt("[LPASS-PROBE] VA_MACRO INP_MUX +0x%03x (pa=0x%08x) = 0x%08x\r\n",
+                         off, S23AUD_VA_MACRO_PA + off, v);
+        }
+    }
+    for (uint32_t n = 0U; n < S23AUD_VA_MACRO_NUM_DEC; n++) {
+        uint32_t decPa = s23aud_dec_block_pa(1, n);
+        uint32_t decOff = decPa - S23AUD_VA_MACRO_PA;
+        uint32_t d0 = 0U, d1 = 0U, d2 = 0U, d3 = 0U;
+        (void)ProbeWhitelistedReg32(vaMacro, S23AUD_VA_MACRO_PA, decOff + 0x00U, &d0);
+        (void)ProbeWhitelistedReg32(vaMacro, S23AUD_VA_MACRO_PA, decOff + 0x04U, &d1);
+        (void)ProbeWhitelistedReg32(vaMacro, S23AUD_VA_MACRO_PA, decOff + 0x08U, &d2);
+        (void)ProbeWhitelistedReg32(vaMacro, S23AUD_VA_MACRO_PA, decOff + 0x0CU, &d3);
+        S23AudLogFmt("[LPASS-PROBE] VA_MACRO CDC_TX%u (+0x%03x pa=0x%08x): [0..3]=0x%08x 0x%08x 0x%08x 0x%08x\r\n",
+                     n, decOff, decPa, d0, d1, d2, d3);
+    }
+
+    for (uint32_t off = 0x0080U; off <= 0x0098U; off += 4U) {
+        uint32_t v = 0U;
+        if (ProbeWhitelistedReg32(txMacro, S23AUD_TX_MACRO_PA, off, &v)) {
+            S23AudLogFmt("[LPASS-PROBE] TX_MACRO TOP_CSR +0x%03x (pa=0x%08x) = 0x%08x\r\n",
+                         off, S23AUD_TX_MACRO_PA + off, v);
+        }
+    }
+    for (uint32_t off = 0x0100U; off <= 0x0120U; off += 4U) {
+        uint32_t v = 0U;
+        if (ProbeWhitelistedReg32(txMacro, S23AUD_TX_MACRO_PA, off, &v)) {
+            S23AudLogFmt("[LPASS-PROBE] TX_MACRO INP_MUX +0x%03x (pa=0x%08x) = 0x%08x\r\n",
+                         off, S23AUD_TX_MACRO_PA + off, v);
+        }
+    }
+    for (uint32_t n = 0U; n < S23AUD_TX_MACRO_NUM_DEC; n++) {
+        uint32_t decPa = s23aud_dec_block_pa(0, n);
+        uint32_t decOff = decPa - S23AUD_TX_MACRO_PA;
+        uint32_t d0 = 0U, d1 = 0U, d2 = 0U, d3 = 0U;
+        (void)ProbeWhitelistedReg32(txMacro, S23AUD_TX_MACRO_PA, decOff + 0x00U, &d0);
+        (void)ProbeWhitelistedReg32(txMacro, S23AUD_TX_MACRO_PA, decOff + 0x04U, &d1);
+        (void)ProbeWhitelistedReg32(txMacro, S23AUD_TX_MACRO_PA, decOff + 0x08U, &d2);
+        (void)ProbeWhitelistedReg32(txMacro, S23AUD_TX_MACRO_PA, decOff + 0x0CU, &d3);
+        S23AudLogFmt("[LPASS-PROBE] TX_MACRO CDC_TX%u (+0x%03x pa=0x%08x): [0..3]=0x%08x 0x%08x 0x%08x 0x%08x\r\n",
+                     n, decOff, decPa, d0, d1, d2, d3);
+    }
+
+    uint32_t dmicDivSel = 0U, dmicCtlWord = 0U;
+    int divRc = s23aud_dmic_clk_div_sel(9600000U, 2400000U, &dmicDivSel);
+    int ctlRc = (divRc == 0) ? s23aud_va_dmic_ctl_value(vaDmicCtl[0], dmicDivSel, 1, &dmicCtlWord) : -1;
+    S23AudLogFmt("[LPASS-PROBE] VA DMIC calc(mclk=9600000, dmic=2400000, pair=0): div_sel=%u factor=%u ctl_word=0x%08x (rc=%d/%d) | AR capture IDs: CODEC_DMA_SOURCE=0x%08x PCM_ENC=0x%08x RD_SHARED_MEM_EP=0x%08x ch_mask(2)=0x%x\r\n",
+                 dmicDivSel, s23aud_dmic_div_factor(dmicDivSel), dmicCtlWord, divRc, ctlRc,
+                 S23AUD_AR_MODULE_ID_CODEC_DMA_SOURCE,
+                 S23AUD_AR_MODULE_ID_PCM_ENC,
+                 S23AUD_AR_MODULE_ID_RD_SHARED_MEM_EP,
+                 s23aud_codec_dma_ch_mask(2U));
+
+    UnmapIo(&vaMacro, S23AUD_VA_MACRO_SIZE);
+    UnmapIo(&txMacro, S23AUD_TX_MACRO_SIZE);
+    S23AudLogFlush();
+}
+
+/* ============================================================================
  * Public Hardware Engine API
  * ========================================================================== */
 NTSTATUS S23AudHwCreate(S23_AUD_HW **OutHw) {
@@ -2189,6 +2420,10 @@ NTSTATUS S23AudHwCreate(S23_AUD_HW **OutHw) {
     hw->VolFixedDb[1] = S23_VOL_DEFAULT_DB_FIXED;
     hw->Muted[0]      = FALSE;
     hw->Muted[1]      = FALSE;
+    hw->CaptureProbeMode = S23AudReadRegDword(L"CaptureProbeMode", 0U);
+    hw->InspectSpkProtFw = S23AudReadRegDword(L"InspectSpkProtFw", 0U);
+    S23AudLogFmt("[HW] Params: CaptureProbeMode=%u InspectSpkProtFw=%u\r\n",
+                 hw->CaptureProbeMode, hw->InspectSpkProtFw);
 
     hw->Gcc  = MapIo(PA_GCC_BASE, SZ_GCC);
     hw->Tlmm = MapIo(PA_TLMM_BASE, SZ_TLMM);
@@ -2369,6 +2604,11 @@ NTSTATUS S23AudHwStartStream(S23_AUD_HW *Hw) {
         return STATUS_UNSUCCESSFUL;
     }
     Hw->ClocksOn = TRUE;
+
+    Hw->CaptureProbeMode = S23AudReadRegDword(L"CaptureProbeMode", Hw->CaptureProbeMode);
+    if (Hw->CaptureProbeMode == 1U) {
+        ProbeLpassVaTxMacrosLocked(Hw);
+    }
 
     /* 2. APPS TLMM GPIO126..129 -> FUNC_SEL=1 (i2s0_sck/data0/data1/ws), egpio_en=0 */
     for (uint32_t g = 126U; g <= 129U; g++) {
