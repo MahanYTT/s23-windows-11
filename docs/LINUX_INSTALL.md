@@ -2,7 +2,16 @@
 
 You do **not** need a Windows host PC or Windows VM to partition the S23, pull device firmware, apply Windows 11 ARM64, configure the EFI boot chain (`BCD` / `SanPolicy=4`), flash UEFI to `sda25`, or control live Windows over USB-C (`s23link.py`).
 
-Only **compiling** the MSVC/WDK drivers (`s23gpu`, `s23audio`, `s23modem`, `s23mbb`) from source requires Windows WDK — and [`.github/workflows/build-drivers.yml`](../.github/workflows/build-drivers.yml) builds and test-signs all of them automatically on GitHub Actions so Linux users can download the `s23-drivers-arm64` artifact directly (or fork/trigger the workflow via `gh workflow run build-drivers.yml`).
+## What's Included in the Driver Pack vs. What You Still Supply
+
+| Component | Source | Notes |
+|---|---|---|
+| **Open-source S23 Windows drivers** (`s23touch`, `s23batt`, `s23keys`, `s23bthx`, `s23perf`, `s23audio`, `s23mbb`, `s23modem_xprt`, `s23gpu.sys` KMD) + `s23modemd.exe`, `s23sms.ps1`, `s23perfctl.ps1`, `s23_firstboot.ps1`, `s23test.cer` | **[GitHub Releases](https://github.com/MahanYTT/s23-windows-11/releases)** (`s23-drivers-arm64.zip`) or [`.github/workflows/build-drivers.yml`](../.github/workflows/build-drivers.yml) | Pre-built and test-signed (`CN=S23TouchTest2020`) automatically via GitHub Actions — zero local Windows needed. |
+| **Stock Samsung/Qualcomm phone firmware** (`modem`, `apnhlos`, `dsp`, `vendor` GPU/Wi-Fi/BT/audio blobs) | **Pulled from your own phone** via `install_s23_linux.py pull-fw` | Proprietary + bound to your device's TrustZone rollback fuses (bit 8 / bit 9); see [`modem_5g_research/FIRMWARE_GROUND_TRUTH.md`](../modem_5g_research/FIRMWARE_GROUND_TRUTH.md). |
+| **Qualcomm Wi-Fi 6E driver** (`qcwlan8280.sys`) | User-supplied proprietary Qualcomm WHQL package | See [`wifi_research/qca6490_bringup/QCA6490_DRIVER_AND_FW_GUIDE.md`](../wifi_research/qca6490_bringup/QCA6490_DRIVER_AND_FW_GUIDE.md) and [`wifi_research/WIFI_BRINGUP_FIXES.md`](../wifi_research/WIFI_BRINGUP_FIXES.md). |
+| **Project Mu UEFI `boot.img`** (`Mu-dm1q.img`) | Built on Linux (`Mu-Silicium` + `S23DisplayFixDxe`) | See [`display_research/DISPLAY_BLACK_SCREEN_FIX.md`](../display_research/DISPLAY_BLACK_SCREEN_FIX.md) and [`scripts/legacy/compile_dm1q_v4.sh`](../scripts/legacy/compile_dm1q_v4.sh). |
+| **Mesa Freedreno 3D / OpenGL DLLs** (`s23gpu_umd.dll`, `libgallium_wgl.dll`) | Built on Linux from Mesa Freedreno | Optional for basic display; required for D3D11 / OpenGL 4.6 hardware acceleration (`drivers/s23gpu/s23gpu.inf`, [`gpu_research/S23_ADRENO740_ARCHITECTURE.md`](../gpu_research/S23_ADRENO740_ARCHITECTURE.md)). |
+| **Windows 11 ARM64 ISO** (`10.0.26100` / 24H2) | Official Microsoft / UUP dump ISO | Applied directly from Linux via `wimlib-imagex`. |
 
 ---
 
@@ -45,13 +54,14 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 ## 2. Getting Drivers (Zero-Windows Option vs. Local Clang Build)
 
-### Option A: Cloud-built ARM64 bundle (all drivers, no Windows PC needed)
-Trigger or download the `s23-drivers-arm64` artifact from the **`Build ARM64 Drivers`** GitHub Actions workflow ([`build-drivers.yml`](../.github/workflows/build-drivers.yml)):
+### Option A: Prebuilt ARM64 driver bundle (all drivers, no Windows PC needed)
+Download `s23-drivers-arm64.zip` from **[GitHub Releases](https://github.com/MahanYTT/s23-windows-11/releases)** and extract to `./dist_s23_drivers`, or download the latest **`Build ARM64 Drivers`** workflow run artifact ([`build-drivers.yml`](../.github/workflows/build-drivers.yml)):
 
 ```bash
+# Either download from Releases, or via gh CLI:
+gh release download --pattern 's23-drivers-arm64.zip' && unzip s23-drivers-arm64.zip -d ./dist_s23_drivers
+# Or trigger a fresh cloud build:
 gh workflow run build-drivers.yml
-# wait for completion, then:
-gh run download --name s23-drivers-arm64 --dir ./dist_s23_drivers
 ```
 
 This contains all signed `.sys` drivers (`s23touch`, `s23batt`, `s23keys`, `s23bthx`, `s23perf`, `s23audio`, `s23mbb`, `s23modem_xprt`, `s23gpu`), `s23modemd.exe`, `s23sms.ps1`, `s23perfctl.ps1`, `s23test.cer`, and `s23_firstboot.ps1`.

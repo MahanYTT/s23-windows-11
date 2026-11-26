@@ -261,7 +261,7 @@ All drivers target **Windows ARM64 kernel mode** and only import standard kernel
 - **Linux (native on CachyOS / Arch / Debian / Fedora, or WSL on Windows):**
   - Full install/provisioning from Linux (no Windows PC or VM required): see **[`docs/LINUX_INSTALL.md`](docs/LINUX_INSTALL.md)** and [`scripts/linux/`](scripts/linux/) (`install_s23_linux.py`, `build_and_sign_linux.py`, `99-s23-winusb.rules`).
   - Clang driver builds (`build_wsl.py`) & SSDTs: `clang` (`clang-18` or newer), `lld` (`lld-link`), `llvm-dlltool`, Python 3, `acpica` (`iasl`), plus `osslsigncode` / `openssl` for Linux signing.
-- **Windows / GitHub Actions** (only for building `s23gpu`, `s23audio`, `s23modem`, `s23mbb` from source + `.cat` generation): Visual Studio 2022 with the ARM64 MSVC toolset, Windows SDK/WDK `10.0.26100`, PowerShell, Python 3, and `CN=S23TouchTest2020`. Or download the prebuilt `s23-drivers-arm64` bundle from [`.github/workflows/build-drivers.yml`](.github/workflows/build-drivers.yml).
+- **Windows / GitHub Actions** (only for building `s23gpu`, `s23audio`, `s23modem`, `s23mbb` from source + `.cat` generation): Visual Studio 2022 with the ARM64 MSVC toolset, Windows SDK/WDK `10.0.26100`, PowerShell, Python 3, and `CN=S23TouchTest2020`. Or download the prebuilt signed `s23-drivers-arm64.zip` driver pack from **[GitHub Releases](https://github.com/MahanYTT/s23-windows-11/releases)** (built by [`.github/workflows/build-drivers.yml`](.github/workflows/build-drivers.yml)).
 
 ### Linux / Clang / WSL drivers (`s23batt`, `s23touch`, `s23keys`, `s23bthx`, `s23perf`, probes)
 
