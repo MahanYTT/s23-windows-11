@@ -153,6 +153,9 @@ if (Test-Path (Join-Path $outDir 'libgallium_wgl.dll')) {
     if ($LASTEXITCODE) { throw "signtool OpenGL DLLs failed: $LASTEXITCODE" }
 }
 
+# outd = x64 Mesa WGL ICD + libgl-gdi opengl32.dll for APP-LOCAL use only (copied next to an x64 app by
+# deploy_s23gpu.ps1). They are deliberately NOT in s23gpu.inf: UserModeDriverNameWoW/OpenGLDriverNameWoW are for
+# 32-bit (x86) processes, and no x86 or x64 D3D UMD is built. See GPU_POLISH_NOTES.md section c.
 $outX64Dir = Join-Path $outDir 'x64'
 New-Item -ItemType Directory -Force -Path $outX64Dir | Out-Null
 $wslWglX64 = "$MesaWslDir/build_x64/src/gallium/targets/wgl/libgallium_wgl.dll"
